@@ -89,3 +89,23 @@ http://192.168.1.23:8000
 - 不要提交 `backend-node/node_modules`
 - 不要提交 Xcode 的 `xcuserdata`
 - 可以提交 `backend-node/.env.example`，它只保存变量名，不保存真实密钥
+
+## 4. RAG 知识库
+
+知识库文档放在：
+
+```text
+backend-node/knowledge/
+```
+
+当前第一版 RAG 使用 Markdown 文档 + 关键词匹配：
+
+```text
+用户提问
+  -> 后端搜索 backend-node/knowledge/*.md
+  -> 找到相关资料
+  -> 把资料和问题一起发给 AI
+  -> AI 按结构化 JSON 返回
+```
+
+新增知识时，可以继续往 `backend-node/knowledge/` 里添加 `.md` 文件。

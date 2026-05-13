@@ -68,13 +68,15 @@ final class ChatViewModel: ObservableObject {
 
     /// 点击发送按钮后调用。
     ///
-    /// 当前第一版默认走“流式输出”：
+    /// 当前默认走“Agent 流式输出”：
     /// - 用户消息立即追加到列表
     /// - 再追加一条空的 assistant 消息
-    /// - 后端每返回一个 delta，就更新这条 assistant 消息的 content
+    /// - 后端先完成 Tool Calling 阶段
+    /// - 后端再把最终回答通过 SSE 返回
+    /// - 每收到一个 delta，就更新这条 assistant 消息的 content
     ///
-    /// 原来的结构化接口仍然保留在 ChatAPIClient 里，
-    /// 后续如果想做“流式文本结束后替换成结构化卡片”，可以继续复用它。
+    /// 普通流式接口和结构化接口仍然保留在 ChatAPIClient 里，
+    /// 方便后续做对比测试或“最终结构化卡片”升级。
     func sendMessage() async {
         let messageText = trimmedInputText
 
@@ -118,12 +120,17 @@ final class ChatViewModel: ObservableObject {
         var streamedAnswer = ""
 
         do {
-            /// 调用网络层，请求 Node.js 流式接口。
+            /// 调用网络层，请求 Node.js Agent 流式接口。
             ///
-            /// sendStreamingMessage 返回的不是完整答案，
+            /// sendAgentStreamingMessage 返回的不是完整答案，
             /// 而是一个 AsyncThrowingStream<String, Error>。
-            /// 每次 for try await 取到的 delta，都是后端 SSE 推来的新文本片段。
-            let stream = try chatAPI.sendStreamingMessage(
+            ///
+            /// 后端会先做 Tool Calling：
+            /// 模型决定是否调用 searchKnowledge / generateQuiz，
+            /// 后端执行工具并把结果交回模型。
+            ///
+            /// 工具阶段完成后，最终回答才会一段段通过 SSE 推给 iOS。
+            let stream = try chatAPI.sendAgentStreamingMessage(
                 messageText,
                 systemPrompt: AppConfig.defaultSystemPrompt,
                 history: history

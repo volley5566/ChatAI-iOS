@@ -9,14 +9,16 @@
 
 ```text
 iOS SwiftUI
-  -> Node.js /api/chat/stream
-  -> DeepSeek OpenAI-compatible API stream
-  -> Node.js 通过 SSE 返回文本片段
+  -> Node.js /api/agent/stream
+  -> Tool Calling / Agent Runner
+  -> DeepSeek OpenAI-compatible API
+  -> Node.js 通过 SSE 返回最终文本片段
   -> iOS 实时更新同一条 AI 消息气泡
 ```
 
-项目里也保留了非流式结构化接口 `/api/chat`，
-方便后续继续做“最终结构化卡片”或接口对比测试。
+项目里也保留了普通流式接口 `/api/chat/stream`
+和非流式结构化接口 `/api/chat`，
+方便后续继续做接口对比测试或“最终结构化卡片”升级。
 
 ## 1. 启动后端
 
@@ -138,7 +140,7 @@ AI 就能知道这些话是在接着上一轮问题说。
 
 ## 6. 流式输出
 
-当前 App 默认使用第一版流式输出接口：
+项目保留了普通流式输出接口：
 
 ```text
 POST /api/chat/stream
@@ -296,3 +298,146 @@ curl -N \
 `-N` 的作用是关闭 curl 的输出缓冲。
 
 如果不加 `-N`，curl 可能会等攒够一批内容后再显示，看起来就不像实时流式输出。
+
+## 7. Tool Calling / Agent
+
+当前 App 默认使用第一版 Agent 流式接口：
+
+```text
+POST /api/agent/stream
+```
+
+它在普通流式输出前，增加了一个 Tool Calling 阶段：
+
+```text
+iOS 发送 message + history
+  -> Node.js 把可用工具列表交给模型
+  -> 模型判断是否需要调用工具
+  -> Node.js 校验工具名和参数
+  -> Node.js 执行真正的后端工具
+  -> Node.js 把工具结果交回模型
+  -> 模型生成最终回答
+  -> Node.js 通过 SSE 流式返回给 iOS
+```
+
+### Tool Calling 是什么
+
+Tool Calling 不是模型真的执行代码。
+
+模型只会返回类似下面的结构化请求：
+
+```json
+{
+  "name": "searchKnowledge",
+  "arguments": {
+    "query": "SwiftUI @State"
+  }
+}
+```
+
+真正执行工具的是 Node.js 后端。
+
+这样做的好处是：
+
+```text
+模型负责理解用户意图、选择工具、组织回答
+后端负责校验参数、执行工具、控制权限和安全边界
+```
+
+### 当前支持的工具
+
+第一版 Agent 只开放两个低风险学习工具：
+
+```text
+searchKnowledge(query)
+  搜索 backend-node/knowledge/ 里的 Markdown 知识库
+
+generateQuiz(topic, count)
+  根据学习主题生成 1 到 5 道练习题
+```
+
+这两个工具都不会修改数据，也不会调用外部业务系统，适合先把 Tool Calling 主流程跑通。
+
+### Agent Runner 循环
+
+后端里有一个简单 Agent Runner。
+
+它的工作方式是：
+
+```text
+最多循环 4 轮
+
+每一轮：
+  调模型
+  如果模型返回 tool_calls：
+    后端执行工具
+    把工具结果放回 messages
+    继续下一轮
+
+  如果模型没有返回 tool_calls：
+    结束工具阶段
+    进入最终回答阶段
+```
+
+为什么要限制最多 4 轮？
+
+因为模型有可能反复调用工具。比如一直搜索知识库、一直换 query。
+设置上限可以避免一次请求无限执行。
+
+### 为什么最终回答仍然流式返回
+
+Agent 的工具阶段是非流式的：
+
+```text
+模型决定工具
+后端执行工具
+模型看工具结果
+```
+
+工具阶段完成后，后端再开启 `stream: true`，把最终回答通过 SSE 返回给 iOS。
+
+这样第一版实现更容易理解：
+
+```text
+工具调用阶段：稳定、易调试
+最终回答阶段：用户体验仍然是流式
+```
+
+后续如果要做更高级版本，可以继续升级成“流式 tool_call 参数拼接”，但第一版没必要一开始就做这么复杂。
+
+### 手动测试 Agent 接口
+
+启动后端后，可以测试知识库工具：
+
+```bash
+curl -N \
+  -X POST http://127.0.0.1:8000/api/agent/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "SwiftUI 的 @State 是什么？请先查知识库再回答。",
+    "system_prompt": "You are a friendly iOS tutor.",
+    "history": []
+  }'
+```
+
+也可以测试练习题工具：
+
+```bash
+curl -N \
+  -X POST http://127.0.0.1:8000/api/agent/stream \
+  -H "Content-Type: application/json" \
+  -d '{
+    "message": "基于 SwiftUI @Binding 给我出 3 道练习题。",
+    "system_prompt": "You are a friendly iOS tutor.",
+    "history": []
+  }'
+```
+
+如果后端日志里看到类似：
+
+```text
+[Agent] tool call: searchKnowledge, ok: true
+[Agent] tool calls executed: 1
+```
+
+说明模型已经触发 Tool Calling，后端也执行了对应工具。

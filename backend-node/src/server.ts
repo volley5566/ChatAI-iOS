@@ -12,7 +12,12 @@ import express, { Request, Response } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
-import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
+import type {
+  ChatCompletionAssistantMessageParam,
+  ChatCompletionMessageParam,
+  ChatCompletionMessageToolCall,
+  ChatCompletionTool,
+} from "openai/resources/chat/completions";
 // fs/path 是 Node.js 自带模块。
 // fs：读取 knowledge 目录里的 Markdown 文件。
 // path：拼接不同系统下都安全的文件路径。
@@ -193,6 +198,73 @@ type ChatStreamEvent =
   | { type: "done" }
   | { type: "error"; error: string };
 
+/**
+ * 第一版学习助手 Agent 支持的工具名。
+ *
+ * 这里先只做两个低风险工具：
+ * - searchKnowledge：只读，查本地 Markdown 知识库
+ * - generateQuiz：只生成练习题，不修改任何数据
+ *
+ * 后续接 MCP 或真实业务系统时，可以继续往这里扩展。
+ */
+type AgentToolName = "searchKnowledge" | "generateQuiz";
+
+/**
+ * searchKnowledge 工具的入参。
+ *
+ * query 是模型根据用户问题整理出来的搜索词。
+ * 例如用户问“@State 和 @Binding 有什么区别”，
+ * 模型可能会传入 "SwiftUI @State @Binding"。
+ */
+type SearchKnowledgeArguments = {
+  query: string;
+};
+
+/**
+ * generateQuiz 工具的入参。
+ *
+ * topic：练习题围绕的学习主题。
+ * count：题目数量，可选；后端会把它限制在 1 到 5 之间，
+ * 避免模型一次请求生成太多内容。
+ */
+type GenerateQuizArguments = {
+  topic: string;
+  count?: number;
+};
+
+/**
+ * 后端执行工具后的统一结果格式。
+ *
+ * 为什么不直接把工具原始结果塞回模型？
+ * 因为统一包装后，模型每次都能看到：
+ * - toolName：这是谁的结果
+ * - ok：工具是否成功
+ * - result：成功时的数据
+ * - error：失败时的原因
+ *
+ * 这会让最终回答更稳定，也方便以后增加更多工具。
+ */
+type AgentToolExecutionResult = {
+  toolName: string;
+  ok: boolean;
+  result?: unknown;
+  error?: string;
+};
+
+/**
+ * DeepSeek V4 thinking mode 会在 assistant 消息里额外返回 reasoning_content。
+ *
+ * OpenAI SDK 的通用类型目前不包含这个 DeepSeek 扩展字段，
+ * 但 DeepSeek 官方要求：
+ * 如果某个 assistant 消息发起了 tool_call，
+ * 后续请求必须把这条消息里的 reasoning_content 原样传回 API。
+ *
+ * 所以这里定义一个本地扩展类型，只在 Agent tool loop 内部使用。
+ */
+type DeepSeekAssistantMessageWithReasoning = ChatCompletionAssistantMessageParam & {
+  reasoning_content?: string | null;
+};
+
 //8.1 定义结构化输出规则
 /**
  * 第 3 阶段的核心目标：
@@ -254,6 +326,33 @@ Do not mention that you are streaming.
 Keep the answer beginner-friendly and practical.
 If code helps, include a short code example.
 Use the same language as the user's question.
+`;
+
+/**
+ * Agent 接口使用的额外规则。
+ *
+ * 普通 /api/chat/stream 是“后端固定做 RAG + 模型直接回答”。
+ * /api/agent/stream 是“模型可以自己选择工具 + 后端执行工具 + 模型再回答”。
+ *
+ * 这里重点告诉模型：
+ * - 什么时候应该用 searchKnowledge
+ * - 什么时候应该用 generateQuiz
+ * - 工具结果是事实来源，不能编造不存在的资料
+ * - 最终回答仍然是普通文本，方便 iOS 继续用流式气泡展示
+ */
+const agentOutputGuide = `
+You are an iOS learning assistant agent.
+
+You can use tools when they help:
+- Use searchKnowledge when the user asks about iOS, SwiftUI, this project, backend code, RAG, streaming, or a concept that may exist in the local knowledge base.
+- Use generateQuiz when the user asks for exercises, practice questions, quizzes, review questions, or wants to test understanding.
+
+Tool rules:
+- Do not claim you used a tool unless a tool result is present.
+- If a tool returns no useful result, say that clearly and continue with general beginner-friendly guidance.
+- Do not invent source file names or knowledge base content.
+- For final answers, write normal conversational text, not JSON.
+- Use the same language as the user's question.
 `;
 
 /**
@@ -340,6 +439,21 @@ function buildStreamingInstructions(
   const ragGuide = buildRagGuide(knowledgeContext);
 
   return `${rolePrompt}\n\n${ragGuide}\n\n${streamingOutputGuide}`;
+}
+
+/**
+ * 组合 Agent 接口使用的 system prompt。
+ *
+ * 第一版 Agent 不再自动把 RAG context 塞进 system prompt，
+ * 而是把“搜索知识库”暴露成 searchKnowledge 工具。
+ *
+ * 这样可以观察模型是否会根据任务自己决定调用工具，
+ * 也更贴近后续接 MCP / 业务 API 的 Agent 工作方式。
+ */
+function buildAgentInstructions(systemPrompt?: string): string {
+  const rolePrompt = buildRolePrompt(systemPrompt);
+
+  return `${rolePrompt}\n\n${agentOutputGuide}`;
 }
 
 /**
@@ -1009,6 +1123,506 @@ ${truncateText(match.document.content, maxCharactersPerDocument)}
   return context.trim();
 }
 
+//8.3 Tool Calling / Agent：定义工具、校验参数、执行工具
+/**
+ * 提供给模型看的工具列表。
+ *
+ * 注意：
+ * 这里的 tools 只是“工具说明书”，告诉模型：
+ * - 工具叫什么
+ * - 什么时候用
+ * - 参数长什么样
+ *
+ * 模型不会真的执行这些函数。
+ * 模型只会返回 tool_call，真正执行工具的是后端的 executeAgentTool。
+ */
+const agentTools: ChatCompletionTool[] = [
+  {
+    type: "function",
+    function: {
+      name: "searchKnowledge",
+      description:
+        "Search the local Markdown knowledge base for iOS, SwiftUI, backend, RAG, streaming, and project concepts. Use this before answering questions that may depend on project docs.",
+      parameters: {
+        type: "object",
+        properties: {
+          query: {
+            type: "string",
+            description:
+              "A concise search query, for example 'SwiftUI @State' or 'URLSession JSON request'.",
+          },
+        },
+        required: ["query"],
+        additionalProperties: false,
+      },
+    },
+  },
+  {
+    type: "function",
+    function: {
+      name: "generateQuiz",
+      description:
+        "Generate beginner-friendly practice questions for a learning topic. Use this when the user asks for exercises, quiz questions, practice, review, or wants to test understanding.",
+      parameters: {
+        type: "object",
+        properties: {
+          topic: {
+            type: "string",
+            description:
+              "The learning topic, for example 'SwiftUI @State' or 'iOS URLSession'.",
+          },
+          count: {
+            type: "integer",
+            description:
+              "How many questions to generate. Keep it between 1 and 5.",
+            minimum: 1,
+            maximum: 5,
+          },
+        },
+        required: ["topic"],
+        additionalProperties: false,
+      },
+    },
+  },
+];
+
+/**
+ * 解析模型返回的工具参数。
+ *
+ * Chat Completions 协议里，tool_call.function.arguments 是字符串，
+ * 内容通常是 JSON，例如：
+ *
+ * {"query":"SwiftUI @State"}
+ *
+ * 但它毕竟是模型生成的文本，不能假设永远合法。
+ * 如果解析失败，这里返回 undefined，让后面的参数校验统一处理错误。
+ */
+function parseToolArguments(rawArguments: string): unknown {
+  try {
+    return JSON.parse(rawArguments || "{}");
+  } catch {
+    return undefined;
+  }
+}
+
+/**
+ * 判断 unknown 值是不是普通对象。
+ *
+ * TypeScript 里 JSON.parse 的结果是 unknown。
+ * 在读取 value.query / value.topic 之前，
+ * 需要先确认它真的是对象，而不是 null、数组、数字或字符串。
+ */
+function isObjectRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value) && typeof value === "object" && !Array.isArray(value);
+}
+
+/**
+ * 校验 searchKnowledge 的参数。
+ *
+ * 模型生成的 tool arguments 不能直接相信：
+ * - 可能不是合法 JSON
+ * - 可能漏字段
+ * - 可能把 query 写成数字或对象
+ *
+ * 所以每个工具都要在后端做自己的参数校验。
+ */
+function normalizeSearchKnowledgeArguments(
+  rawArguments: unknown
+): SearchKnowledgeArguments | undefined {
+  if (!isObjectRecord(rawArguments)) {
+    return undefined;
+  }
+
+  const query = rawArguments.query;
+
+  if (typeof query !== "string") {
+    return undefined;
+  }
+
+  const trimmedQuery = query.trim();
+
+  if (!trimmedQuery) {
+    return undefined;
+  }
+
+  return {
+    query: trimmedQuery,
+  };
+}
+
+/**
+ * 校验 generateQuiz 的参数。
+ *
+ * 这里和 searchKnowledge 一样，不能相信模型传来的 arguments。
+ * 后端会做三件事：
+ * - topic 必须是非空字符串
+ * - count 可以省略
+ * - 如果 count 是数字，就四舍五入并限制在 1 到 5
+ *
+ * 这样即使模型传了 999、0、2.7，也不会让工具输出失控。
+ */
+function normalizeGenerateQuizArguments(
+  rawArguments: unknown
+): GenerateQuizArguments | undefined {
+  if (!isObjectRecord(rawArguments)) {
+    return undefined;
+  }
+
+  const topic = rawArguments.topic;
+
+  if (typeof topic !== "string") {
+    return undefined;
+  }
+
+  const trimmedTopic = topic.trim();
+
+  if (!trimmedTopic) {
+    return undefined;
+  }
+
+  const countValue = rawArguments.count;
+  const count =
+    typeof countValue === "number" && Number.isFinite(countValue)
+      ? Math.min(Math.max(Math.round(countValue), 1), 5)
+      : 3;
+
+  return {
+    topic: trimmedTopic,
+    count,
+  };
+}
+
+/**
+ * 执行 searchKnowledge 工具。
+ *
+ * 它复用当前已有的轻量 RAG 检索逻辑：
+ * - retrieveRelevantKnowledge：打分并找出相关 Markdown 文档
+ * - truncateText：限制返回给模型的内容长度
+ *
+ * 返回给模型的是结构化 JSON 字符串。
+ * 这样模型能清楚看到 source / title / excerpt，而不是一大段难以解析的文本。
+ */
+function runSearchKnowledgeTool(args: SearchKnowledgeArguments): AgentToolExecutionResult {
+  const matches = retrieveRelevantKnowledge(args.query);
+
+  return {
+    toolName: "searchKnowledge",
+    ok: true,
+    result: {
+      query: args.query,
+      matches: matches.map((match) => ({
+        source: match.document.fileName,
+        title: match.document.title,
+        score: match.score,
+        excerpt: truncateText(match.document.content, 1200),
+      })),
+    },
+  };
+}
+
+/**
+ * 执行 generateQuiz 工具。
+ *
+ * 第一版先不再嵌套调用模型生成题目，
+ * 而是用后端模板生成几个稳定的学习题。
+ *
+ * 这样有两个好处：
+ * - Tool Calling 链路更容易调试
+ * - 工具结果可预测，不会因为工具内部又调用模型而增加复杂度和成本
+ *
+ * 最终题目仍然会交给模型整理成自然语言回答。
+ */
+function runGenerateQuizTool(args: GenerateQuizArguments): AgentToolExecutionResult {
+  const templates = [
+    `请用自己的话解释 ${args.topic} 的核心作用。`,
+    `请举一个适合使用 ${args.topic} 的具体 iOS 开发场景。`,
+    `请说明 ${args.topic} 常见的一个误区，并写出正确理解。`,
+    `如果你要把 ${args.topic} 讲给初学者，你会用什么类比？`,
+    `请写一个和 ${args.topic} 相关的小代码片段或伪代码思路。`,
+  ];
+
+  return {
+    toolName: "generateQuiz",
+    ok: true,
+    result: {
+      topic: args.topic,
+      count: args.count ?? 3,
+      questions: templates.slice(0, args.count ?? 3).map((question, index) => ({
+        number: index + 1,
+        question,
+      })),
+    },
+  };
+}
+
+/**
+ * 生成一个统一格式的工具失败结果。
+ *
+ * 失败结果也会作为 tool message 交回模型。
+ * 这样模型可以在最终回答里自然说明：
+ * “我尝试调用工具，但参数不合法/工具不存在。”
+ */
+function buildToolErrorResult(
+  toolName: string,
+  error: string
+): AgentToolExecutionResult {
+  return {
+    toolName,
+    ok: false,
+    error,
+  };
+}
+
+/**
+ * 根据模型返回的 tool_call 执行真正的后端工具。
+ *
+ * 这是 Tool Calling 最关键的安全边界：
+ * - 模型只能“请求调用工具”
+ * - 后端决定这个工具是否存在
+ * - 后端校验参数是否合法
+ * - 后端执行真实函数
+ *
+ * 后续如果接订单、支付、工单等业务系统，
+ * 权限校验、用户确认、审计日志也都应该放在这个边界附近。
+ */
+function executeAgentTool(toolCall: ChatCompletionMessageToolCall): AgentToolExecutionResult {
+  if (toolCall.type !== "function") {
+    return buildToolErrorResult("unknown", "Only function tool calls are supported.");
+  }
+
+  const toolName = toolCall.function.name as AgentToolName;
+  const rawArguments = parseToolArguments(toolCall.function.arguments);
+
+  switch (toolName) {
+    case "searchKnowledge": {
+      const args = normalizeSearchKnowledgeArguments(rawArguments);
+
+      if (!args) {
+        return buildToolErrorResult(toolName, "Invalid arguments. Expected { query: string }.");
+      }
+
+      return runSearchKnowledgeTool(args);
+    }
+
+    case "generateQuiz": {
+      const args = normalizeGenerateQuizArguments(rawArguments);
+
+      if (!args) {
+        return buildToolErrorResult(
+          toolName,
+          "Invalid arguments. Expected { topic: string, count?: number }."
+        );
+      }
+
+      return runGenerateQuizTool(args);
+    }
+
+    default:
+      return buildToolErrorResult(
+        toolCall.function.name,
+        `Unknown tool: ${toolCall.function.name}`
+      );
+  }
+}
+
+/**
+ * 把工具结果转成 tool message 的 content。
+ *
+ * Chat Completions 的 tool 消息 content 需要是字符串，
+ * 所以后端把统一结果对象 JSON.stringify 后再放回 messages。
+ */
+function stringifyToolResult(result: AgentToolExecutionResult): string {
+  return JSON.stringify(result);
+}
+
+/**
+ * Agent 最多允许连续调用几轮工具。
+ *
+ * 为什么需要上限？
+ * 模型可能因为提示词、工具结果、或边界问题陷入循环：
+ * - 一直调用 searchKnowledge
+ * - 搜不到资料后反复换 query
+ * - 生成题目后又继续生成题目
+ *
+ * 设置上限后，后端可以保证一次请求最终会停止。
+ */
+const maxAgentToolSteps = 4;
+
+type AgentRunResult = {
+  /**
+   * 工具调用阶段结束后的完整 messages。
+   *
+   * 里面包含：
+   * - system prompt
+   * - 历史对话
+   * - 当前用户问题
+   * - assistant 发起的 tool_calls
+   * - 后端返回的 tool 结果
+   *
+   * 最终流式回答会继续使用这份 messages。
+   */
+  messages: ChatCompletionMessageParam[];
+
+  /**
+   * 本次请求实际执行了多少个工具调用。
+   *
+   * 这个值主要用于日志，方便开发时确认：
+   * 用户的问题到底有没有触发 Tool Calling。
+   */
+  toolCallCount: number;
+};
+
+/**
+ * 组装 Agent 初始 messages。
+ *
+ * 和普通 RAG 接口不同：
+ * - 普通接口会先检索知识库，再把资料塞进 system prompt
+ * - Agent 接口只告诉模型有哪些工具可用，让模型自己决定是否 searchKnowledge
+ *
+ * 这种写法更接近真实 Agent：
+ * 模型先读问题和历史，再选择要不要使用工具。
+ */
+function buildAgentMessages(
+  message: string,
+  systemPrompt: string | undefined,
+  history: NormalizedChatHistoryItem[]
+): ChatCompletionMessageParam[] {
+  return [
+    {
+      role: "system",
+      content: buildAgentInstructions(systemPrompt),
+    },
+    ...history.map((item): ChatCompletionMessageParam => ({
+      role: item.role,
+      content: item.content,
+    })),
+    {
+      role: "user",
+      content: message,
+    },
+  ];
+}
+
+/**
+ * 把模型返回的 assistant tool_call 消息整理成下一轮请求可用的 message。
+ *
+ * 不能只保留 content 和 tool_calls。
+ *
+ * DeepSeek V4 thinking mode 默认开启；当 assistant 消息里包含 tool_calls 时，
+ * DeepSeek 会同时返回 reasoning_content。
+ * 下一轮把 tool 结果发回模型时，必须把 reasoning_content 一起带上，
+ * 否则 DeepSeek 会返回：
+ * The `reasoning_content` in the thinking mode must be passed back to the API.
+ *
+ * OpenAI SDK 类型里没有 reasoning_content，
+ * 所以这里用本地扩展类型保留这个 DeepSeek 专有字段。
+ */
+function buildAssistantToolMessage(
+  assistantMessage: DeepSeekAssistantMessageWithReasoning,
+  toolCalls: ChatCompletionMessageToolCall[]
+): ChatCompletionAssistantMessageParam {
+  const assistantToolMessage: DeepSeekAssistantMessageWithReasoning = {
+    role: "assistant",
+    content: assistantMessage.content ?? null,
+    tool_calls: toolCalls,
+  };
+
+  if (typeof assistantMessage.reasoning_content === "string") {
+    assistantToolMessage.reasoning_content = assistantMessage.reasoning_content;
+  }
+
+  return assistantToolMessage;
+}
+
+/**
+ * 执行 Agent 的“工具调用阶段”。
+ *
+ * 第一版采用一个更容易理解和维护的两阶段设计：
+ *
+ * 阶段 1：非流式 tool calling
+ * - 模型决定是否调用工具
+ * - 后端执行工具
+ * - 工具结果放回 messages
+ * - 最多循环 maxAgentToolSteps 次
+ *
+ * 阶段 2：流式最终回答
+ * - 工具调用阶段结束后
+ * - 再用 stream: true 生成最终回复给 iOS
+ *
+ * 为什么不一开始就做“流式 tool calling”？
+ * 流式 tool calling 需要拼接 delta 里的工具名和 arguments，
+ * 边界更多，也更难给初学项目讲清楚。
+ * 先用非流式工具阶段，可以把 Agent 核心流程跑通。
+ */
+async function runAgentToolLoop(
+  message: string,
+  systemPrompt: string | undefined,
+  history: NormalizedChatHistoryItem[]
+): Promise<AgentRunResult> {
+  const messages = buildAgentMessages(message, systemPrompt, history);
+  let toolCallCount = 0;
+
+  for (let step = 0; step < maxAgentToolSteps; step += 1) {
+    const completion = await deepseek.chat.completions.create({
+      model,
+      messages,
+      tools: agentTools,
+      tool_choice: "auto",
+    });
+
+    const assistantMessage = completion.choices[0]
+      ?.message as DeepSeekAssistantMessageWithReasoning | undefined;
+
+    if (!assistantMessage) {
+      break;
+    }
+
+    const toolCalls = assistantMessage.tool_calls || [];
+
+    /**
+     * 没有 tool_calls，说明模型认为不需要工具，
+     * 或者工具调用阶段已经结束，可以进入最终回答阶段。
+     */
+    if (toolCalls.length === 0) {
+      break;
+    }
+
+    toolCallCount += toolCalls.length;
+
+    /**
+     * 必须把 assistant 的 tool_calls 原样放回 messages。
+     *
+     * Chat Completions 协议要求：
+     * assistant(tool_calls)
+     * -> tool(result)
+     * -> assistant/final
+     *
+     * 如果只放 tool 结果，不放 assistant 的 tool_calls，
+     * 下一轮模型就不知道这些 tool 结果是在回应哪一次调用。
+     */
+    messages.push(buildAssistantToolMessage(assistantMessage, toolCalls));
+
+    for (const toolCall of toolCalls) {
+      const toolResult = executeAgentTool(toolCall);
+
+      console.log(
+        `[Agent] tool call: ${toolCall.type === "function" ? toolCall.function.name : toolCall.type}, ok: ${toolResult.ok}`
+      );
+
+      messages.push({
+        role: "tool",
+        tool_call_id: toolCall.id,
+        content: stringifyToolResult(toolResult),
+      });
+    }
+  }
+
+  return {
+    messages,
+    toolCallCount,
+  };
+}
+
 /**
  * 组装一次 Chat Completions 请求需要的全部上下文。
  *
@@ -1367,6 +1981,158 @@ app.post(
         writeSseEvent(res, {
           type: "error",
           error: "Failed to stream AI response.",
+        });
+      }
+
+      res.end();
+    }
+  }
+);
+
+//12. Agent 流式接口：Tool Calling + 最终流式回答
+/**
+ 这个接口是第一版 iOS 学习助手 Agent。
+
+ 和 /api/chat/stream 的区别：
+ - /api/chat/stream：后端固定做 RAG，然后模型直接回答
+ - /api/agent/stream：模型可以先选择工具，后端执行工具，再让模型最终回答
+
+ 第一版支持两个本地工具：
+ - searchKnowledge(query)：搜索本地 Markdown 知识库
+ - generateQuiz(topic, count)：生成学习练习题
+
+ 重要边界：
+ 模型不会真正执行工具。
+ 模型只会返回 tool_call。
+ 后端校验工具名和参数后，才会执行真正的函数。
+ */
+app.post(
+  "/api/agent/stream",
+  async (
+    req: Request,
+    res: Response<ErrorResponseBody>
+  ) => {
+    let clientClosed = false;
+
+    /**
+     * Agent 接口也要监听客户端断开。
+     *
+     * 因为 Tool Calling 阶段可能需要先等一次或多次模型响应，
+     * 如果用户中途离开页面或网络断开，后端应该尽快停止后续写入。
+     */
+    res.on("close", () => {
+      clientClosed = true;
+    });
+
+    try {
+      const body = req.body as ChatRequestBody;
+      const message = body.message?.trim();
+      const systemPrompt = body.system_prompt?.trim();
+      const history = sanitizeChatHistory(body.history);
+
+      if (!message) {
+        res.status(400).json({
+          error: "Message cannot be empty.",
+        });
+        return;
+      }
+
+      /**
+       * 先建立 SSE 连接。
+       *
+       * Agent 工具调用阶段本身是非流式的，可能需要一点时间。
+       * 提前 flush headers 后，iOS 能尽早知道连接成功，
+       * 页面可以进入“AI 正在回复”的状态。
+       */
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders();
+
+      console.log(`[Agent] history messages sent to AI: ${history.length}`);
+
+      /**
+       * 第一阶段：Agent Tool Calling 循环。
+       *
+       * 这里模型可以：
+       * - 直接不调用工具，进入最终回答
+       * - 调用 searchKnowledge
+       * - 调用 generateQuiz
+       * - 在拿到工具结果后继续调用下一个工具
+       *
+       * 后端会限制最多 maxAgentToolSteps 轮，防止无限循环。
+       */
+      const agentRun = await runAgentToolLoop(message, systemPrompt, history);
+
+      console.log(`[Agent] tool calls executed: ${agentRun.toolCallCount}`);
+
+      if (clientClosed) {
+        res.end();
+        return;
+      }
+
+      /**
+       * 第二阶段：最终回答流式输出。
+       *
+       * 注意这里不再传 tools / tool_choice。
+       *
+       * 原因：
+       * - 工具调用阶段已经结束
+       * - 最终阶段只需要基于 agentRun.messages 里的工具结果生成回答
+       * - 不传 tools 时，模型没有可调用工具，自然只能输出文本
+       *
+       * 这样也更兼容不同 OpenAI-compatible 服务，
+       * 避免某些服务对 tool_choice: "none" 或 tools + stream 的支持不一致。
+       */
+      const stream = await deepseek.chat.completions.create({
+        model,
+        messages: agentRun.messages,
+        stream: true,
+      });
+
+      for await (const chunk of stream) {
+        if (clientClosed) {
+          break;
+        }
+
+        /**
+         * 最终阶段没有再传 tools，
+         * 所以这里和普通流式接口一样，只关心 delta.content。
+         *
+         * 工具结果已经在 agentRun.messages 里，
+         * 模型会基于这些消息生成最终自然语言回答。
+         */
+        const delta = chunk.choices[0]?.delta?.content;
+
+        if (delta) {
+          writeSseEvent(res, {
+            type: "delta",
+            delta,
+          });
+        }
+      }
+
+      if (!clientClosed) {
+        writeSseEvent(res, {
+          type: "done",
+        });
+      }
+
+      res.end();
+    } catch (error) {
+      console.error("Agent API error:", error);
+
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: "Failed to run AI agent.",
+        });
+        return;
+      }
+
+      if (!clientClosed) {
+        writeSseEvent(res, {
+          type: "error",
+          error: "Failed to run AI agent.",
         });
       }
 

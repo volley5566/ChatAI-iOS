@@ -1,6 +1,6 @@
 # AI iOS Chat Demo 项目架构
 
-Keywords: iOS, SwiftUI, Node.js, Express, backend, API, DeepSeek, OpenAI-compatible, architecture
+Keywords: iOS, SwiftUI, Node.js, Express, backend, API, DeepSeek, OpenAI-compatible, architecture, Tool Calling, Agent, SSE, streaming
 
 这个项目是一个前后端分离的 AI 聊天 Demo。
 
@@ -11,16 +11,32 @@ Keywords: iOS, SwiftUI, Node.js, Express, backend, API, DeepSeek, OpenAI-compati
 
 ## 调用流程
 
+当前 App 默认走 Agent 流式接口：
+
 ```text
 用户在 iOS 输入问题
   -> SwiftUI 调用 ChatViewModel
   -> ChatViewModel 调用 ChatAPIClient
-  -> ChatAPIClient POST /api/chat
+  -> ChatAPIClient POST /api/agent/stream
   -> Node.js Express 接收请求
-  -> Node.js 调用 DeepSeek API
-  -> Node.js 把 AI 回答整理成结构化 JSON
-  -> iOS 解码 JSON
-  -> SwiftUI 展示标题、摘要、重点、下一步问题
+  -> Node.js 把工具列表交给 DeepSeek/OpenAI-compatible API
+  -> 模型决定是否返回 tool_call
+  -> Node.js 校验工具名和参数
+  -> Node.js 执行本地工具
+  -> Node.js 把工具结果交回模型
+  -> 模型生成最终回答
+  -> Node.js 通过 SSE 流式返回文本片段
+  -> iOS 实时更新同一条 AI 消息气泡
+```
+
+项目里也保留了两个旧接口：
+
+```text
+POST /api/chat
+  -> 非流式结构化 JSON 回答
+
+POST /api/chat/stream
+  -> 固定 RAG 检索 + 普通流式文本回答
 ```
 
 ## 为什么需要 Node.js 后端
@@ -45,8 +61,9 @@ iOS 负责：
 - 展示聊天页面
 - 管理用户输入
 - 调用后端接口
-- 解析后端返回的 JSON
-- 展示结构化回答
+- 解析后端 SSE 事件
+- 把流式 delta 追加到同一条 assistant 消息里
+- 在需要时仍可解析旧结构化接口的 JSON
 
 核心文件：
 
@@ -64,9 +81,42 @@ Node.js 负责：
 - 接收 iOS 请求
 - 调用 DeepSeek/OpenAI-compatible API
 - 控制 prompt
-- 将 AI 输出整理成稳定 JSON
+- 维护可用工具列表
+- 校验模型返回的 tool_call 参数
+- 执行真正的后端工具
+- 通过 SSE 返回最终流式文本
+- 在旧结构化接口中将 AI 输出整理成稳定 JSON
+
+当前 Agent 支持两个本地工具：
+
+```text
+searchKnowledge(query)
+  搜索 backend-node/knowledge/ 里的 Markdown 知识库
+
+generateQuiz(topic, count)
+  根据学习主题生成 1 到 5 道练习题
+```
+
+## Tool Calling 在本项目中的含义
+
+Tool Calling 不是模型直接执行代码。
+
+模型只负责返回一个结构化的工具调用请求，例如：
+
+```text
+调用 searchKnowledge
+参数 query = "SwiftUI @State"
+```
+
+真正执行工具的是 Node.js 后端。
+
+这样可以把职责分开：
+
+- 模型负责理解用户意图、选择工具、组织最终回答
+- 后端负责校验工具名、校验参数、执行真实函数、控制安全边界
+
+当前工具都只读或只生成练习题，不会修改数据库，也不会调用支付、订单等高风险系统。
 
 核心文件：
 
 - `backend-node/src/server.ts`
-

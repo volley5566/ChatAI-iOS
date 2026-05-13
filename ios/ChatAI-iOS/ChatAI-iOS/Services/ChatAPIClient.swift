@@ -32,6 +32,20 @@ protocol ChatAPI {
         systemPrompt: String,
         history: [ChatHistoryItem]
     ) throws -> AsyncThrowingStream<String, Error>
+
+    /// 给 Agent 后端发送用户问题，返回最终回答的流式文本片段。
+    ///
+    /// 和 sendStreamingMessage 的区别：
+    /// - sendStreamingMessage 调普通流式聊天接口 /api/chat/stream
+    /// - sendAgentStreamingMessage 调 Agent 接口 /api/agent/stream
+    ///
+    /// Agent 接口会先在后端执行 Tool Calling，
+    /// 然后再把最终回答一段段推给 iOS。
+    func sendAgentStreamingMessage(
+        _ message: String,
+        systemPrompt: String,
+        history: [ChatHistoryItem]
+    ) throws -> AsyncThrowingStream<String, Error>
 }
 
 /// iOS 调用 Node.js 后端时可能遇到的错误。
@@ -160,11 +174,62 @@ final class ChatAPIClient: ChatAPI {
         systemPrompt: String,
         history: [ChatHistoryItem]
     ) throws -> AsyncThrowingStream<String, Error> {
-        /// 1. 拼出流式接口地址：
-        /// baseURL = http://127.0.0.1:8000
-        /// path    = /api/chat/stream
-        /// final   = http://127.0.0.1:8000/api/chat/stream
-        let url = baseURL.appending(path: "api/chat/stream")
+        /// 普通流式聊天仍然保留给对比测试。
+        ///
+        /// 这个接口的特点是：
+        /// - 后端会先做固定 RAG 检索
+        /// - 模型不会自主选择工具
+        /// - DeepSeek / OpenAI-compatible API 直接 stream: true 返回文本
+        try sendStreamingRequest(
+            path: "api/chat/stream",
+            message: message,
+            systemPrompt: systemPrompt,
+            history: history
+        )
+    }
+
+    func sendAgentStreamingMessage(
+        _ message: String,
+        systemPrompt: String,
+        history: [ChatHistoryItem]
+    ) throws -> AsyncThrowingStream<String, Error> {
+        /// Agent 流式聊天是当前 App 默认入口。
+        ///
+        /// 这个接口的特点是：
+        /// - 后端先把工具列表交给模型
+        /// - 模型可以返回 tool_call
+        /// - 后端执行工具并把结果交回模型
+        /// - 最终回答仍然通过同一套 SSE 解析逻辑返回给 iOS
+        try sendStreamingRequest(
+            path: "api/agent/stream",
+            message: message,
+            systemPrompt: systemPrompt,
+            history: history
+        )
+    }
+
+    private func sendStreamingRequest(
+        path: String,
+        message: String,
+        systemPrompt: String,
+        history: [ChatHistoryItem]
+    ) throws -> AsyncThrowingStream<String, Error> {
+        /// path 由上层入口传入。
+        ///
+        /// 这样普通流式聊天和 Agent 流式聊天可以共用：
+        /// - JSON 请求体编码
+        /// - HTTP 状态码处理
+        /// - SSE data 行解析
+        /// - AsyncThrowingStream 取消逻辑
+        ///
+        /// 差异只保留在后端 URL 上，避免两套几乎一样的网络代码。
+
+        /// 1. 拼出流式接口地址。
+        ///
+        /// 现在有两个流式接口：
+        /// - /api/chat/stream：普通流式聊天
+        /// - /api/agent/stream：Tool Calling Agent，后端会先执行工具，再流式返回最终回答
+        let url = baseURL.appending(path: path)
 
         /// 2. 创建 URLRequest。
         ///

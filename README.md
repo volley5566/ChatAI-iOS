@@ -1,4 +1,8 @@
 # AI iOS Chat Demo
+<img width="1206" height="2622" alt="Simulator Screenshot - iPhone 17 Pro - 2026-05-13 at 19 03 58" src="https://github.com/user-attachments/assets/fb134342-727b-42dc-aaa7-428864719177" />
+<img width="1206" height="2622" alt="Simulator Screenshot - iPhone 17 Pro - 2026-05-13 at 19 03 52" src="https://github.com/user-attachments/assets/095d8ead-6e9e-4186-ae92-8bc76dcc5e51" />
+
+
 
 一个用于学习的 AI 聊天 Demo，包含：
 

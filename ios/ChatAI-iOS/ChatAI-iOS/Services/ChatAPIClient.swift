@@ -13,8 +13,8 @@ import Foundation
 /// 但用协议有一个好处：以后写单元测试或预览时，
 /// 可以做一个假的 ChatAPI，避免每次都真的请求后端。
 protocol ChatAPI {
-    /// 给后端发送用户问题，返回 AI 的回答文本。
-    func sendMessage(_ message: String, systemPrompt: String) async throws -> String
+    /// 给后端发送用户问题，返回 AI 的结构化回答。
+    func sendMessage(_ message: String, systemPrompt: String) async throws -> StructuredAnswer
 }
 
 /// iOS 调用 Node.js 后端时可能遇到的错误。
@@ -59,7 +59,7 @@ final class ChatAPIClient: ChatAPI {
         self.urlSession = urlSession
     }
 
-    func sendMessage(_ message: String, systemPrompt: String) async throws -> String {
+    func sendMessage(_ message: String, systemPrompt: String) async throws -> StructuredAnswer {
         /// 1. 拼出完整接口地址：
         /// baseURL = http://127.0.0.1:8000
         /// path    = /api/chat
@@ -107,16 +107,26 @@ final class ChatAPIClient: ChatAPI {
         /// 7. 把后端 JSON 解码成 Swift 结构体。
         /// 后端成功时返回：
         /// {
-        ///   "answer": "AI 的回答"
+        ///   "title": "标题",
+        ///   "summary": "摘要",
+        ///   "points": ["重点 1", "重点 2"],
+        ///   "next_question": "下一步问题"
         /// }
-        let responseBody = try JSONDecoder().decode(ChatResponseBody.self, from: data)
-        let answer = responseBody.answer.trimmingCharacters(in: .whitespacesAndNewlines)
+        let decoder = JSONDecoder()
 
-        guard !answer.isEmpty else {
+        /// Node.js 返回的是 next_question，
+        /// Swift 里更习惯写成 nextQuestion。
+        /// convertFromSnakeCase 会自动完成这种转换。
+        decoder.keyDecodingStrategy = .convertFromSnakeCase
+
+        let structuredAnswer = try decoder.decode(StructuredAnswer.self, from: data)
+
+        guard !structuredAnswer.title.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ||
+            !structuredAnswer.summary.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw ChatAPIError.emptyAnswer
         }
 
-        return answer
+        return structuredAnswer
     }
 }
 
@@ -136,11 +146,6 @@ private struct ChatRequestBody: Encodable {
         case message
         case systemPrompt = "system_prompt"
     }
-}
-
-/// 成功响应体：Node.js -> iOS。
-private struct ChatResponseBody: Decodable {
-    let answer: String
 }
 
 /// 失败响应体：Node.js -> iOS。

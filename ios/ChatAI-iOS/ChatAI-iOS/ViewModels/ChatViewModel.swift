@@ -80,14 +80,18 @@ final class ChatViewModel: ObservableObject {
 
         do {
             /// 调用网络层，请求 Node.js 后端。
-            let answer = try await chatAPI.sendMessage(
+            let structuredAnswer = try await chatAPI.sendMessage(
                 messageText,
                 systemPrompt: AppConfig.defaultSystemPrompt
             )
 
-            /// 后端成功返回后，把 AI 回答追加到消息列表。
+            /// 后端成功返回后，把 AI 的结构化回答追加到消息列表。
             messages.append(
-                ChatMessage(role: .assistant, content: answer)
+                ChatMessage(
+                    role: .assistant,
+                    content: structuredAnswer.summary,
+                    structuredAnswer: structuredAnswer
+                )
             )
         } catch {
             /// 出错时不崩溃，而是把错误显示在页面上。

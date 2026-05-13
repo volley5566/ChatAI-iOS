@@ -25,14 +25,13 @@ struct MessageBubbleView: View {
                 Spacer(minLength: 48)
             }
 
-            Text(message.content)
-                .font(.body)
-                .foregroundStyle(isUserMessage ? .white : .primary)
+            messageContent
                 .padding(.horizontal, 14)
                 .padding(.vertical, 10)
                 .background(bubbleBackground)
                 .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
                 .textSelection(.enabled)
+                .frame(maxWidth: 560, alignment: isUserMessage ? .trailing : .leading)
 
             if !isUserMessage {
                 Spacer(minLength: 48)
@@ -49,6 +48,21 @@ struct MessageBubbleView: View {
             Color(.secondarySystemBackground)
         }
     }
+
+    /// 气泡里的内容。
+    ///
+    /// 用户消息：显示普通文字。
+    /// AI 消息：优先显示结构化回答；如果没有结构化回答，就显示普通文字。
+    @ViewBuilder
+    private var messageContent: some View {
+        if !isUserMessage, let structuredAnswer = message.structuredAnswer {
+            StructuredAnswerView(answer: structuredAnswer)
+        } else {
+            Text(message.content)
+                .font(.body)
+                .foregroundStyle(isUserMessage ? .white : .primary)
+        }
+    }
 }
 
 #if DEBUG
@@ -56,7 +70,16 @@ struct MessageBubbleView_Previews: PreviewProvider {
     static var previews: some View {
         VStack(spacing: 12) {
             MessageBubbleView(
-                message: ChatMessage(role: .assistant, content: "这是 AI 的回答。")
+                message: ChatMessage(
+                    role: .assistant,
+                    content: "这是 AI 的回答。",
+                    structuredAnswer: StructuredAnswer(
+                        title: "SwiftUI 是什么",
+                        summary: "SwiftUI 是 Apple 提供的声明式 UI 框架。",
+                        points: ["用 View 描述界面", "用状态驱动 UI 自动刷新"],
+                        nextQuestion: "你想继续了解 @State 吗？"
+                    )
+                )
             )
             MessageBubbleView(
                 message: ChatMessage(role: .user, content: "这是用户的问题。")

@@ -79,12 +79,166 @@ type ChatRequestBody = {
 };
 
 type ChatResponseBody = {
-  answer: string;
+  title: string;
+  summary: string;
+  points: string[];
+  next_question: string;
 };
 
 type ErrorResponseBody = {
   error: string;
 };
+
+//8.1 定义结构化输出规则
+/**
+ * 第 3 阶段的核心目标：
+ * 不再让 AI 随便返回一整段文字，
+ * 而是要求 AI 返回固定 JSON 格式。
+ *
+ * 这样 iOS 就可以稳定地解析：
+ * title         -> 标题
+ * summary       -> 摘要
+ * points        -> 重点列表
+ * next_question -> 下一步建议问题
+ */
+const structuredOutputGuide = `
+You must return only valid JSON.
+Do not return Markdown.
+Do not wrap the JSON in code fences.
+Do not add any text before or after the JSON.
+
+The JSON must match this exact shape:
+{
+  "title": "A short title in the user's language",
+  "summary": "A clear short summary in the user's language",
+  "points": [
+    "Key point 1",
+    "Key point 2",
+    "Key point 3"
+  ],
+  "next_question": "A helpful follow-up question in the user's language"
+}
+
+Rules:
+- title must be short.
+- summary must be beginner-friendly.
+- points must contain 2 to 5 short items.
+- next_question must guide the user to continue learning.
+`;
+
+/**
+ * 组合最终发给 AI 的 system prompt。
+ *
+ * systemPrompt：iOS 传来的角色设定，比如“你是 iOS 学习助手”
+ * structuredOutputGuide：后端强制追加的 JSON 输出规则
+ *
+ * 为什么不直接只用 iOS 传来的 system_prompt？
+ * 因为结构化输出是后端和 iOS 的接口契约，
+ * 必须由后端保证，不能完全交给客户端随便覆盖。
+ */
+function buildInstructions(systemPrompt?: string): string {
+  const rolePrompt =
+    systemPrompt ||
+    "You are a helpful AI assistant. Explain concepts clearly and simply for a mobile developer learning iOS, SwiftUI, and AI application development.";
+
+  return `${rolePrompt}\n\n${structuredOutputGuide}`;
+}
+
+/**
+ * 从 AI 返回的文本里提取 JSON。
+ *
+ * 理想情况下，AI 会严格只返回：
+ * { "title": "...", ... }
+ *
+ * 但实际开发中，AI 偶尔可能会返回：
+ * ```json
+ * { ... }
+ * ```
+ *
+ * 所以这里做一个轻量容错：
+ * 取第一个 { 到最后一个 } 之间的内容再 JSON.parse。
+ */
+function extractJsonText(rawText: string): string {
+  const startIndex = rawText.indexOf("{");
+  const endIndex = rawText.lastIndexOf("}");
+
+  if (startIndex === -1 || endIndex === -1 || endIndex <= startIndex) {
+    throw new Error("AI response does not contain a JSON object.");
+  }
+
+  return rawText.slice(startIndex, endIndex + 1);
+}
+
+/**
+ * 把未知数据整理成 ChatResponseBody。
+ *
+ * JSON.parse 的结果类型是 unknown，不能直接相信。
+ * 这个函数会检查字段类型，并提供默认值。
+ * 这样即使 AI 少返回了某个字段，后端也能尽量给 iOS 一个稳定结构。
+ */
+function normalizeStructuredAnswer(
+  value: unknown,
+  rawAnswer: string
+): ChatResponseBody {
+  const data = value as Partial<Record<keyof ChatResponseBody, unknown>>;
+
+  const title =
+    typeof data.title === "string" && data.title.trim()
+      ? data.title.trim()
+      : "AI 回答";
+
+  const summary =
+    typeof data.summary === "string" && data.summary.trim()
+      ? data.summary.trim()
+      : rawAnswer.trim() || "AI 已返回回答，但内容为空。";
+
+  const points = Array.isArray(data.points)
+    ? data.points
+        .filter((item): item is string => typeof item === "string")
+        .map((item) => item.trim())
+        .filter(Boolean)
+        .slice(0, 5)
+    : [];
+
+  const nextQuestion =
+    typeof data.next_question === "string" && data.next_question.trim()
+      ? data.next_question.trim()
+      : "你想继续了解哪一部分？";
+
+  return {
+    title,
+    summary,
+    points,
+    next_question: nextQuestion,
+  };
+}
+
+/**
+ * 把 AI 原始文本转换成结构化响应。
+ *
+ * 如果解析成功：返回 AI 生成的结构化 JSON。
+ * 如果解析失败：使用 fallback，把原始回答放进 summary。
+ *
+ * 这样做的好处：
+ * iOS 永远能收到固定结构，不会因为 AI 格式偶发错误而崩溃。
+ */
+function parseStructuredAnswer(rawAnswer: string): ChatResponseBody {
+  try {
+    const jsonText = extractJsonText(rawAnswer);
+    const parsed = JSON.parse(jsonText);
+
+    return normalizeStructuredAnswer(parsed, rawAnswer);
+  } catch (error) {
+    console.warn("Failed to parse structured AI response:", error);
+
+    return {
+      title: "AI 回答",
+      summary: rawAnswer.trim() || "AI 返回了空内容，请稍后再试。",
+      points: [],
+      next_question: "你想换一种方式再问一次吗？",
+    };
+  }
+}
 
 
 //9. 健康检查接口
@@ -115,7 +269,7 @@ Node.js 调 DeepSeek Chat Completions API
 ↓
 DeepSeek 返回回答
 ↓
-Node.js 把 answer 返回给 iOS
+Node.js 把结构化 JSON 返回给 iOS
  */
 app.post(
   "/api/chat",
@@ -135,9 +289,7 @@ app.post(
         return;
       }
 
-      const instructions =
-        systemPrompt ||
-        "You are a helpful AI assistant. Explain concepts clearly and simply for a mobile developer learning iOS, SwiftUI, and AI application development.";
+      const instructions = buildInstructions(systemPrompt);
       //核心代码
       /**
        * DeepSeek 使用 OpenAI-compatible 的 Chat Completions API。
@@ -158,9 +310,10 @@ app.post(
         ],
       });
 
-      res.json({
-        answer: completion.choices[0]?.message?.content || "",
-      });
+      const rawAnswer = completion.choices[0]?.message?.content || "";
+      const structuredAnswer = parseStructuredAnswer(rawAnswer);
+
+      res.json(structuredAnswer);
     } catch (error) {
       console.error("Chat API error:", error);
 

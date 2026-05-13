@@ -11,8 +11,8 @@
 iOS SwiftUI
   -> Node.js /api/chat
   -> DeepSeek OpenAI-compatible API
-  -> Node.js 返回 answer
-  -> iOS 展示 AI 回答
+  -> Node.js 返回结构化 JSON
+  -> iOS 按标题、摘要、重点列表展示 AI 回答
 ```
 
 ## 1. 启动后端

@@ -29,5 +29,25 @@ struct ChatMessage: Identifiable, Equatable {
     let role: ChatMessageRole
 
     /// 消息正文。
+    ///
+    /// 对用户消息来说，这就是用户输入的内容。
+    /// 对 AI 消息来说，它可以作为 fallback：
+    /// 如果 structuredAnswer 为空，就显示 content。
     let content: String
+
+    /// AI 的结构化回答。
+    ///
+    /// 只有 assistant 消息才会有这个值。
+    /// 用户消息不需要结构化展示，所以保持 nil。
+    let structuredAnswer: StructuredAnswer?
+
+    init(
+        role: ChatMessageRole,
+        content: String,
+        structuredAnswer: StructuredAnswer? = nil
+    ) {
+        self.role = role
+        self.content = content
+        self.structuredAnswer = structuredAnswer
+    }
 }

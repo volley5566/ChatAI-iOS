@@ -67,6 +67,14 @@ final class ChatViewModel: ObservableObject {
     }
 
     /// 点击发送按钮后调用。
+    ///
+    /// 当前第一版默认走“流式输出”：
+    /// - 用户消息立即追加到列表
+    /// - 再追加一条空的 assistant 消息
+    /// - 后端每返回一个 delta，就更新这条 assistant 消息的 content
+    ///
+    /// 原来的结构化接口仍然保留在 ChatAPIClient 里，
+    /// 后续如果想做“流式文本结束后替换成结构化卡片”，可以继续复用它。
     func sendMessage() async {
         let messageText = trimmedInputText
 
@@ -90,28 +98,83 @@ final class ChatViewModel: ObservableObject {
         errorMessage = nil
         isSending = true
 
+        /**
+         用 defer 保证函数退出时一定恢复发送状态。
+
+         流式输出里可能出现几种退出路径：
+         - 正常收到 done
+         - 网络错误
+         - 后端 SSE error
+         - JSON 解析错误
+
+         如果每个分支都手动写 isSending = false，
+         后续维护时很容易漏掉某个分支。
+         */
+        defer {
+            isSending = false
+        }
+
+        var assistantMessageID: UUID?
+        var streamedAnswer = ""
+
         do {
-            /// 调用网络层，请求 Node.js 后端。
-            let structuredAnswer = try await chatAPI.sendMessage(
+            /// 调用网络层，请求 Node.js 流式接口。
+            ///
+            /// sendStreamingMessage 返回的不是完整答案，
+            /// 而是一个 AsyncThrowingStream<String, Error>。
+            /// 每次 for try await 取到的 delta，都是后端 SSE 推来的新文本片段。
+            let stream = try chatAPI.sendStreamingMessage(
                 messageText,
                 systemPrompt: AppConfig.defaultSystemPrompt,
                 history: history
             )
 
-            /// 后端成功返回后，把 AI 的结构化回答追加到消息列表。
-            messages.append(
-                ChatMessage(
-                    role: .assistant,
-                    content: structuredAnswer.summary,
-                    structuredAnswer: structuredAnswer
-                )
-            )
+            /**
+             先追加一条空的 AI 消息，给后续 delta 一个固定容器。
+
+             这条消息的 id 会被保存下来。
+             后面每收到一段 delta，都通过这个 id 找到同一条消息并替换 content。
+             */
+            let assistantMessage = ChatMessage(role: .assistant, content: "")
+            assistantMessageID = assistantMessage.id
+            messages.append(assistantMessage)
+
+            for try await delta in stream {
+                streamedAnswer += delta
+
+                if let assistantMessageID {
+                    updateMessageContent(
+                        id: assistantMessageID,
+                        content: streamedAnswer
+                    )
+                }
+            }
+
+            /**
+             如果后端正常结束，但没有任何文本片段，
+             这通常表示模型返回异常或上游没有输出内容。
+             这里复用已有 emptyAnswer 错误，给用户一个明确提示。
+             */
+            if streamedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+                throw ChatAPIError.emptyAnswer
+            }
         } catch {
+            /**
+             如果错误发生在还没收到任何 delta 之前，
+             页面上会留下一个空白 AI 气泡。
+             这种气泡没有信息量，所以直接移除。
+             *
+             如果已经收到部分内容，则保留 partial answer，
+             同时显示错误提示，方便用户知道回答中途断了。
+             */
+            if streamedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+               let assistantMessageID {
+                messages.removeAll { $0.id == assistantMessageID }
+            }
+
             /// 出错时不崩溃，而是把错误显示在页面上。
             errorMessage = error.localizedDescription
         }
-
-        isSending = false
     }
 
     /// 清空聊天记录，保留一条欢迎语。
@@ -136,14 +199,39 @@ final class ChatViewModel: ObservableObject {
     /// 整理最近几条历史消息，发送给后端。
     ///
     /// 这里会排除最开始那条欢迎语。
-    /// 欢迎语不是用户和 AI 的真实问答内容，
-    /// 发给后端反而会干扰模型理解上下文。
+    ///
+    /// 为什么用 dropFirst？
+    /// messages 第一条是 App 自己放进去的欢迎语，
+    /// 它不是用户和 AI 的真实问答内容。
+    ///
+    /// 流式输出后，assistant 消息可能没有 structuredAnswer，
+    /// 但它的 content 就是真实 AI 回答。
+    /// 所以不能再只用 structuredAnswer 判断 AI 消息是否可进入历史。
     private func recentHistoryItems() -> [ChatHistoryItem] {
         messages
+            .dropFirst()
             .filter { message in
-                message.role == .user || message.structuredAnswer != nil
+                !message.toHistoryItem().content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }
             .suffix(maxHistoryMessages)
             .map { $0.toHistoryItem() }
+    }
+
+    /// 更新某一条消息的正文。
+    ///
+    /// 流式输出时，后端会持续返回 delta。
+    /// 我们不追加新消息，而是不断替换同一条 assistant 消息的 content。
+    ///
+    /// 这样聊天列表始终保持：
+    /// 用户一条消息 -> AI 一条消息
+    ///
+    /// 而不是：
+    /// 用户一条消息 -> AI 片段 1 -> AI 片段 2 -> AI 片段 3
+    private func updateMessageContent(id: UUID, content: String) {
+        guard let index = messages.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+
+        messages[index] = messages[index].updatingContent(content)
     }
 }

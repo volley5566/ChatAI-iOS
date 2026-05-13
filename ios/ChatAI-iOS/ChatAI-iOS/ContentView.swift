@@ -59,7 +59,7 @@ struct ContentView: View {
                     if viewModel.isSending {
                         HStack {
                             ProgressView()
-                            Text("AI 正在思考...")
+                            Text("AI 正在回复...")
                                 .font(.footnote)
                                 .foregroundStyle(.secondary)
                             Spacer()

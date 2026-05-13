@@ -150,6 +150,49 @@ type ScoredKnowledgeDocument = {
   score: number;
 };
 
+/**
+ * 后端目前有两种聊天输出模式。
+ *
+ * structured：
+ * - 旧接口 /api/chat 使用
+ * - AI 返回完整 JSON
+ * - iOS 一次性解析成结构化卡片
+ *
+ * streaming：
+ * - 新接口 /api/chat/stream 使用
+ * - AI 返回普通文本流
+ * - iOS 收到一小段就更新一次气泡
+ */
+type ChatResponseMode = "structured" | "streaming";
+
+/**
+ * 组装好的一次 AI 请求。
+ *
+ * 两个接口都需要：
+ * - RAG 检索结果：用于日志和排查知识库命中情况
+ * - Chat Completions messages：真正发给 DeepSeek 的上下文
+ */
+type PreparedChatCompletion = {
+  knowledgeMatches: ScoredKnowledgeDocument[];
+  aiMessages: ChatCompletionMessageParam[];
+};
+
+/**
+ * SSE 发送给 iOS 的事件格式。
+ *
+ * 第一版只做三类事件：
+ * - delta：一小段新生成的文本
+ * - done：模型已经结束生成
+ * - error：流式过程中出现错误
+ *
+ * 这里不用 data: [DONE]，而是统一用 JSON，
+ * 是为了让 iOS 端只写一个 JSON 解码器即可处理所有事件。
+ */
+type ChatStreamEvent =
+  | { type: "delta"; delta: string }
+  | { type: "done" }
+  | { type: "error"; error: string };
+
 //8.1 定义结构化输出规则
 /**
  * 第 3 阶段的核心目标：
@@ -191,35 +234,53 @@ Rules:
 `;
 
 /**
- * 组合最终发给 AI 的 system prompt。
+ * 流式输出接口使用的回答规则。
  *
- * systemPrompt：iOS 传来的角色设定，比如“你是 iOS 学习助手”
- * structuredOutputGuide：后端强制追加的 JSON 输出规则
+ * 为什么不能复用 structuredOutputGuide？
+ * - 结构化接口需要 AI 返回完整 JSON，方便 iOS 一次性解析成卡片。
+ * - 流式接口需要用户立刻看到自然语言片段。
  *
- * 为什么不直接只用 iOS 传来的 system_prompt？
- * 因为结构化输出是后端和 iOS 的接口契约，
- * 必须由后端保证，不能完全交给客户端随便覆盖。
+ * 如果流式接口也要求 JSON，iOS 会先收到半截：
+ * {"title":"...
+ * 这对用户来说不是一段可读回答，也不适合第一版流式体验。
+ *
+ * 所以第一版 /api/chat/stream 先返回普通文本。
+ * 等流式链路稳定后，可以再做“先流文本，结束后再返回结构化结果”的升级版。
  */
-function buildInstructions(systemPrompt?: string, knowledgeContext?: string): string {
-  const rolePrompt =
-    systemPrompt ||
-    "You are a helpful AI assistant. Explain concepts clearly and simply for a mobile developer learning iOS, SwiftUI, and AI application development.";
+const streamingOutputGuide = `
+Return a normal conversational answer, not JSON.
+Do not wrap the whole answer in a JSON object.
+Do not mention that you are streaming.
+Keep the answer beginner-friendly and practical.
+If code helps, include a short code example.
+Use the same language as the user's question.
+`;
 
-  /**
-   * ragGuide 是 RAG 阶段额外加入的提示词。
-   *
-   * 如果检索到了知识库资料：
-   * - 告诉 AI 优先参考这些资料
-   * - 再让 AI 回答用户问题
-   *
-   * 如果没有检索到资料：
-   * - 明确告诉 AI 没有匹配资料
-   * - 让 AI 使用通用知识回答
-   *
-   * 这样做的好处是：
-   * AI 不会误以为每次都有知识库资料，也更容易遵守我们的回答边界。
-   */
-  const ragGuide = knowledgeContext
+/**
+ * 默认角色设定。
+ *
+ * 结构化接口和流式接口都应该使用同一个默认角色，
+ * 否则同一个问题在两个接口里可能出现风格不一致。
+ */
+const defaultRolePrompt =
+  "You are a helpful AI assistant. Explain concepts clearly and simply for a mobile developer learning iOS, SwiftUI, and AI application development.";
+
+function buildRolePrompt(systemPrompt?: string): string {
+  return systemPrompt || defaultRolePrompt;
+}
+
+/**
+ * 生成 RAG 提示词。
+ *
+ * 这个函数被结构化接口和流式接口共用：
+ * - 有知识库命中时，要求 AI 优先参考知识库。
+ * - 没有命中时，明确告诉 AI 使用通用知识回答。
+ *
+ * 抽出来的原因是：
+ * 两个接口只应该在“输出格式”上不同，不应该在“如何使用知识库”上不同。
+ */
+function buildRagGuide(knowledgeContext?: string): string {
+  return knowledgeContext
     ? `
 Use the following knowledge base context as the primary reference.
 If the context is relevant, base your answer on it.
@@ -232,6 +293,21 @@ ${knowledgeContext}
 No matching knowledge base context was found for this question.
 Answer with your general knowledge, but keep the answer beginner-friendly.
 `;
+}
+
+/**
+ * 组合最终发给 AI 的 system prompt。
+ *
+ * systemPrompt：iOS 传来的角色设定，比如“你是 iOS 学习助手”
+ * structuredOutputGuide：后端强制追加的 JSON 输出规则
+ *
+ * 为什么不直接只用 iOS 传来的 system_prompt？
+ * 因为结构化输出是后端和 iOS 的接口契约，
+ * 必须由后端保证，不能完全交给客户端随便覆盖。
+ */
+function buildInstructions(systemPrompt?: string, knowledgeContext?: string): string {
+  const rolePrompt = buildRolePrompt(systemPrompt);
+  const ragGuide = buildRagGuide(knowledgeContext);
 
   /**
    * 最终 system prompt 的组成：
@@ -244,6 +320,26 @@ Answer with your general knowledge, but keep the answer beginner-friendly.
    * 先告诉 AI 参考资料，再告诉 AI 输出格式。
    */
   return `${rolePrompt}\n\n${ragGuide}\n\n${structuredOutputGuide}`;
+}
+
+/**
+ * 组合流式接口使用的 system prompt。
+ *
+ * 它和 buildInstructions 的主要区别：
+ * - buildInstructions：要求 AI 返回固定 JSON，适合 /api/chat。
+ * - buildStreamingInstructions：要求 AI 返回普通自然语言，适合 /api/chat/stream。
+ *
+ * RAG 和角色设定仍然保持一致，这样两个接口回答同一问题时，
+ * 只是在“返回格式”上不同，不会出现知识来源或语气完全不一致。
+ */
+function buildStreamingInstructions(
+  systemPrompt?: string,
+  knowledgeContext?: string
+): string {
+  const rolePrompt = buildRolePrompt(systemPrompt);
+  const ragGuide = buildRagGuide(knowledgeContext);
+
+  return `${rolePrompt}\n\n${ragGuide}\n\n${streamingOutputGuide}`;
 }
 
 /**
@@ -914,6 +1010,118 @@ ${truncateText(match.document.content, maxCharactersPerDocument)}
 }
 
 /**
+ * 组装一次 Chat Completions 请求需要的全部上下文。
+ *
+ * 为什么要把这段逻辑抽出来？
+ * /api/chat 和 /api/chat/stream 的共同部分很多：
+ * - 根据“当前问题 + 历史”做 RAG 检索
+ * - 把知识库命中结果拼成 system prompt
+ * - 把 system、历史消息、当前用户问题组装成 messages
+ *
+ * 如果两边各写一份，后续维护时很容易出现：
+ * - 普通接口带 history，流式接口忘了带 history
+ * - 普通接口做 RAG，流式接口忘了做 RAG
+ * - 两边 system prompt 逻辑不一致
+ *
+ * 所以这里用 responseMode 控制“输出格式”，其余上下文逻辑保持一致。
+ */
+function prepareChatCompletion(
+  message: string,
+  systemPrompt: string | undefined,
+  history: NormalizedChatHistoryItem[],
+  responseMode: ChatResponseMode
+): PreparedChatCompletion {
+  /**
+   * RAG 检索使用“历史 + 当前问题”。
+   *
+   * 这样用户追问“继续”“举个例子”时，
+   * 检索仍然能看到上一轮里的 @State、URLSession 等关键词。
+   */
+  const retrievalQuery = buildRetrievalQuery(message, history);
+  const knowledgeMatches = retrieveRelevantKnowledge(retrievalQuery);
+
+  /**
+   * 把命中的 Markdown 文档整理成一段 prompt context。
+   * 没有命中时返回 undefined，buildRagGuide 会明确告诉 AI 使用通用知识。
+   */
+  const knowledgeContext = buildKnowledgeContext(knowledgeMatches);
+
+  /**
+   * 两种接口只在输出格式上不同：
+   * - structured：强制 JSON
+   * - streaming：普通文本，方便边生成边展示
+   */
+  const instructions =
+    responseMode === "streaming"
+      ? buildStreamingInstructions(systemPrompt, knowledgeContext)
+      : buildInstructions(systemPrompt, knowledgeContext);
+
+  /**
+   * Chat Completions messages 的顺序很重要：
+   * 1. system：角色、RAG、输出格式规则
+   * 2. history：最近几轮用户和 AI 的真实对话
+   * 3. user：这一次的新问题
+   *
+   * 当前问题不要放进 history，因为它已经作为最后一条 user message 单独发送。
+   */
+  const aiMessages: ChatCompletionMessageParam[] = [
+    {
+      role: "system",
+      content: instructions,
+    },
+    ...history.map((item): ChatCompletionMessageParam => ({
+      role: item.role,
+      content: item.content,
+    })),
+    {
+      role: "user",
+      content: message,
+    },
+  ];
+
+  return {
+    knowledgeMatches,
+    aiMessages,
+  };
+}
+
+/**
+ * 打印本次请求的 RAG 和 history 信息。
+ *
+ * 普通接口和流式接口都会调用它，方便在终端对比：
+ * - 哪些知识库文档被命中
+ * - 发给模型的历史消息数量
+ */
+function logChatContext(
+  responseMode: ChatResponseMode,
+  knowledgeMatches: ScoredKnowledgeDocument[],
+  history: NormalizedChatHistoryItem[]
+): void {
+  console.log(
+    `[RAG:${responseMode}] matched documents: ${
+      knowledgeMatches
+        .map((item) => `${item.document.fileName}:${item.score}`)
+        .join(", ") || "none"
+    }`
+  );
+  console.log(`[History:${responseMode}] messages sent to AI: ${history.length}`);
+}
+
+/**
+ * 向 iOS 写一条 SSE 事件。
+ *
+ * SSE 的基本格式是：
+ *
+ * data: {"type":"delta","delta":"hello"}
+ *
+ * 注意最后必须有一个空行，也就是 \n\n。
+ * 浏览器、URLSession 或其他客户端会用这个空行判断“一条事件结束了”。
+ */
+function writeSseEvent(res: Response, event: ChatStreamEvent): void {
+  res.write(`data: ${JSON.stringify(event)}\n\n`);
+}
+
+/**
  * 服务启动时读取一次知识库。
  *
  * 当前适合学习和小型 Demo。
@@ -977,63 +1185,20 @@ app.post(
         return;
       }
 
-      /**
-       * RAG 第一步：根据用户问题检索知识库。
-       *
-       * 例如用户问 "@State 和 @Binding 有什么区别？"
-       * 这里通常会命中：
-       * - swiftui-state.md
-       * - swiftui-binding.md
-       *
-       * 如果用户追问“请更详细回答”，当前问题本身没有关键词，
-       * 所以这里会把最近历史也一起用于检索。
-       */
-      const retrievalQuery = buildRetrievalQuery(message, history);
-      const knowledgeMatches = retrieveRelevantKnowledge(retrievalQuery);
-
-      /**
-       * RAG 第二步：把命中的文档整理成一段知识库上下文。
-       *
-       * 这段内容不会直接返回给 iOS，
-       * 而是放进 prompt，作为 AI 回答时的参考资料。
-       */
-      const knowledgeContext = buildKnowledgeContext(knowledgeMatches);
-
-      /**
-       * RAG 第三步：把角色设定、知识库上下文、结构化输出规则组合成 system prompt。
-       */
-      const instructions = buildInstructions(systemPrompt, knowledgeContext);
-
-      // 打印命中的文档，方便你在终端确认 RAG 有没有生效。
-      console.log(
-        `[RAG] matched documents: ${
-          knowledgeMatches
-            .map((item) => `${item.document.fileName}:${item.score}`)
-            .join(", ") || "none"
-        }`
+      const { knowledgeMatches, aiMessages } = prepareChatCompletion(
+        message,
+        systemPrompt,
+        history,
+        "structured"
       );
-      console.log(`[History] messages sent to AI: ${history.length}`);
+
+      logChatContext("structured", knowledgeMatches, history);
       //核心代码
       /**
        * DeepSeek 使用 OpenAI-compatible 的 Chat Completions API。
        * model：用哪个模型
        * messages：聊天上下文，system 是系统提示词，user 是用户输入
        */
-      const aiMessages: ChatCompletionMessageParam[] = [
-        {
-          role: "system",
-          content: instructions,
-        },
-        ...history.map((item): ChatCompletionMessageParam => ({
-          role: item.role,
-          content: item.content,
-        })),
-        {
-          role: "user",
-          content: message,
-        },
-      ];
-
       const completion = await deepseek.chat.completions.create({
         model,
         messages: aiMessages,
@@ -1049,6 +1214,163 @@ app.post(
       res.status(500).json({
         error: "Failed to generate AI response.",
       });
+    }
+  }
+);
+
+//11. 流式聊天接口
+/**
+ 这个接口是 /api/chat 的第一版流式版本。
+
+ 它仍然复用：
+ - message：当前用户问题
+ - system_prompt：角色设定
+ - history：最近聊天上下文
+ - RAG：知识库检索结果
+
+ 但返回方式不同：
+ - /api/chat 等模型完整返回后，再把 JSON 一次性返回给 iOS
+ - /api/chat/stream 会把模型生成的文本片段一段段转发给 iOS
+
+ 第一版流式接口只返回普通文本，不返回结构化 JSON。
+ 这样 iOS 可以直接把 delta 追加到同一条 AI 气泡里，
+ 用户不会看到半截 JSON。
+ */
+app.post(
+  "/api/chat/stream",
+  async (
+    req: Request,
+    res: Response<ErrorResponseBody>
+  ) => {
+    let clientClosed = false;
+
+    /**
+     * 如果 iOS 用户离开页面、网络断开、或者请求被取消，
+     * Express 会触发 close。
+     *
+     * 这里记录 clientClosed，后面 for await 读取模型流时会尽快停止写入，
+     * 避免继续往一个已经关闭的连接里 res.write。
+     */
+    res.on("close", () => {
+      clientClosed = true;
+    });
+
+    try {
+      const body = req.body as ChatRequestBody;
+      const message = body.message?.trim();
+      const systemPrompt = body.system_prompt?.trim();
+      const history = sanitizeChatHistory(body.history);
+
+      if (!message) {
+        res.status(400).json({
+          error: "Message cannot be empty.",
+        });
+        return;
+      }
+
+      const { knowledgeMatches, aiMessages } = prepareChatCompletion(
+        message,
+        systemPrompt,
+        history,
+        "streaming"
+      );
+
+      logChatContext("streaming", knowledgeMatches, history);
+
+      /**
+       * SSE 必须设置 text/event-stream。
+       *
+       * Cache-Control:
+       * - no-cache：告诉中间层不要缓存这条响应
+       * - no-transform：避免代理层压缩/改写流式内容
+       *
+       * Connection: keep-alive：
+       * - 告诉客户端这条 HTTP 连接会保持一段时间，用来持续接收事件
+       */
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+
+      /**
+       * 立即把响应头发给 iOS。
+       *
+       * 如果不 flushHeaders，有些客户端会等到第一段 body 出现才认为连接建立。
+       * 对流式输出来说，越早让客户端知道“连接成功”，体验越好。
+       */
+      res.flushHeaders();
+
+      /**
+       * 开启 DeepSeek / OpenAI-compatible 的流式返回。
+       *
+       * stream: true 之后，completion 不再是一个完整对象，
+       * 而是一个 async iterable。我们可以用 for await 一段段读取。
+       */
+      const stream = await deepseek.chat.completions.create({
+        model,
+        messages: aiMessages,
+        stream: true,
+      });
+
+      for await (const chunk of stream) {
+        if (clientClosed) {
+          break;
+        }
+
+        /**
+         * Chat Completions 的流式 chunk 通常长这样：
+         * {
+         *   choices: [
+         *     {
+         *       delta: { content: "一小段文本" }
+         *     }
+         *   ]
+         * }
+         *
+         * 有些 chunk 只表示 role、结束原因等元信息，没有 content。
+         * 这类 chunk 不需要发给 iOS。
+         */
+        const delta = chunk.choices[0]?.delta?.content;
+
+        if (delta) {
+          writeSseEvent(res, {
+            type: "delta",
+            delta,
+          });
+        }
+      }
+
+      if (!clientClosed) {
+        writeSseEvent(res, {
+          type: "done",
+        });
+      }
+
+      res.end();
+    } catch (error) {
+      console.error("Streaming Chat API error:", error);
+
+      /**
+       * 如果错误发生在 SSE 响应头发送之前，
+       * 仍然可以像普通 JSON 接口一样返回 500。
+       *
+       * 如果错误发生在流式连接建立之后，
+       * HTTP 状态码已经不能改了，只能通过 SSE error 事件告诉 iOS。
+       */
+      if (!res.headersSent) {
+        res.status(500).json({
+          error: "Failed to stream AI response.",
+        });
+        return;
+      }
+
+      if (!clientClosed) {
+        writeSseEvent(res, {
+          type: "error",
+          error: "Failed to stream AI response.",
+        });
+      }
+
+      res.end();
     }
   }
 );

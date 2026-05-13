@@ -21,6 +21,13 @@ import Foundation
 /// SwiftUI 的页面状态应该在主线程更新，这样最安全。
 @MainActor
 final class ChatViewModel: ObservableObject {
+    /// 每次请求最多带几条历史消息。
+    ///
+    /// 只带最近 6 条，是为了避免聊天越久，请求内容无限变大。
+    /// 最近 6 条通常可以覆盖 3 轮问答，足够处理：
+    /// “请更详细回答”“继续”“举个例子”这类追问。
+    private let maxHistoryMessages = 6
+
     /// 聊天消息列表。页面会根据它自动刷新。
     @Published var messages: [ChatMessage] = [
         ChatMessage(
@@ -67,6 +74,11 @@ final class ChatViewModel: ObservableObject {
             return
         }
 
+        /// 在追加当前用户消息之前，先整理历史。
+        /// 因为当前 message 会单独作为 message 字段发给后端，
+        /// history 里只需要放“之前发生过的对话”。
+        let history = recentHistoryItems()
+
         /// 先把用户输入追加到聊天列表。
         /// 这样用户点击发送后，能马上看到自己的消息。
         messages.append(
@@ -82,7 +94,8 @@ final class ChatViewModel: ObservableObject {
             /// 调用网络层，请求 Node.js 后端。
             let structuredAnswer = try await chatAPI.sendMessage(
                 messageText,
-                systemPrompt: AppConfig.defaultSystemPrompt
+                systemPrompt: AppConfig.defaultSystemPrompt,
+                history: history
             )
 
             /// 后端成功返回后，把 AI 的结构化回答追加到消息列表。
@@ -118,5 +131,19 @@ final class ChatViewModel: ObservableObject {
     /// 用户只输入空格时，也会被当成空消息。
     private var trimmedInputText: String {
         inputText.trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    /// 整理最近几条历史消息，发送给后端。
+    ///
+    /// 这里会排除最开始那条欢迎语。
+    /// 欢迎语不是用户和 AI 的真实问答内容，
+    /// 发给后端反而会干扰模型理解上下文。
+    private func recentHistoryItems() -> [ChatHistoryItem] {
+        messages
+            .filter { message in
+                message.role == .user || message.structuredAnswer != nil
+            }
+            .suffix(maxHistoryMessages)
+            .map { $0.toHistoryItem() }
     }
 }

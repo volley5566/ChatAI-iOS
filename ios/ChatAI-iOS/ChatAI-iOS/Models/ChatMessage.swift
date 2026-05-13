@@ -11,7 +11,7 @@ import Foundation
 ///
 /// user：用户发出的消息
 /// assistant：AI 返回的消息
-enum ChatMessageRole {
+enum ChatMessageRole: String {
     case user
     case assistant
 }
@@ -49,5 +49,26 @@ struct ChatMessage: Identifiable, Equatable {
         self.role = role
         self.content = content
         self.structuredAnswer = structuredAnswer
+    }
+
+    /// 转成后端接口需要的历史消息。
+    ///
+    /// 用户消息直接使用用户输入的 content。
+    /// AI 消息优先使用 structuredAnswer 整理出的纯文本，
+    /// 这样后端不用理解 iOS 的 UI 结构，也能看懂上一轮 AI 回答。
+    func toHistoryItem() -> ChatHistoryItem {
+        ChatHistoryItem(
+            role: role.rawValue,
+            content: historyContent
+        )
+    }
+
+    /// 用于发送给后端的纯文本内容。
+    private var historyContent: String {
+        if let structuredAnswer {
+            return structuredAnswer.historyContent
+        }
+
+        return content
     }
 }

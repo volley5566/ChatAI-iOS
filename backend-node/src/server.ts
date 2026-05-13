@@ -12,6 +12,7 @@ import express, { Request, Response } from "express";
 import cors from "cors";
 import dotenv from "dotenv";
 import OpenAI from "openai";
+import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 // fs/path 是 Node.js 自带模块。
 // fs：读取 knowledge 目录里的 Markdown 文件。
 // path：拼接不同系统下都安全的文件路径。
@@ -73,14 +74,20 @@ const deepseek = new OpenAI({
  iOS 会给后端传：
  {
   "message": "Explain SwiftUI @State",
-  "system_prompt": "You are a senior iOS mentor..."
+  "system_prompt": "You are a senior iOS mentor...",
+  "history": [
+    { "role": "user", "content": "@State 和 @Binding 有什么区别？" },
+    { "role": "assistant", "content": "@State 保存当前 View 的状态..." }
+  ]
 }
   message：用户的问题
   system_prompt：给 AI 的角色设定，可选
+  history：最近几条聊天历史，可选，用来解决“请更详细回答”这类上下文问题
  */
 type ChatRequestBody = {
   message?: string;
   system_prompt?: string;
+  history?: ChatHistoryItem[];
 };
 
 type ChatResponseBody = {
@@ -92,6 +99,29 @@ type ChatResponseBody = {
 
 type ErrorResponseBody = {
   error: string;
+};
+
+/**
+ * iOS 发来的历史消息。
+ *
+ * 这里把字段定义成可选，是因为外部输入不能完全相信。
+ * 后面会用 sanitizeChatHistory 做校验和清洗。
+ */
+type ChatHistoryItem = {
+  role?: string;
+  content?: string;
+};
+
+/**
+ * 清洗后真正会发给 AI API 的历史消息。
+ *
+ * Chat Completions 里普通对话历史只需要两种 role：
+ * - user：用户说过的话
+ * - assistant：AI 之前回答过的话
+ */
+type NormalizedChatHistoryItem = {
+  role: "user" | "assistant";
+  content: string;
 };
 
 /**
@@ -422,6 +452,133 @@ function parseStructuredAnswer(rawAnswer: string): ChatResponseBody {
     console.warn("Failed to parse structured AI response:", error);
     return buildFallbackStructuredAnswer(rawAnswer);
   }
+}
+
+//8.2 多轮上下文：清洗并限制最近聊天历史
+/**
+ * 每次最多带多少条历史消息。
+ *
+ * 这里选择 6 条，是一个适合 Demo 的平衡：
+ * - 可以覆盖最近 3 轮 user/assistant 对话
+ * - 能解决“请更详细回答”“继续”“举个例子”这类追问
+ * - 不会让请求内容无限增长
+ */
+const maxHistoryMessages = 6;
+
+/**
+ * 每条历史消息最多保留多少字符。
+ *
+ * 如果不限制，长对话会导致：
+ * - 请求变慢
+ * - token 成本变高
+ * - 超过模型上下文限制
+ */
+const maxHistoryContentCharacters = 1200;
+
+function truncateHistoryContent(content: string): string {
+  if (content.length <= maxHistoryContentCharacters) {
+    return content;
+  }
+
+  return `${content.slice(0, maxHistoryContentCharacters)}\n...`;
+}
+
+/**
+ * 清洗 iOS 传来的 history。
+ *
+ * 为什么要清洗？
+ * history 来自客户端，后端不能完全相信：
+ * - role 可能不是 user/assistant
+ * - content 可能不是字符串
+ * - 内容可能为空
+ * - 历史可能非常长
+ *
+ * 清洗后，只保留最近几条合法消息，再发给 AI API。
+ */
+function sanitizeChatHistory(history: unknown): NormalizedChatHistoryItem[] {
+  if (!Array.isArray(history)) {
+    return [];
+  }
+
+  const normalizedHistory = history
+    .map((item): NormalizedChatHistoryItem | undefined => {
+      /**
+       * history 是外部请求体的一部分，不能假设每一项都是对象。
+       *
+       * 例如调试接口、旧版本客户端、或者异常请求都可能传入：
+       * - null
+       * - 字符串 / 数字
+       * - 数组
+       *
+       * 这些值都不是一条合法聊天历史，直接忽略即可。
+       * 这里提前返回，可以避免下面读取 item.role 时出现运行时错误。
+       */
+      if (!item || typeof item !== "object") {
+        return undefined;
+      }
+
+      const historyItem = item as ChatHistoryItem;
+      const role = historyItem.role;
+      const content = historyItem.content;
+
+      /**
+       * 只允许 user / assistant 进入模型上下文。
+       *
+       * 不接受 system / tool 等角色，是为了避免客户端通过 history
+       * 注入额外系统指令，影响后端统一维护的 system prompt 和输出格式规则。
+       */
+      if (role !== "user" && role !== "assistant") {
+        return undefined;
+      }
+
+      /**
+       * content 必须是字符串。
+       *
+       * 不能直接使用 content?.trim()：
+       * 如果 content 是数字、对象或数组，?. 只能防 null/undefined，
+       * 不能防“存在但类型不对”的值，仍然可能触发运行时错误。
+       */
+      if (typeof content !== "string") {
+        return undefined;
+      }
+
+      /**
+       * 空白消息没有上下文价值，也会浪费 token。
+       * 先 trim 再截断，能避免一条全是空格的历史被误认为有效内容。
+       */
+      const trimmedContent = content.trim();
+
+      if (!trimmedContent) {
+        return undefined;
+      }
+
+      return {
+        role,
+        content: truncateHistoryContent(trimmedContent),
+      };
+    })
+    .filter((item): item is NormalizedChatHistoryItem => Boolean(item));
+
+  return normalizedHistory.slice(-maxHistoryMessages);
+}
+
+/**
+ * RAG 检索时使用的查询文本。
+ *
+ * 只用当前 message 有一个问题：
+ * 如果用户追问“请更详细回答”，这句话本身没有 @State/@Binding 等关键词，
+ * 知识库就可能搜不到相关文档。
+ *
+ * 所以这里把“最近历史 + 当前问题”合在一起做检索，
+ * 让追问也能继续命中上一轮相关资料。
+ */
+function buildRetrievalQuery(
+  message: string,
+  history: NormalizedChatHistoryItem[]
+): string {
+  const historyText = history.map((item) => item.content).join("\n");
+
+  return `${historyText}\n${message}`.trim();
 }
 
 //8.2 轻量 RAG：读取 Markdown 知识库并做简单文本检索
@@ -811,6 +968,7 @@ app.post(
       const body = req.body as ChatRequestBody;
       const message = body.message?.trim();
       const systemPrompt = body.system_prompt?.trim();
+      const history = sanitizeChatHistory(body.history);
 
       if (!message) {
         res.status(400).json({
@@ -826,8 +984,12 @@ app.post(
        * 这里通常会命中：
        * - swiftui-state.md
        * - swiftui-binding.md
+       *
+       * 如果用户追问“请更详细回答”，当前问题本身没有关键词，
+       * 所以这里会把最近历史也一起用于检索。
        */
-      const knowledgeMatches = retrieveRelevantKnowledge(message);
+      const retrievalQuery = buildRetrievalQuery(message, history);
+      const knowledgeMatches = retrieveRelevantKnowledge(retrievalQuery);
 
       /**
        * RAG 第二步：把命中的文档整理成一段知识库上下文。
@@ -850,24 +1012,31 @@ app.post(
             .join(", ") || "none"
         }`
       );
+      console.log(`[History] messages sent to AI: ${history.length}`);
       //核心代码
       /**
        * DeepSeek 使用 OpenAI-compatible 的 Chat Completions API。
        * model：用哪个模型
        * messages：聊天上下文，system 是系统提示词，user 是用户输入
        */
+      const aiMessages: ChatCompletionMessageParam[] = [
+        {
+          role: "system",
+          content: instructions,
+        },
+        ...history.map((item): ChatCompletionMessageParam => ({
+          role: item.role,
+          content: item.content,
+        })),
+        {
+          role: "user",
+          content: message,
+        },
+      ];
+
       const completion = await deepseek.chat.completions.create({
         model,
-        messages: [
-          {
-            role: "system",
-            content: instructions,
-          },
-          {
-            role: "user",
-            content: message,
-          },
-        ],
+        messages: aiMessages,
       });
 
       const rawAnswer = completion.choices[0]?.message?.content || "";

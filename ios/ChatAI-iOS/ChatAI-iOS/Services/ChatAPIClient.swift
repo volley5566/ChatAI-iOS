@@ -14,7 +14,11 @@ import Foundation
 /// 可以做一个假的 ChatAPI，避免每次都真的请求后端。
 protocol ChatAPI {
     /// 给后端发送用户问题，返回 AI 的结构化回答。
-    func sendMessage(_ message: String, systemPrompt: String) async throws -> StructuredAnswer
+    func sendMessage(
+        _ message: String,
+        systemPrompt: String,
+        history: [ChatHistoryItem]
+    ) async throws -> StructuredAnswer
 }
 
 /// iOS 调用 Node.js 后端时可能遇到的错误。
@@ -59,7 +63,11 @@ final class ChatAPIClient: ChatAPI {
         self.urlSession = urlSession
     }
 
-    func sendMessage(_ message: String, systemPrompt: String) async throws -> StructuredAnswer {
+    func sendMessage(
+        _ message: String,
+        systemPrompt: String,
+        history: [ChatHistoryItem]
+    ) async throws -> StructuredAnswer {
         /// 1. 拼出完整接口地址：
         /// baseURL = http://127.0.0.1:8000
         /// path    = /api/chat
@@ -77,11 +85,16 @@ final class ChatAPIClient: ChatAPI {
         /// 后端 server.ts 期望收到：
         /// {
         ///   "message": "...",
-        ///   "system_prompt": "..."
+        ///   "system_prompt": "...",
+        ///   "history": [
+        ///     { "role": "user", "content": "上一轮用户问题" },
+        ///     { "role": "assistant", "content": "上一轮 AI 回答" }
+        ///   ]
         /// }
         let requestBody = ChatRequestBody(
             message: message,
-            systemPrompt: systemPrompt
+            systemPrompt: systemPrompt,
+            history: history
         )
         request.httpBody = try JSONEncoder().encode(requestBody)
 
@@ -137,6 +150,7 @@ final class ChatAPIClient: ChatAPI {
 private struct ChatRequestBody: Encodable {
     let message: String
     let systemPrompt: String
+    let history: [ChatHistoryItem]
 
     /// Swift 通常用驼峰命名 systemPrompt；
     /// 后端现在用下划线命名 system_prompt。
@@ -145,6 +159,7 @@ private struct ChatRequestBody: Encodable {
     enum CodingKeys: String, CodingKey {
         case message
         case systemPrompt = "system_prompt"
+        case history
     }
 }
 

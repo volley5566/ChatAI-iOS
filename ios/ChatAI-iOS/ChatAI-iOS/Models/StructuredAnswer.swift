@@ -36,4 +36,43 @@ struct StructuredAnswer: Decodable, Equatable {
 
     /// AI 推荐用户下一步可以追问的问题。
     let nextQuestion: String
+
+    /// 把结构化回答整理成普通文本，作为下一轮对话的历史上下文。
+    ///
+    /// 为什么不直接把 JSON 发回后端？
+    /// 因为 AI API 需要的是自然对话历史。
+    /// 用标题、摘要、重点拼成文本，更接近“上一轮 AI 说过的话”。
+    var historyContent: String {
+        var parts = [
+            title,
+            summary
+        ]
+
+        if !points.isEmpty {
+            let pointsText = points
+                .map { "- \($0)" }
+                .joined(separator: "\n")
+
+            parts.append("重点：\n\(pointsText)")
+        }
+
+        /// UI 会把 nextQuestion 显示成“下一步”建议。
+        ///
+        /// 如果用户下一句回复“好，讲这个”“继续这个”，
+        /// 模型需要从历史里看到上一轮 AI 提出的建议问题，
+        /// 才能正确理解“这个”指的是什么。
+        ///
+        /// 所以这里不能只记录 title / summary / points，
+        /// 也要把 nextQuestion 放进历史上下文。
+        let trimmedNextQuestion = nextQuestion.trimmingCharacters(in: .whitespacesAndNewlines)
+
+        if !trimmedNextQuestion.isEmpty {
+            parts.append("下一步建议：\n\(trimmedNextQuestion)")
+        }
+
+        return parts
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+            .joined(separator: "\n")
+    }
 }

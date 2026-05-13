@@ -119,7 +119,62 @@ backend-node/knowledge/
 
 新增知识时，可以继续往 `backend-node/knowledge/` 里添加 `.md` 文件。
 
-## 5. 多轮上下文
+## 5. 后端代码结构
+
+后端已经按职责拆成多个模块，`server.ts` 只保留 Express 路由和 HTTP/SSE 生命周期。
+
+```text
+backend-node/src/server.ts
+  Express 路由、SSE 连接、服务启动
+
+backend-node/src/config.ts
+  读取和校验 .env 配置
+
+backend-node/src/deepseekClient.ts
+  创建 DeepSeek/OpenAI-compatible SDK 客户端
+
+backend-node/src/chatCompletion.ts
+  普通聊天接口的 RAG 上下文和 messages 组装
+
+backend-node/src/chatHistory.ts
+  清洗 history，限制历史长度，组装检索 query
+
+backend-node/src/knowledge.ts
+  读取 backend-node/knowledge/*.md，并做轻量关键词检索
+
+backend-node/src/prompts.ts
+  结构化输出、普通流式输出、Agent 的 prompt 规则
+
+backend-node/src/structuredAnswer.ts
+  解析 /api/chat 的结构化 JSON 回答，并提供兜底解析
+
+backend-node/src/agentTools.ts
+  Tool Calling 工具定义、参数校验、工具执行、工具状态事件
+
+backend-node/src/agentRunner.ts
+  Agent Runner，负责 tool_call 循环和 DeepSeek reasoning_content 回传
+
+backend-node/src/sse.ts
+  统一写 SSE event
+
+backend-node/src/types.ts
+  后端共享类型
+```
+
+拆分后的职责关系：
+
+```text
+server.ts
+  -> 普通聊天：chatCompletion + structuredAnswer + sse
+  -> Agent 聊天：agentRunner -> agentTools -> knowledge
+  -> 共用：config + deepseekClient + chatHistory + types
+```
+
+这样后续新增工具时，主要改 `agentTools.ts`；
+调整 Agent 循环时，主要改 `agentRunner.ts`；
+调整知识库检索时，主要改 `knowledge.ts`。
+
+## 6. 多轮上下文
 
 iOS 每次发送消息时，会把最近 6 条历史消息一起发送给后端：
 
@@ -142,7 +197,7 @@ AI 就能知道这些话是在接着上一轮问题说。
 
 为了避免请求内容无限增长，当前只保留最近 6 条历史消息。
 
-## 6. 流式输出
+## 7. 流式输出
 
 项目保留了普通流式输出接口：
 
@@ -309,7 +364,7 @@ curl -N \
 
 如果不加 `-N`，curl 可能会等攒够一批内容后再显示，看起来就不像实时流式输出。
 
-## 7. Tool Calling / Agent
+## 8. Tool Calling / Agent
 
 当前 App 默认使用第一版 Agent 流式接口：
 

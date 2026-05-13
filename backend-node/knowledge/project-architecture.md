@@ -138,4 +138,15 @@ iOS 不会把这些状态显示成新的聊天消息。
 
 核心文件：
 
-- `backend-node/src/server.ts`
+- `backend-node/src/server.ts`：Express 路由和服务启动
+- `backend-node/src/config.ts`：环境变量配置
+- `backend-node/src/deepseekClient.ts`：DeepSeek/OpenAI-compatible 客户端
+- `backend-node/src/chatCompletion.ts`：普通聊天请求上下文组装
+- `backend-node/src/chatHistory.ts`：聊天历史清洗和检索 query 组装
+- `backend-node/src/knowledge.ts`：Markdown 知识库读取和检索
+- `backend-node/src/prompts.ts`：结构化、流式、Agent prompt 规则
+- `backend-node/src/structuredAnswer.ts`：结构化 JSON 解析和兜底处理
+- `backend-node/src/agentTools.ts`：Tool Calling 工具定义和执行
+- `backend-node/src/agentRunner.ts`：Agent tool loop
+- `backend-node/src/sse.ts`：SSE 事件写入
+- `backend-node/src/types.ts`：后端共享类型

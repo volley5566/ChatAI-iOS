@@ -123,13 +123,14 @@ final class ChatViewModel: ObservableObject {
             /// 调用网络层，请求 Node.js Agent 流式接口。
             ///
             /// sendAgentStreamingMessage 返回的不是完整答案，
-            /// 而是一个 AsyncThrowingStream<String, Error>。
+            /// 而是一个 AsyncThrowingStream<ChatStreamUpdate, Error>。
             ///
             /// 后端会先做 Tool Calling：
             /// 模型决定是否调用 searchKnowledge / generateQuiz，
             /// 后端执行工具并把结果交回模型。
             ///
-            /// 工具阶段完成后，最终回答才会一段段通过 SSE 推给 iOS。
+            /// 工具阶段会通过 tool_start / tool_done 告诉 iOS 当前进度。
+            /// 工具阶段完成后，最终回答才会通过 delta 一段段推给 iOS。
             let stream = try chatAPI.sendAgentStreamingMessage(
                 messageText,
                 systemPrompt: AppConfig.defaultSystemPrompt,
@@ -146,14 +147,35 @@ final class ChatViewModel: ObservableObject {
             assistantMessageID = assistantMessage.id
             messages.append(assistantMessage)
 
-            for try await delta in stream {
-                streamedAnswer += delta
+            for try await update in stream {
+                switch update {
+                case .delta(let delta):
+                    streamedAnswer += delta
 
-                if let assistantMessageID {
-                    updateMessageContent(
-                        id: assistantMessageID,
-                        content: streamedAnswer
-                    )
+                    if let assistantMessageID {
+                        updateMessageContent(
+                            id: assistantMessageID,
+                            content: streamedAnswer
+                        )
+                    }
+
+                case .toolStart(let toolUpdate):
+                    if let assistantMessageID {
+                        updateAgentToolStep(
+                            messageID: assistantMessageID,
+                            update: toolUpdate,
+                            status: .running
+                        )
+                    }
+
+                case .toolDone(let toolUpdate):
+                    if let assistantMessageID {
+                        updateAgentToolStep(
+                            messageID: assistantMessageID,
+                            update: toolUpdate,
+                            status: toolUpdate.ok == false ? .failed : .completed
+                        )
+                    }
                 }
             }
 
@@ -240,5 +262,42 @@ final class ChatViewModel: ObservableObject {
         }
 
         messages[index] = messages[index].updatingContent(content)
+    }
+
+    /// 更新某条 AI 消息里的 Agent 工具执行步骤。
+    ///
+    /// tool_start 和 tool_done 使用同一个 toolCallID。
+    /// 如果已经存在对应步骤，就更新状态和文案；
+    /// 如果不存在，就追加一条新步骤。
+    ///
+    /// 这样 UI 能展示：
+    /// - 正在查询知识库
+    /// - 已查询知识库，找到 2 条相关资料
+    private func updateAgentToolStep(
+        messageID: UUID,
+        update: AgentToolUpdate,
+        status: AgentToolStepStatus
+    ) {
+        guard let messageIndex = messages.firstIndex(where: { $0.id == messageID }) else {
+            return
+        }
+
+        let step = AgentToolStep(
+            id: update.toolCallID,
+            toolName: update.toolName,
+            displayName: update.displayName,
+            status: status,
+            message: update.message
+        )
+
+        var steps = messages[messageIndex].agentToolSteps
+
+        if let stepIndex = steps.firstIndex(where: { $0.id == step.id }) {
+            steps[stepIndex] = step
+        } else {
+            steps.append(step)
+        }
+
+        messages[messageIndex] = messages[messageIndex].updatingAgentToolSteps(steps)
     }
 }

@@ -16,6 +16,34 @@ enum ChatMessageRole: String {
     case assistant
 }
 
+/// Agent 工具执行步骤的状态。
+///
+/// running：工具正在执行
+/// completed：工具执行成功
+/// failed：工具执行失败
+enum AgentToolStepStatus: Equatable {
+    case running
+    case completed
+    case failed
+}
+
+/// 一条 Agent 工具执行记录。
+///
+/// 它不是聊天历史的一部分，而是 UI 辅助信息：
+/// 用来告诉用户 AI 当前调用了哪个工具、工具是否完成。
+struct AgentToolStep: Identifiable, Equatable {
+    /// 后端 SSE 里传来的 tool_call_id。
+    ///
+    /// 同一个工具可能在一次回答里被调用多次。
+    /// 用 toolCallID 可以精确更新对应那一步，而不是只靠工具名猜。
+    let id: String
+
+    let toolName: String
+    let displayName: String
+    let status: AgentToolStepStatus
+    let message: String
+}
+
 /// App 页面中显示的一条聊天消息。
 ///
 /// 注意：这个模型只给 iOS 页面显示使用。
@@ -41,16 +69,25 @@ struct ChatMessage: Identifiable, Equatable {
     /// 用户消息不需要结构化展示，所以保持 nil。
     let structuredAnswer: StructuredAnswer?
 
+    /// Agent 工具执行过程。
+    ///
+    /// 普通聊天消息为空。
+    /// Agent 回答时，如果后端发送 tool_start / tool_done 事件，
+    /// ViewModel 会把这些事件整理成步骤展示在 AI 气泡里。
+    let agentToolSteps: [AgentToolStep]
+
     init(
         role: ChatMessageRole,
         content: String,
         structuredAnswer: StructuredAnswer? = nil,
+        agentToolSteps: [AgentToolStep] = [],
         id: UUID = UUID()
     ) {
         self.id = id
         self.role = role
         self.content = content
         self.structuredAnswer = structuredAnswer
+        self.agentToolSteps = agentToolSteps
     }
 
     /// 返回一条“正文已更新，但 id / role / structuredAnswer 保持不变”的消息。
@@ -68,6 +105,21 @@ struct ChatMessage: Identifiable, Equatable {
             role: role,
             content: newContent,
             structuredAnswer: structuredAnswer,
+            agentToolSteps: agentToolSteps,
+            id: id
+        )
+    }
+
+    /// 返回一条“工具步骤已更新，但消息正文和 id 保持不变”的消息。
+    ///
+    /// 这样工具状态变化时，SwiftUI 仍然认为这是同一条 AI 消息，
+    /// 不会把工具状态渲染成新的聊天气泡。
+    func updatingAgentToolSteps(_ newSteps: [AgentToolStep]) -> ChatMessage {
+        ChatMessage(
+            role: role,
+            content: content,
+            structuredAnswer: structuredAnswer,
+            agentToolSteps: newSteps,
             id: id
         )
     }

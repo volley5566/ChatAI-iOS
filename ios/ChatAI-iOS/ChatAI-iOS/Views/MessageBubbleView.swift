@@ -52,15 +52,73 @@ struct MessageBubbleView: View {
     /// 气泡里的内容。
     ///
     /// 用户消息：显示普通文字。
-    /// AI 消息：优先显示结构化回答；如果没有结构化回答，就显示普通文字。
+    /// AI 消息：
+    /// - 如果有 Agent 工具步骤，先显示工具执行状态
+    /// - 优先显示结构化回答
+    /// - 如果没有结构化回答，就显示普通文字
     @ViewBuilder
     private var messageContent: some View {
-        if !isUserMessage, let structuredAnswer = message.structuredAnswer {
-            StructuredAnswerView(answer: structuredAnswer)
-        } else {
+        if isUserMessage {
             Text(message.content)
                 .font(.body)
-                .foregroundStyle(isUserMessage ? .white : .primary)
+                .foregroundStyle(.white)
+        } else if let structuredAnswer = message.structuredAnswer {
+            VStack(alignment: .leading, spacing: 8) {
+                agentToolStepsView
+                StructuredAnswerView(answer: structuredAnswer)
+            }
+        } else {
+            VStack(alignment: .leading, spacing: 8) {
+                agentToolStepsView
+
+                if !message.content.isEmpty {
+                    Text(message.content)
+                        .font(.body)
+                        .foregroundStyle(.primary)
+                }
+            }
+        }
+    }
+
+    /// Agent 工具执行状态。
+    ///
+    /// 这些状态来自后端 SSE：
+    /// - tool_start：显示“正在...”
+    /// - tool_done：显示“已完成...”
+    ///
+    /// 它们放在 AI 气泡内部，表示这是当前回答生成过程的一部分。
+    @ViewBuilder
+    private var agentToolStepsView: some View {
+        if !message.agentToolSteps.isEmpty {
+            VStack(alignment: .leading, spacing: 6) {
+                ForEach(message.agentToolSteps) { step in
+                    HStack(spacing: 6) {
+                        toolStatusIcon(for: step.status)
+                            .font(.caption)
+                            .frame(width: 14, height: 14)
+
+                        Text(step.message)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
+            }
+        }
+    }
+
+    /// 根据工具状态切换图标。
+    @ViewBuilder
+    private func toolStatusIcon(for status: AgentToolStepStatus) -> some View {
+        switch status {
+        case .running:
+            ProgressView()
+                .scaleEffect(0.55)
+        case .completed:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        case .failed:
+            Image(systemName: "exclamationmark.circle.fill")
+                .foregroundStyle(.red)
         }
     }
 }
@@ -78,7 +136,16 @@ struct MessageBubbleView_Previews: PreviewProvider {
                         summary: "SwiftUI 是 Apple 提供的声明式 UI 框架。",
                         points: ["用 View 描述界面", "用状态驱动 UI 自动刷新"],
                         nextQuestion: "你想继续了解 @State 吗？"
-                    )
+                    ),
+                    agentToolSteps: [
+                        AgentToolStep(
+                            id: "call_1",
+                            toolName: "searchKnowledge",
+                            displayName: "查询知识库",
+                            status: .completed,
+                            message: "已查询知识库，找到 2 条相关资料"
+                        )
+                    ]
                 )
             )
             MessageBubbleView(

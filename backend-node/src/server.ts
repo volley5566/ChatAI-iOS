@@ -189,6 +189,8 @@ type PreparedChatCompletion = {
  * - delta：一小段新生成的文本
  * - done：模型已经结束生成
  * - error：流式过程中出现错误
+ * - tool_start：Agent 开始执行某个工具
+ * - tool_done：Agent 工具执行完成
  *
  * 这里不用 data: [DONE]，而是统一用 JSON，
  * 是为了让 iOS 端只写一个 JSON 解码器即可处理所有事件。
@@ -196,7 +198,22 @@ type PreparedChatCompletion = {
 type ChatStreamEvent =
   | { type: "delta"; delta: string }
   | { type: "done" }
-  | { type: "error"; error: string };
+  | { type: "error"; error: string }
+  | {
+      type: "tool_start";
+      tool_call_id: string;
+      tool_name: string;
+      display_name: string;
+      message: string;
+    }
+  | {
+      type: "tool_done";
+      tool_call_id: string;
+      tool_name: string;
+      display_name: string;
+      ok: boolean;
+      message: string;
+    };
 
 /**
  * 第一版学习助手 Agent 支持的工具名。
@@ -1436,6 +1453,107 @@ function stringifyToolResult(result: AgentToolExecutionResult): string {
 }
 
 /**
+ * 把工具名转换成适合 iOS 展示的短文案。
+ *
+ * 模型和后端内部使用 searchKnowledge / generateQuiz 这类英文函数名，
+ * 但用户更容易理解“查询知识库”“生成练习题”。
+ */
+function getAgentToolDisplayName(toolName: string): string {
+  switch (toolName) {
+    case "searchKnowledge":
+      return "查询知识库";
+    case "generateQuiz":
+      return "生成练习题";
+    default:
+      return "执行工具";
+  }
+}
+
+function buildToolStartEvent(toolCall: ChatCompletionMessageToolCall): ChatStreamEvent {
+  const toolName = toolCall.type === "function" ? toolCall.function.name : "unknown";
+  const displayName = getAgentToolDisplayName(toolName);
+
+  return {
+    type: "tool_start",
+    tool_call_id: toolCall.id,
+    tool_name: toolName,
+    display_name: displayName,
+    message: `正在${displayName}`,
+  };
+}
+
+function getToolResultCount(result: AgentToolExecutionResult): number | undefined {
+  if (!isObjectRecord(result.result)) {
+    return undefined;
+  }
+
+  const matches = result.result.matches;
+  const questions = result.result.questions;
+
+  if (Array.isArray(matches)) {
+    return matches.length;
+  }
+
+  if (Array.isArray(questions)) {
+    return questions.length;
+  }
+
+  return undefined;
+}
+
+/**
+ * 生成工具完成后的展示文案。
+ *
+ * 这里不把完整工具结果发给 iOS，
+ * 只发一个适合 UI 展示的摘要：
+ * - 知识库查到几条资料
+ * - 练习题生成了几道题
+ * - 工具失败时显示错误
+ *
+ * 完整结果仍然只放回模型 messages，
+ * 避免 UI 层承担解析工具数据结构的职责。
+ */
+function buildToolDoneMessage(result: AgentToolExecutionResult): string {
+  const displayName = getAgentToolDisplayName(result.toolName);
+
+  if (!result.ok) {
+    return `${displayName}失败：${result.error || "未知错误"}`;
+  }
+
+  const resultCount = getToolResultCount(result);
+
+  if (result.toolName === "searchKnowledge") {
+    return typeof resultCount === "number"
+      ? `已查询知识库，找到 ${resultCount} 条相关资料`
+      : "已查询知识库";
+  }
+
+  if (result.toolName === "generateQuiz") {
+    return typeof resultCount === "number"
+      ? `已生成 ${resultCount} 道练习题`
+      : "已生成练习题";
+  }
+
+  return `${displayName}完成`;
+}
+
+function buildToolDoneEvent(
+  toolCall: ChatCompletionMessageToolCall,
+  result: AgentToolExecutionResult
+): ChatStreamEvent {
+  const toolName = toolCall.type === "function" ? toolCall.function.name : result.toolName;
+
+  return {
+    type: "tool_done",
+    tool_call_id: toolCall.id,
+    tool_name: toolName,
+    display_name: getAgentToolDisplayName(toolName),
+    ok: result.ok,
+    message: buildToolDoneMessage(result),
+  };
+}
+
+/**
  * Agent 最多允许连续调用几轮工具。
  *
  * 为什么需要上限？
@@ -1557,7 +1675,8 @@ function buildAssistantToolMessage(
 async function runAgentToolLoop(
   message: string,
   systemPrompt: string | undefined,
-  history: NormalizedChatHistoryItem[]
+  history: NormalizedChatHistoryItem[],
+  onToolEvent?: (event: ChatStreamEvent) => void
 ): Promise<AgentRunResult> {
   const messages = buildAgentMessages(message, systemPrompt, history);
   let toolCallCount = 0;
@@ -1603,11 +1722,15 @@ async function runAgentToolLoop(
     messages.push(buildAssistantToolMessage(assistantMessage, toolCalls));
 
     for (const toolCall of toolCalls) {
+      onToolEvent?.(buildToolStartEvent(toolCall));
+
       const toolResult = executeAgentTool(toolCall);
 
       console.log(
         `[Agent] tool call: ${toolCall.type === "function" ? toolCall.function.name : toolCall.type}, ok: ${toolResult.ok}`
       );
+
+      onToolEvent?.(buildToolDoneEvent(toolCall, toolResult));
 
       messages.push({
         role: "tool",
@@ -2062,7 +2185,16 @@ app.post(
        *
        * 后端会限制最多 maxAgentToolSteps 轮，防止无限循环。
        */
-      const agentRun = await runAgentToolLoop(message, systemPrompt, history);
+      const agentRun = await runAgentToolLoop(
+        message,
+        systemPrompt,
+        history,
+        (event) => {
+          if (!clientClosed) {
+            writeSseEvent(res, event);
+          }
+        }
+      );
 
       console.log(`[Agent] tool calls executed: ${agentRun.toolCallCount}`);
 

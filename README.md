@@ -208,6 +208,10 @@ Content-Type: text/event-stream
 每个事件都是一行 `data:`，后面跟 JSON：
 
 ```text
+data: {"type":"tool_start","tool_call_id":"call_xxx","tool_name":"searchKnowledge","display_name":"查询知识库","message":"正在查询知识库"}
+
+data: {"type":"tool_done","tool_call_id":"call_xxx","tool_name":"searchKnowledge","display_name":"查询知识库","ok":true,"message":"已查询知识库，找到 2 条相关资料"}
+
 data: {"type":"delta","delta":"SwiftUI "}
 
 data: {"type":"delta","delta":"里的 @State "}
@@ -223,9 +227,11 @@ data: {"type":"done"}
 data: {"type":"error","error":"Failed to stream AI response."}
 ```
 
-iOS 只需要解析三种事件：
+iOS 只需要解析这几种事件：
 
 ```text
+tool_start：显示 Agent 正在调用哪个工具
+tool_done：显示工具执行结果摘要
 delta：追加文本
 done：结束本次回答
 error：显示错误提示
@@ -313,8 +319,10 @@ POST /api/agent/stream
 iOS 发送 message + history
   -> Node.js 把可用工具列表交给模型
   -> 模型判断是否需要调用工具
+  -> Node.js 通过 SSE 发送 tool_start
   -> Node.js 校验工具名和参数
   -> Node.js 执行真正的后端工具
+  -> Node.js 通过 SSE 发送 tool_done
   -> Node.js 把工具结果交回模型
   -> 模型生成最终回答
   -> Node.js 通过 SSE 流式返回给 iOS
@@ -402,6 +410,30 @@ Agent 的工具阶段是非流式的：
 工具调用阶段：稳定、易调试
 最终回答阶段：用户体验仍然是流式
 ```
+
+### iOS 如何展示 Agent 执行过程
+
+Agent 接口会在工具开始和结束时发送额外 SSE 事件：
+
+```text
+tool_start
+  -> iOS 在当前 AI 气泡里显示“正在查询知识库”
+
+tool_done
+  -> iOS 把同一步更新成“已查询知识库，找到 2 条相关资料”
+
+delta
+  -> iOS 继续把最终回答追加到同一条 AI 气泡
+```
+
+这样聊天列表仍然保持：
+
+```text
+用户一条消息
+AI 一条消息
+```
+
+但 AI 消息内部能看到 Agent 调用了哪个工具。
 
 后续如果要做更高级版本，可以继续升级成“流式 tool_call 参数拼接”，但第一版没必要一开始就做这么复杂。
 

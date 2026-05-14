@@ -7,7 +7,22 @@
 
 import Foundation
 
+/// 整体架构：
+///
+/// ChatViewModel
+///     ↓ 调用协议
+/// ChatAPI
+///     ↓ 真实实现
+/// ChatAPIClient
+///     ↓
+/// URLSession
+///     ↓
+/// Node.js 后端
+///     ↓
+/// AI / Agent / Tool Calling
+
 /// 网络层向 ViewModel 暴露的流式更新。
+/// 给 ViewModel 用的流式事件。
 ///
 /// 后端 SSE 里现在不只有文本：
 /// - delta：最终回答的一小段文本
@@ -25,6 +40,11 @@ enum ChatStreamUpdate: Equatable {
 ///
 /// toolCallID 用来对应后端的 tool_call_id。
 /// 同一个工具可能被调用多次，所以不能只靠 toolName 更新 UI。
+///
+/// 它表示后端告诉 iOS：
+/// - 某个工具开始了
+/// - 某个工具完成了
+/// - 某个工具失败了
 struct AgentToolUpdate: Equatable {
     let toolCallID: String
     let toolName: String
@@ -33,13 +53,19 @@ struct AgentToolUpdate: Equatable {
     let ok: Bool?
 }
 
+/// ChatAPI 协议：网络层抽象，聊天网络接口应该具备哪些能力。
 /// 把“聊天接口”抽象成一个协议。
 ///
 /// 现在项目很小，直接写 class 也可以。
 /// 但用协议有一个好处：以后写单元测试或预览时，
 /// 可以做一个假的 ChatAPI，避免每次都真的请求后端。
+///
+/// 重要：
+/// 因为 ViewModel 依赖的是：private let chatAPI: ChatAPI
+/// 而不是直接依赖：private let chatAPI = ChatAPIClient()
 protocol ChatAPI {
     /// 给后端发送用户问题，返回 AI 的结构化回答。
+    /// 普通非流式结构化回答。
     func sendMessage(
         _ message: String,
         systemPrompt: String,
@@ -53,6 +79,7 @@ protocol ChatAPI {
     ///
     /// ViewModel 会用 for try await 消费这个 stream：
     /// 每收到一个 delta，就把它追加到同一条 AI 消息气泡里。
+    /// 普通流式文本回答。
     func sendStreamingMessage(
         _ message: String,
         systemPrompt: String,
@@ -67,6 +94,7 @@ protocol ChatAPI {
     ///
     /// Agent 接口会先在后端执行 Tool Calling，
     /// 然后再把最终回答一段段推给 iOS。
+    /// Agent 流式回答，包含工具状态和文本片段。
     func sendAgentStreamingMessage(
         _ message: String,
         systemPrompt: String,
@@ -98,12 +126,19 @@ enum ChatAPIError: LocalizedError {
     }
 }
 
+/// ChatAPIClient：真正发请求的类。
+/// 它实现了 ChatAPI 协议。
 /// 真正负责发 HTTP 请求的类。
 ///
 /// 这个类只关心一件事：
 /// 把 Swift 数据编码成 JSON -> 发给后端 -> 把后端 JSON 解码成 Swift 数据。
 final class ChatAPIClient: ChatAPI {
+    // 里面有两个核心成员，这里通过 init 传入。
+
+    /// 后端基础地址。
     private let baseURL: URL
+
+    /// URLSession 是 iOS 原生网络请求工具。
     private let urlSession: URLSession
 
     /// 依赖通过 init 传进来，代码会更容易测试。
@@ -116,34 +151,46 @@ final class ChatAPIClient: ChatAPI {
         self.urlSession = urlSession
     }
 
+    /// 给后端发送用户问题，等待后端一次性返回完整 StructuredAnswer。
+    ///
+    /// 1. 拼 URL
+    /// 2. 创建 URLRequest
+    /// 3. 设置 POST 和 Content-Type
+    /// 4. 编码请求体 JSON
+    /// 5. 用 URLSession 发请求
+    /// 6. 检查 HTTP 响应
+    /// 7. 检查状态码
+    /// 8. 解码 StructuredAnswer
+    /// 9. 检查是否为空
+    /// 10. 返回结果
     func sendMessage(
         _ message: String,
         systemPrompt: String,
         history: [ChatHistoryItem]
     ) async throws -> StructuredAnswer {
-        /// 1. 拼出完整接口地址：
-        /// baseURL = http://127.0.0.1:8000
-        /// path    = /api/chat
-        /// final   = http://127.0.0.1:8000/api/chat
+        // 1. 拼出完整接口地址：
+        // baseURL = http://127.0.0.1:8000
+        // path    = /api/chat
+        // final   = http://127.0.0.1:8000/api/chat
         let url = baseURL.appending(path: "api/chat")
 
-        /// 2. 创建 URLRequest。
-        /// URLRequest 可以理解为“一次 HTTP 请求的说明书”：
-        /// 请求哪个地址、用 GET 还是 POST、请求头是什么、请求体是什么。
+        // 2. 创建 URLRequest。
+        // URLRequest 可以理解为“一次 HTTP 请求的说明书”：
+        // 请求哪个地址、用 GET 还是 POST、请求头是什么、请求体是什么。
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
-        /// 3. 把 Swift 结构体编码成 JSON 数据。
-        /// 后端 server.ts 期望收到：
-        /// {
-        ///   "message": "...",
-        ///   "system_prompt": "...",
-        ///   "history": [
-        ///     { "role": "user", "content": "上一轮用户问题" },
-        ///     { "role": "assistant", "content": "上一轮 AI 回答" }
-        ///   ]
-        /// }
+        // 3. 把 Swift 结构体编码成 JSON 数据。
+        // 后端 server.ts 期望收到：
+        // {
+        //   "message": "...",
+        //   "system_prompt": "...",
+        //   "history": [
+        //     { "role": "user", "content": "上一轮用户问题" },
+        //     { "role": "assistant", "content": "上一轮 AI 回答" }
+        //   ]
+        // }
         let requestBody = ChatRequestBody(
             message: message,
             systemPrompt: systemPrompt,
@@ -151,17 +198,17 @@ final class ChatAPIClient: ChatAPI {
         )
         request.httpBody = try JSONEncoder().encode(requestBody)
 
-        /// 4. 发起网络请求。
-        /// await 表示这里会等待网络结果，但不会卡住 UI 主线程。
+        // 4. 发起网络请求。
+        // await 表示这里会等待网络结果，但不会卡住 UI 主线程。
         let (data, response) = try await urlSession.data(for: request)
 
-        /// 5. 确认后端返回的是 HTTP 响应。
+        // 5. 确认后端返回的是 HTTP 响应。
         guard let httpResponse = response as? HTTPURLResponse else {
             throw ChatAPIError.invalidResponse
         }
 
-        /// 6. 只把 200...299 当成成功。
-        /// 如果后端返回 400 / 500，就尝试读取后端的 error 字段。
+        // 6. 只把 200...299 当成成功。
+        // 如果后端返回 400 / 500，就尝试读取后端的 error 字段。
         guard (200...299).contains(httpResponse.statusCode) else {
             if let errorBody = try? JSONDecoder().decode(ChatErrorResponseBody.self, from: data) {
                 throw ChatAPIError.serverMessage(errorBody.error)
@@ -170,19 +217,19 @@ final class ChatAPIClient: ChatAPI {
             throw ChatAPIError.serverMessage("请求失败，HTTP 状态码：\(httpResponse.statusCode)")
         }
 
-        /// 7. 把后端 JSON 解码成 Swift 结构体。
-        /// 后端成功时返回：
-        /// {
-        ///   "title": "标题",
-        ///   "summary": "摘要",
-        ///   "points": ["重点 1", "重点 2"],
-        ///   "next_question": "下一步问题"
-        /// }
+        // 7. 把后端 JSON 解码成 Swift 结构体。
+        // 后端成功时返回：
+        // {
+        //   "title": "标题",
+        //   "summary": "摘要",
+        //   "points": ["重点 1", "重点 2"],
+        //   "next_question": "下一步问题"
+        // }
         let decoder = JSONDecoder()
 
-        /// Node.js 返回的是 next_question，
-        /// Swift 里更习惯写成 nextQuestion。
-        /// convertFromSnakeCase 会自动完成这种转换。
+        // Node.js 返回的是 next_question，
+        // Swift 里更习惯写成 nextQuestion。
+        // convertFromSnakeCase 会自动完成这种转换。
         decoder.keyDecodingStrategy = .convertFromSnakeCase
 
         let structuredAnswer = try decoder.decode(StructuredAnswer.self, from: data)
@@ -195,17 +242,19 @@ final class ChatAPIClient: ChatAPI {
         return structuredAnswer
     }
 
+    /// 普通流式请求。
     func sendStreamingMessage(
         _ message: String,
         systemPrompt: String,
         history: [ChatHistoryItem]
     ) throws -> AsyncThrowingStream<String, Error> {
-        /// 普通流式聊天仍然保留给对比测试。
-        ///
-        /// 这个接口的特点是：
-        /// - 后端会先做固定 RAG 检索
-        /// - 模型不会自主选择工具
-        /// - DeepSeek / OpenAI-compatible API 直接 stream: true 返回文本
+        // 也就是说，它只返回文本片段。
+        // 普通流式聊天仍然保留给对比测试。
+        //
+        // 这个接口的特点是：
+        // - 后端会先做固定 RAG 检索
+        // - 模型不会自主选择工具
+        // - DeepSeek / OpenAI-compatible API 直接 stream: true 返回文本
         let updateStream = try sendStreamingRequest(
             path: "api/chat/stream",
             message: message,
@@ -213,13 +262,11 @@ final class ChatAPIClient: ChatAPI {
             history: history
         )
 
-        /**
-         普通流式接口只需要文本 delta。
-
-         这里把更通用的 ChatStreamUpdate 转回 String，
-         保持 sendStreamingMessage 的老接口不变。
-         如果后端未来给普通流式接口也发工具事件，旧调用方会自动忽略。
-         */
+        // 普通流式接口只需要文本 delta。
+        //
+        // 这里把更通用的 ChatStreamUpdate 转回 String，
+        // 保持 sendStreamingMessage 的老接口不变。
+        // 如果后端未来给普通流式接口也发工具事件，旧调用方会自动忽略。
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -241,18 +288,36 @@ final class ChatAPIClient: ChatAPI {
         }
     }
 
+    /// Agent 流式请求。
+    ///
+    /// 普通流式：
+    ///     只返回 AI 文本片段
+    ///
+    /// Agent 流式：
+    ///     可能先返回工具执行状态
+    ///     再返回 AI 文本片段
+    ///
+    /// AsyncThrowingStream 可以异步不断吐数据的流，而且可能抛错误。
+    /// 类比 Flow<ChatStreamUpdate>。
+    ///
+    /// 后端不是一次性返回完整答案，而是一段一段持续返回。
+    ///
+    /// AsyncThrowingStream 里面有一个 continuation：
+    /// - continuation.yield(...) 给外部吐出一条数据
+    /// - continuation.finish() 正常结束
+    /// - continuation.finish(throwing: error) 以错误结束
     func sendAgentStreamingMessage(
         _ message: String,
         systemPrompt: String,
         history: [ChatHistoryItem]
     ) throws -> AsyncThrowingStream<ChatStreamUpdate, Error> {
-        /// Agent 流式聊天是当前 App 默认入口。
-        ///
-        /// 这个接口的特点是：
-        /// - 后端先把工具列表交给模型
-        /// - 模型可以返回 tool_call
-        /// - 后端执行工具并把结果交回模型
-        /// - 最终回答仍然通过同一套 SSE 解析逻辑返回给 iOS
+        // Agent 流式聊天是当前 App 默认入口。
+        //
+        // 这个接口的特点是：
+        // - 后端先把工具列表交给模型
+        // - 模型可以返回 tool_call
+        // - 后端执行工具并把结果交回模型
+        // - 最终回答仍然通过同一套 SSE 解析逻辑返回给 iOS
         try sendStreamingRequest(
             path: "api/agent/stream",
             message: message,
@@ -261,38 +326,48 @@ final class ChatAPIClient: ChatAPI {
         )
     }
 
+    /// 它是普通流式和 Agent 流式的公共底层实现。
+    ///
+    /// sendStreamingMessage
+    ///     ↓
+    /// sendStreamingRequest(path: "api/chat/stream")
+    ///
+    /// sendAgentStreamingMessage
+    ///     ↓
+    /// sendStreamingRequest(path: "api/agent/stream")
     private func sendStreamingRequest(
         path: String,
         message: String,
         systemPrompt: String,
         history: [ChatHistoryItem]
     ) throws -> AsyncThrowingStream<ChatStreamUpdate, Error> {
-        /// path 由上层入口传入。
-        ///
-        /// 这样普通流式聊天和 Agent 流式聊天可以共用：
-        /// - JSON 请求体编码
-        /// - HTTP 状态码处理
-        /// - SSE data 行解析
-        /// - AsyncThrowingStream 取消逻辑
-        ///
-        /// 差异只保留在后端 URL 上，避免两套几乎一样的网络代码。
+        // path 由上层入口传入。
+        //
+        // 这样普通流式聊天和 Agent 流式聊天可以共用：
+        // - JSON 请求体编码
+        // - HTTP 状态码处理
+        // - SSE data 行解析
+        // - AsyncThrowingStream 取消逻辑
+        //
+        // 差异只保留在后端 URL 上，避免两套几乎一样的网络代码。
 
-        /// 1. 拼出流式接口地址。
-        ///
-        /// 现在有两个流式接口：
-        /// - /api/chat/stream：普通流式聊天
-        /// - /api/agent/stream：Tool Calling Agent，后端会先执行工具，再流式返回最终回答
+        // 1. 拼出流式接口地址。
+        //
+        // 现在有两个流式接口：
+        // - /api/chat/stream：普通流式聊天
+        // - /api/agent/stream：Tool Calling Agent，后端会先执行工具，再流式返回最终回答
         let url = baseURL.appending(path: path)
 
-        /// 2. 创建 URLRequest。
-        ///
-        /// 流式接口虽然返回的是 text/event-stream，
-        /// 但请求体仍然是 JSON：
-        /// {
-        ///   "message": "...",
-        ///   "system_prompt": "...",
-        ///   "history": [...]
-        /// }
+        // 2. 创建 URLRequest。
+        //
+        // 流式接口虽然返回的是 text/event-stream，
+        // 但请求体仍然是 JSON：
+        // {
+        //   "message": "...",
+        //   "system_prompt": "...",
+        //   "history": [...]
+        // }
+        // 响应体是 text/event-stream，也就是 SSE
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
@@ -304,29 +379,32 @@ final class ChatAPIClient: ChatAPI {
         )
         request.httpBody = try JSONEncoder().encode(requestBody)
 
-        /**
-         AsyncThrowingStream 的作用：
-
-         - 后端每推送一个 SSE 事件，网络层就 yield 一个 ChatStreamUpdate。
-         - ViewModel 可以用 for try await 像读数组一样读取这些更新。
-         - 如果网络失败、后端返回 error 事件，stream 会 finish(throwing:)。
-
-         这样 UI 层不用理解 SSE 协议，只关心“文本片段或工具状态”。
-         */
+        // AsyncThrowingStream 的作用：
+        //
+        // - 后端每推送一个 SSE 事件，网络层就 yield 一个 ChatStreamUpdate。
+        // - ViewModel 可以用 for try await 像读数组一样读取这些更新。
+        // - 如果网络失败、后端返回 error 事件，stream 会 finish(throwing:)。
+        //
+        // 这样 UI 层不用理解 SSE 协议，只关心“文本片段或工具状态”。
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
-                    /**
-                     URLSession.bytes(for:) 会在收到响应头后就返回，
-                     后续 body 可以通过 bytes.lines 一行一行读取。
-
-                     这正好适合 SSE：
-                     后端会持续写入：
-                     data: {"type":"delta","delta":"..."}
-                     空行
-                     data: {"type":"done"}
-                     空行
-                     */
+                    // URLSession.bytes(for:) 会在收到响应头后就返回，
+                    // 后续 body 可以通过 bytes.lines 一行一行读取。
+                    //
+                    // 这正好适合 SSE：
+                    // 后端会持续写入：
+                    // data: {"type":"delta","delta":"..."}
+                    // 空行
+                    // data: {"type":"done"}
+                    // 空行
+                    // 真正体现“这是 SSE 流式响应”的地方，是这里。
+                    // SSE 全称是 Server-Sent Events：
+                    // 后端和前端建立一个长连接，后端可以不断往前端推送消息。
+                    // 适合流式接口：请求 -> 后端持续推送 -> iOS 一边收一边处理。
+                    //
+                    // bytes(for:) 收到响应头后就返回，
+                    // 后续响应体可以一行一行读取。
                     let (bytes, response) = try await urlSession.bytes(for: request)
 
                     guard let httpResponse = response as? HTTPURLResponse else {
@@ -334,16 +412,17 @@ final class ChatAPIClient: ChatAPI {
                         return
                     }
 
-                    /**
-                     如果后端在建立 SSE 之前就返回 400 / 500，
-                     响应体仍然是普通 JSON error。
-
-                     这里把剩余 body 读成文本，再尝试解析 error 字段，
-                     这样用户看到的错误会和非流式接口保持一致。
-                     */
+                    // 如果后端在建立 SSE 之前就返回 400 / 500，
+                    // 响应体仍然是普通 JSON error。
+                    //
+                    // 这里把剩余 body 读成文本，再尝试解析 error 字段，
+                    // 这样用户看到的错误会和非流式接口保持一致。
+                    // 检查流式接口 HTTP 状态码。
                     guard (200...299).contains(httpResponse.statusCode) else {
                         var errorText = ""
 
+                        // 这说明你的 iOS 端不是等一个完整 JSON 返回，
+                        // 而是在一行一行读取后端持续推送的数据。
                         for try await line in bytes.lines {
                             errorText += line
                         }
@@ -363,20 +442,23 @@ final class ChatAPIClient: ChatAPI {
                     let decoder = JSONDecoder()
                     let dataPrefix = "data:"
 
-                    /**
-                     SSE 是按“行”传输的。
-                     当前后端每个事件只写一行 data：
-                     data: {"type":"delta","delta":"文本片段"}
-
-                     空行表示一个事件结束。
-                     因为后端已经把每个事件压成一行 JSON，
-                     iOS 这里只需要处理 data: 开头的行即可。
-                     */
+                    // SSE 是按“行”传输的。
+                    // 当前后端每个事件只写一行 data：
+                    // data: {"type":"delta","delta":"文本片段"}
+                    //
+                    // 空行表示一个事件结束。
+                    // 因为后端已经把每个事件压成一行 JSON，
+                    // iOS 这里只需要处理 data: 开头的行即可。
+                    // 逐行读取 SSE。
                     for try await line in bytes.lines {
+                        // 只处理 data: 开头的行。
                         guard line.hasPrefix(dataPrefix) else {
                             continue
                         }
 
+                        // 去掉 data:
+                        // data: {"type":"delta","delta":"SwiftUI"}
+                        // {"type":"delta","delta":"SwiftUI"}
                         let jsonText = String(line.dropFirst(dataPrefix.count))
                             .trimmingCharacters(in: .whitespacesAndNewlines)
 
@@ -384,75 +466,67 @@ final class ChatAPIClient: ChatAPI {
                             continue
                         }
 
+                        // String 转 Data：
+                        // 因为 JSONDecoder 解码需要的是 Data，不是 String，
+                        // 所以要把 JSON 字符串转成 UTF-8 Data。
                         let event = try decoder.decode(ChatStreamEvent.self, from: eventData)
 
+                        // 处理不同 SSE 事件。
                         switch event.type {
                         case "delta":
-                            /**
-                             delta 是模型新生成的一小段文本。
-                             它可能是一个字、一个词，也可能是一小句话。
-                             UI 层只需要把它追加到当前 AI 消息后面。
-                             */
+                            // delta 是模型新生成的一小段文本。
+                            // 它可能是一个字、一个词，也可能是一小句话。
+                            // UI 层只需要把它追加到当前 AI 消息后面。
                             if let delta = event.delta, !delta.isEmpty {
                                 continuation.yield(.delta(delta))
                             }
 
                         case "tool_start":
-                            /**
-                             tool_start 表示 Agent 已经决定调用某个工具。
-                             这时最终答案还没开始生成，但 UI 可以先显示：
-                             “正在查询知识库”“正在生成练习题”。
-                             */
+                            // tool_start 表示 Agent 已经决定调用某个工具。
+                            // 这时最终答案还没开始生成，但 UI 可以先显示：
+                            // “正在查询知识库”“正在生成练习题”。
                             if let toolUpdate = event.agentToolUpdate {
                                 continuation.yield(.toolStart(toolUpdate))
                             }
 
                         case "tool_done":
-                            /**
-                             tool_done 表示后端工具已经执行完。
-                             它只携带适合 UI 展示的摘要，不携带完整工具结果。
-                             完整工具结果仍然只交给模型整理最终回答。
-                             */
+                            // tool_done 表示后端工具已经执行完。
+                            // 它只携带适合 UI 展示的摘要，不携带完整工具结果。
+                            // 完整工具结果仍然只交给模型整理最终回答。
                             if let toolUpdate = event.agentToolUpdate {
                                 continuation.yield(.toolDone(toolUpdate))
                             }
 
                         case "done":
-                            /// done 表示后端已经读完模型流，本次回答结束。
+                            // done 表示后端已经读完模型流，本次回答结束。
                             continuation.finish()
                             return
 
                         case "error":
-                            /// error 表示 SSE 连接建立后，后端或模型流中途失败。
+                            // error 表示 SSE 连接建立后，后端或模型流中途失败。
                             let message = event.error ?? "流式响应失败，请稍后再试。"
                             continuation.finish(throwing: ChatAPIError.serverMessage(message))
                             return
 
                         default:
-                            /**
-                             为了兼容未来扩展，未知事件先忽略。
-                             例如以后可能增加 source / metadata / structured_done。
-                             老版本 iOS 不认识这些事件，也不应该因此中断聊天。
-                             */
+                            // 为了兼容未来扩展，未知事件先忽略。
+                            // 例如以后可能增加 source / metadata / structured_done。
+                            // 老版本 iOS 不认识这些事件，也不应该因此中断聊天。
                             continue
                         }
                     }
 
-                    /**
-                     理论上后端会明确发送 done。
-                     如果连接自然结束但没收到 done，这里也正常 finish，
-                     避免 UI 永远卡在发送状态。
-                     */
+                    // 理论上后端会明确发送 done。
+                    // 如果连接自然结束但没收到 done，这里也正常 finish，
+                    // 避免 UI 永远卡在发送状态。
                     continuation.finish()
                 } catch {
                     continuation.finish(throwing: error)
                 }
             }
 
-            /**
-             如果用户取消任务、页面销毁，AsyncThrowingStream 会终止。
-             这里同步取消底层网络 Task，避免请求继续在后台跑。
-             */
+            // 如果用户取消任务、页面销毁，AsyncThrowingStream 会终止。
+            // 这里同步取消底层网络 Task，避免请求继续在后台跑。
             continuation.onTermination = { _ in
                 task.cancel()
             }
@@ -460,11 +534,11 @@ final class ChatAPIClient: ChatAPI {
     }
 }
 
-/// 请求体：iOS -> Node.js。
-///
+/// iOS 发给 Node.js 的 JSON 请求体。
 /// Codable / Encodable 的作用：
 /// 让 Swift 结构体可以自动变成 JSON。
 private struct ChatRequestBody: Encodable {
+    // Encodable：这个 Swift 结构体可以被 JSONEncoder 编码成 JSON。
     let message: String
     let systemPrompt: String
     let history: [ChatHistoryItem]

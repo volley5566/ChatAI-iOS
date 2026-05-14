@@ -19,7 +19,10 @@ import Foundation
 ///
 /// @MainActor 表示这个类里的状态更新都在主线程执行。
 /// SwiftUI 的页面状态应该在主线程更新，这样最安全。
+/// 这个类里面的状态更新，都应该在主线程执行。
 @MainActor
+// final：这个类不能被继承。
+// ObservableObject：这个对象可以被 SwiftUI 观察，View 可以观察这个 ViewModel。
 final class ChatViewModel: ObservableObject {
     /// 每次请求最多带几条历史消息。
     ///
@@ -29,6 +32,7 @@ final class ChatViewModel: ObservableObject {
     private let maxHistoryMessages = 6
 
     /// 聊天消息列表。页面会根据它自动刷新。
+    /// @Published：这个变量一变化，就通知 SwiftUI 页面刷新。
     @Published var messages: [ChatMessage] = [
         ChatMessage(
             role: .assistant,
@@ -37,23 +41,49 @@ final class ChatViewModel: ObservableObject {
     ]
 
     /// 输入框当前文字。
+    /// @Published：这个变量一变化，就通知 SwiftUI 页面刷新。
     @Published var inputText = ""
 
     /// 是否正在等待后端返回。
     /// 为 true 时，按钮会禁用，并显示发送中的状态。
+    /// 表示当前是否正在发送请求 / 等待 AI 回复
+    ///
+    /// isSending = true
+    ///     输入框禁用
+    ///     发送按钮禁用
+    ///     显示 loading
+    ///     清空按钮禁用
+    ///
+    /// isSending = false
+    ///     恢复正常输入和发送
+    /// @Published：这个变量一变化，就通知 SwiftUI 页面刷新。
     @Published var isSending = false
 
     /// 当前错误提示。
     /// 有值时，页面会显示一条红色提示。
+    /// @Published：这个变量一变化，就通知 SwiftUI 页面刷新。
     @Published var errorMessage: String?
 
+    // 这个是网络层接口：
+    //
+    // View
+    //   ↓
+    // ViewModel
+    //   ↓
+    // ChatAPI 协议
+    //   ↓
+    // ChatAPIClient 实现
+    //   ↓
+    // Node.js 后端 / AI 接口
     private let chatAPI: ChatAPI
 
+    /// 如果外部传了 chatAPI，就用外部传进来的。
+    /// 如果外部没传，就默认用 ChatAPIClient()。
     init(chatAPI: ChatAPI? = nil) {
-        /// 这里不直接把 ChatAPIClient() 写在参数默认值里，
-        /// 是为了避开 Swift 并发隔离下的一个默认参数警告。
-        /// 简单理解：默认参数会在 init 外面先计算；
-        /// 写在 init 里面更符合这个 ViewModel 的主线程上下文。
+        // 这里不直接把 ChatAPIClient() 写在参数默认值里，
+        // 是为了避开 Swift 并发隔离下的一个默认参数警告。
+        // 简单理解：默认参数会在 init 外面先计算；
+        // 写在 init 里面更符合这个 ViewModel 的主线程上下文。
         self.chatAPI = chatAPI ?? ChatAPIClient()
     }
 
@@ -62,6 +92,9 @@ final class ChatViewModel: ObservableObject {
     /// 规则：
     /// - 输入框不能为空
     /// - 当前没有正在发送的请求
+    ///
+    /// 这个是计算属性
+    /// 它不是保存一个值，而是每次访问时动态计算
     var canSendMessage: Bool {
         !trimmedInputText.isEmpty && !isSending
     }
@@ -77,76 +110,134 @@ final class ChatViewModel: ObservableObject {
     ///
     /// 普通流式接口和结构化接口仍然保留在 ChatAPIClient 里，
     /// 方便后续做对比测试或“最终结构化卡片”升级。
+    /// 它是异步函数，因为里面要请求后端、处理流式返回
+    ///
+    /// 用户点击发送
+    ///    ↓
+    /// sendMessage()
+    ///    ↓
+    /// 取出输入框文字并 trim
+    ///    ↓
+    /// 如果为空，直接 return
+    ///    ↓
+    /// 整理历史消息 history
+    ///    ↓
+    /// 把用户消息 append 到 messages
+    ///    ↓
+    /// 清空输入框
+    ///    ↓
+    /// errorMessage = nil
+    ///    ↓
+    /// isSending = true
+    ///    ↓
+    /// 创建流式请求 stream
+    ///    ↓
+    /// 先 append 一条空的 assistant 消息
+    ///    ↓
+    /// 不断接收后端 SSE update
+    ///    ↓
+    /// 收到 delta：更新 assistant content
+    ///    ↓
+    /// 收到 toolStart：更新工具步骤 running
+    ///    ↓
+    /// 收到 toolDone：更新工具步骤 completed / failed
+    ///    ↓
+    /// 结束后如果没内容，抛 emptyAnswer
+    ///    ↓
+    /// 如果出错，显示 errorMessage
+    ///    ↓
+    /// defer 自动 isSending = false
     func sendMessage() async {
+        // 第一步：取出输入内容。
         let messageText = trimmedInputText
 
+        // 如果输入为空，就直接退出，不发送。
         guard !messageText.isEmpty else {
             return
         }
 
-        /// 在追加当前用户消息之前，先整理历史。
-        /// 因为当前 message 会单独作为 message 字段发给后端，
-        /// history 里只需要放“之前发生过的对话”。
+        // 在追加当前用户消息之前，先整理历史。
+        // 因为当前 message 会单独作为 message 字段发给后端，
+        // history 里只需要放“之前发生过的对话”。
+        // 第二步：整理历史消息
         let history = recentHistoryItems()
 
-        /// 先把用户输入追加到聊天列表。
-        /// 这样用户点击发送后，能马上看到自己的消息。
+        // 先把用户输入追加到聊天列表。
+        // 这样用户点击发送后，能马上看到自己的消息。
+        // 第三步：先显示用户消息
         messages.append(
+            // 用户一点发送，就马上把用户消息追加到列表。
             ChatMessage(role: .user, content: messageText)
         )
 
-        /// 清空输入框，避免用户重复发送同一段内容。
+        // 第四步：清空输入框，设置状态。
+        // 清空输入框，避免用户重复发送同一段内容。
         inputText = ""
         errorMessage = nil
         isSending = true
 
-        /**
-         用 defer 保证函数退出时一定恢复发送状态。
-
-         流式输出里可能出现几种退出路径：
-         - 正常收到 done
-         - 网络错误
-         - 后端 SSE error
-         - JSON 解析错误
-
-         如果每个分支都手动写 isSending = false，
-         后续维护时很容易漏掉某个分支。
-         */
+        // 用 defer 保证函数退出时一定恢复发送状态。
+        //
+        // 流式输出里可能出现几种退出路径：
+        // - 正常收到 done
+        // - 网络错误
+        // - 后端 SSE error
+        // - JSON 解析错误
+        //
+        // 如果每个分支都手动写 isSending = false，
+        // 后续维护时很容易漏掉某个分支。
+        // defer：不管这个函数后面怎么结束，离开函数前都执行这段代码。
         defer {
             isSending = false
         }
 
+        // 两个临时变量
+        // 这两个变量是为了处理流式回答。
         var assistantMessageID: UUID?
+        // 它用来累计所有返回片段。
         var streamedAnswer = ""
 
         do {
-            /// 调用网络层，请求 Node.js Agent 流式接口。
-            ///
-            /// sendAgentStreamingMessage 返回的不是完整答案，
-            /// 而是一个 AsyncThrowingStream<ChatStreamUpdate, Error>。
-            ///
-            /// 后端会先做 Tool Calling：
-            /// 模型决定是否调用 searchKnowledge / generateQuiz，
-            /// 后端执行工具并把结果交回模型。
-            ///
-            /// 工具阶段会通过 tool_start / tool_done 告诉 iOS 当前进度。
-            /// 工具阶段完成后，最终回答才会通过 delta 一段段推给 iOS。
+            // 调用网络层，请求 Node.js Agent 流式接口。
+            //
+            // sendAgentStreamingMessage 返回的不是完整答案，
+            // 而是一个 AsyncThrowingStream<ChatStreamUpdate, Error>。
+            //
+            // 后端会先做 Tool Calling：
+            // 模型决定是否调用 searchKnowledge / generateQuiz，
+            // 后端执行工具并把结果交回模型。
+            //
+            // 工具阶段会通过 tool_start / tool_done 告诉 iOS 当前进度。
+            // 工具阶段完成后，最终回答才会通过 delta 一段段推给 iOS。
             let stream = try chatAPI.sendAgentStreamingMessage(
                 messageText,
                 systemPrompt: AppConfig.defaultSystemPrompt,
                 history: history
             )
 
-            /**
-             先追加一条空的 AI 消息，给后续 delta 一个固定容器。
-
-             这条消息的 id 会被保存下来。
-             后面每收到一段 delta，都通过这个 id 找到同一条消息并替换 content。
-             */
+            // 先追加一条空的 AI 消息，给后续 delta 一个固定容器。
+            //
+            // 这条消息的 id 会被保存下来。
+            // 后面每收到一段 delta，都通过这个 id 找到同一条消息并替换 content。
+            //
+            // 用户消息已经显示了
+            //    ↓
+            // 马上追加一个空的 AI 消息气泡
+            //    ↓
+            // 后面流式内容来了
+            //    ↓
+            // 不断更新这个空气泡
             let assistantMessage = ChatMessage(role: .assistant, content: "")
             assistantMessageID = assistantMessage.id
             messages.append(assistantMessage)
 
+            // 这个就是读取流式数据。
+            //
+            // 后端每推送一条 SSE 事件，这里就循环一次。
+            // 可能收到三种 update：
+            // delta       AI 正文片段
+            // toolStart   工具开始执行
+            // toolDone    工具执行完成
             for try await update in stream {
                 switch update {
                 case .delta(let delta):
@@ -179,29 +270,25 @@ final class ChatViewModel: ObservableObject {
                 }
             }
 
-            /**
-             如果后端正常结束，但没有任何文本片段，
-             这通常表示模型返回异常或上游没有输出内容。
-             这里复用已有 emptyAnswer 错误，给用户一个明确提示。
-             */
+            // 如果后端正常结束，但没有任何文本片段，
+            // 这通常表示模型返回异常或上游没有输出内容。
+            // 这里复用已有 emptyAnswer 错误，给用户一个明确提示。
             if streamedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
                 throw ChatAPIError.emptyAnswer
             }
         } catch {
-            /**
-             如果错误发生在还没收到任何 delta 之前，
-             页面上会留下一个空白 AI 气泡。
-             这种气泡没有信息量，所以直接移除。
-             *
-             如果已经收到部分内容，则保留 partial answer，
-             同时显示错误提示，方便用户知道回答中途断了。
-             */
+            // 如果错误发生在还没收到任何 delta 之前，
+            // 页面上会留下一个空白 AI 气泡。
+            // 这种气泡没有信息量，所以直接移除。
+            //
+            // 如果已经收到部分内容，则保留 partial answer，
+            // 同时显示错误提示，方便用户知道回答中途断了。
             if streamedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                let assistantMessageID {
                 messages.removeAll { $0.id == assistantMessageID }
             }
 
-            /// 出错时不崩溃，而是把错误显示在页面上。
+            // 出错时不崩溃，而是把错误显示在页面上。
             errorMessage = error.localizedDescription
         }
     }
@@ -238,11 +325,30 @@ final class ChatViewModel: ObservableObject {
     /// 所以不能再只用 structuredAnswer 判断 AI 消息是否可进入历史。
     private func recentHistoryItems() -> [ChatHistoryItem] {
         messages
+            // 丢掉第一条消息。
             .dropFirst()
+            // 只保留内容不为空的消息。
             .filter { message in
+                // trimmingCharacters(in: .whitespacesAndNewlines)
+                // 去掉字符串前面和后面的空格、换行。
+                //
+                // in: .whitespacesAndNewlines 是什么意思？
+                // 这里的 in: 是参数名：我要按照什么规则来 trim 字符？
+                //
+                // .whitespacesAndNewlines 是一个系统内置的字符集合：空格 + 换行。
+                // 包含：
+                // - 普通空格
+                // - tab
+                // - 换行 \n
+                // - 回车 \r
+                //
+                // 它会把 content 字符串开头和结尾的空格、换行都去掉。
+                // .isEmpty 表示：去掉前后空格和换行后，看看这个字符串是不是空的。
                 !message.toHistoryItem().content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }
+            // 只取最后 maxHistoryMessages 条。
             .suffix(maxHistoryMessages)
+            // 把 ChatMessage 转成 ChatHistoryItem，就是 convert 的 map 过程。
             .map { $0.toHistoryItem() }
     }
 
@@ -257,6 +363,9 @@ final class ChatViewModel: ObservableObject {
     /// 而不是：
     /// 用户一条消息 -> AI 片段 1 -> AI 片段 2 -> AI 片段 3
     private func updateMessageContent(id: UUID, content: String) {
+        // 根据 id 找到 messages 里对应的消息下标。
+        // 如果找不到，直接 return。
+        // 如果找到了，用新的 content 替换它。
         guard let index = messages.firstIndex(where: { $0.id == id }) else {
             return
         }
@@ -278,10 +387,20 @@ final class ChatViewModel: ObservableObject {
         update: AgentToolUpdate,
         status: AgentToolStepStatus
     ) {
+        // 先在 messages 里找到当前那条 assistant 消息。
+        // 找不到就直接退出。
         guard let messageIndex = messages.firstIndex(where: { $0.id == messageID }) else {
             return
         }
 
+        // 创建 AgentToolStep。
+        // 这里把后端返回的 AgentToolUpdate 转成 UI 使用的 AgentToolStep。
+        //
+        // AgentToolUpdate：
+        // 后端流式事件里的工具更新数据。
+        //
+        // AgentToolStep：
+        // 前端消息气泡里展示的工具步骤。
         let step = AgentToolStep(
             id: update.toolCallID,
             toolName: update.toolName,
@@ -290,14 +409,17 @@ final class ChatViewModel: ObservableObject {
             message: update.message
         )
 
+        // 取出已有 steps，一条 AI 消息里可以有多个工具步骤。
         var steps = messages[messageIndex].agentToolSteps
 
+        // 如果已有，就更新；如果没有，就追加。
         if let stepIndex = steps.firstIndex(where: { $0.id == step.id }) {
             steps[stepIndex] = step
         } else {
             steps.append(step)
         }
 
+        // 写回 messages。
         messages[messageIndex] = messages[messageIndex].updatingAgentToolSteps(steps)
     }
 }

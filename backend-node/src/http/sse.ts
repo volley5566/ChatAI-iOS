@@ -1,5 +1,5 @@
 import type { Response } from "express";
-import type { ChatStreamEvent } from "./types";
+import type { ChatStreamEvent } from "../shared/types";
 
 /**
  * 向 iOS 写一条 SSE 事件。

@@ -1,25 +1,26 @@
 import express, { Request, Response } from "express";
 import cors from "cors";
-import { runAgentToolLoop } from "./agentRunner";
-import { logChatContext, prepareChatCompletion } from "./chatCompletion";
-import { sanitizeChatHistory } from "./chatHistory";
-import { model, port } from "./config";
-import { deepseek } from "./deepseekClient";
-import { writeSseEvent } from "./sse";
-import { parseStructuredAnswer } from "./structuredAnswer";
-import type { ChatRequestBody, ChatResponseBody, ErrorResponseBody } from "./types";
+import { runAgentToolLoop } from "./agent/agentRunner";
+import { logChatContext, prepareChatCompletion } from "./chat/chatCompletion";
+import { sanitizeChatHistory } from "./chat/chatHistory";
+import { model, port } from "./config/env";
+import { deepseek } from "./llm/deepseekClient";
+import { writeSseEvent } from "./http/sse";
+import { parseStructuredAnswer } from "./chat/structuredAnswer";
+import type { ChatRequestBody, ChatResponseBody, ErrorResponseBody } from "./shared/types";
 
 /**
  * server.ts 现在只负责 Express 路由和 HTTP 生命周期。
  *
  * 具体业务已经拆到独立模块：
- * - config.ts：环境变量
- * - deepseekClient.ts：模型客户端
- * - chatCompletion.ts：普通聊天上下文组装
- * - knowledge.ts：RAG 知识库
- * - agentTools.ts：Tool Calling 工具
- * - agentRunner.ts：Agent tool loop
- * - sse.ts：SSE 输出
+ * - config/env.ts：环境变量
+ * - llm/deepseekClient.ts：模型客户端
+ * - chat/*：普通聊天上下文、history 清洗、prompt、结构化解析
+ * - knowledge/knowledge.ts：RAG 知识库
+ * - agent/*：Agent loop、Tool Calling 与 MCP 适配层
+ * - mcp/*：MCP client/server 与真实工具实现
+ * - http/sse.ts：SSE 输出
+ * - shared/types.ts：共享类型
  */
 const app = express();
 
@@ -172,7 +173,7 @@ app.post(
   }
 );
 
-//12. Agent 流式接口：Tool Calling + 工具状态可视化 + 最终流式回答
+//12. Agent 流式接口：Tool Calling + MCP + 工具状态可视化 + 最终流式回答
 app.post(
   "/api/agent/stream",
   async (

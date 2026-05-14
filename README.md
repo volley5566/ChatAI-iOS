@@ -15,6 +15,8 @@
 iOS SwiftUI
   -> Node.js /api/agent/stream
   -> Tool Calling / Agent Runner
+  -> MCP Client
+  -> MCP Server / Tools
   -> DeepSeek OpenAI-compatible API
   -> Node.js 通过 SSE 返回最终文本片段
   -> iOS 实时更新同一条 AI 消息气泡
@@ -121,43 +123,55 @@ backend-node/knowledge/
 
 ## 5. 后端代码结构
 
-后端已经按职责拆成多个模块，`server.ts` 只保留 Express 路由和 HTTP/SSE 生命周期。
+后端已经按职责拆成多个目录，`server.ts` 只保留 Express 路由和 HTTP/SSE 生命周期。
 
 ```text
 backend-node/src/server.ts
   Express 路由、SSE 连接、服务启动
 
-backend-node/src/config.ts
+backend-node/src/config/env.ts
   读取和校验 .env 配置
 
-backend-node/src/deepseekClient.ts
+backend-node/src/llm/deepseekClient.ts
   创建 DeepSeek/OpenAI-compatible SDK 客户端
 
-backend-node/src/chatCompletion.ts
+backend-node/src/chat/chatCompletion.ts
   普通聊天接口的 RAG 上下文和 messages 组装
 
-backend-node/src/chatHistory.ts
+backend-node/src/chat/chatHistory.ts
   清洗 history，限制历史长度，组装检索 query
 
-backend-node/src/knowledge.ts
-  读取 backend-node/knowledge/*.md，并做轻量关键词检索
-
-backend-node/src/prompts.ts
+backend-node/src/chat/prompts.ts
   结构化输出、普通流式输出、Agent 的 prompt 规则
 
-backend-node/src/structuredAnswer.ts
+backend-node/src/chat/structuredAnswer.ts
   解析 /api/chat 的结构化 JSON 回答，并提供兜底解析
 
-backend-node/src/agentTools.ts
-  Tool Calling 工具定义、参数校验、工具执行、工具状态事件
+backend-node/src/knowledge/knowledge.ts
+  读取 backend-node/knowledge/*.md，并做轻量关键词检索
 
-backend-node/src/agentRunner.ts
+backend-node/src/agent/agentRunner.ts
   Agent Runner，负责 tool_call 循环和 DeepSeek reasoning_content 回传
 
-backend-node/src/sse.ts
+backend-node/src/agent/agentTools.ts
+  Tool Calling 适配层，把 MCP tools 暴露成 OpenAI-compatible tools，并生成工具状态事件
+
+backend-node/src/agent/agentToolTypes.ts
+  Agent 内部工具结果类型和基础校验函数
+
+backend-node/src/mcp/mcpServer.ts
+  本地 MCP server，通过 stdio 暴露 searchKnowledge / generateQuiz 工具
+
+backend-node/src/mcp/mcpClient.ts
+  本地 MCP client，负责连接 MCP server、列工具、执行工具调用
+
+backend-node/src/mcp/mcpToolHandlers.ts
+  MCP 工具的真实业务实现
+
+backend-node/src/http/sse.ts
   统一写 SSE event
 
-backend-node/src/types.ts
+backend-node/src/shared/types.ts
   后端共享类型
 ```
 
@@ -165,14 +179,14 @@ backend-node/src/types.ts
 
 ```text
 server.ts
-  -> 普通聊天：chatCompletion + structuredAnswer + sse
-  -> Agent 聊天：agentRunner -> agentTools -> knowledge
-  -> 共用：config + deepseekClient + chatHistory + types
+  -> 普通聊天：chat/* + knowledge/* + llm/* + http/*
+  -> Agent 聊天：agent/* -> mcp/* -> knowledge/*
+  -> 共用：config/* + shared/*
 ```
 
-这样后续新增工具时，主要改 `agentTools.ts`；
-调整 Agent 循环时，主要改 `agentRunner.ts`；
-调整知识库检索时，主要改 `knowledge.ts`。
+这样后续新增工具时，主要改 `src/mcp/mcpServer.ts` 和 `src/mcp/mcpToolHandlers.ts`；
+调整 Agent 循环时，主要改 `src/agent/agentRunner.ts`；
+调整知识库检索时，主要改 `src/knowledge/knowledge.ts`。
 
 ## 6. 多轮上下文
 
@@ -364,7 +378,7 @@ curl -N \
 
 如果不加 `-N`，curl 可能会等攒够一批内容后再显示，看起来就不像实时流式输出。
 
-## 8. Tool Calling / Agent
+## 8. Tool Calling / Agent / MCP
 
 当前 App 默认使用第一版 Agent 流式接口：
 
@@ -376,15 +390,43 @@ POST /api/agent/stream
 
 ```text
 iOS 发送 message + history
-  -> Node.js 把可用工具列表交给模型
+  -> Node.js 通过 MCP client 从 MCP server 获取可用工具
+  -> Node.js 把可用工具列表转成 OpenAI-compatible tools 交给模型
   -> 模型判断是否需要调用工具
   -> Node.js 通过 SSE 发送 tool_start
-  -> Node.js 校验工具名和参数
-  -> Node.js 执行真正的后端工具
+  -> Node.js 通过 MCP client 调用 MCP server
+  -> MCP server 校验参数并执行真正的工具
   -> Node.js 通过 SSE 发送 tool_done
   -> Node.js 把工具结果交回模型
   -> 模型生成最终回答
   -> Node.js 通过 SSE 流式返回给 iOS
+```
+
+整体调用链路可以看成下面这张图：
+
+```mermaid
+flowchart TD
+    U["用户输入问题"] --> V["iOS SwiftUI View"]
+    V --> VM["ChatViewModel"]
+    VM --> API["ChatAPIClient"]
+    API -->|POST /api/agent/stream| EXP["Node.js Express server.ts"]
+
+    EXP --> AR["agent/agentRunner.ts"]
+    AR --> AT["agent/agentTools.ts<br/>MCP 与 OpenAI tools 适配层"]
+    AT --> MC["mcp/mcpClient.ts"]
+    MC -->|stdio JSON-RPC| MS["mcp/mcpServer.ts"]
+    MS --> MH["mcp/mcpToolHandlers.ts"]
+    MH --> KB["knowledge/*.md<br/>本地知识库"]
+
+    AR -->|tools + messages| LLM["DeepSeek<br/>OpenAI-compatible API"]
+    LLM -->|tool_calls| AR
+    AR -->|callTool| MC
+    MC -->|tool result| AR
+    AR -->|final messages, stream:true| LLM
+    LLM -->|delta chunks| EXP
+    EXP -->|SSE: tool_start/tool_done/delta/done| API
+    API --> VM
+    VM --> V
 ```
 
 ### Tool Calling 是什么
@@ -402,14 +444,41 @@ Tool Calling 不是模型真的执行代码。
 }
 ```
 
-真正执行工具的是 Node.js 后端。
+真正执行工具的是 Node.js 后端里的 MCP server。
 
 这样做的好处是：
 
 ```text
 模型负责理解用户意图、选择工具、组织回答
-后端负责校验参数、执行工具、控制权限和安全边界
+MCP server 负责校验参数、执行工具、控制权限和安全边界
 ```
+
+### MCP 是什么
+
+MCP 可以理解成 AI Agent 调用外部能力的标准协议。
+
+它把 AI 应用拆成两侧：
+
+```text
+MCP Client
+  发起 listTools / callTool / readResource 等标准请求
+
+MCP Server
+  暴露 tools / resources / prompts，并执行真实能力
+```
+
+在这个项目里：
+
+```text
+agentRunner
+  -> agentTools
+  -> mcpClient
+  -> mcpServer
+  -> mcpToolHandlers
+```
+
+也就是说，DeepSeek 仍然只看到 OpenAI-compatible tools；
+但后端真正执行工具时，已经通过 MCP client/server 标准链路完成。
 
 ### 当前支持的工具
 
@@ -423,7 +492,8 @@ generateQuiz(topic, count)
   根据学习主题生成 1 到 5 道练习题
 ```
 
-这两个工具都不会修改数据，也不会调用外部业务系统，适合先把 Tool Calling 主流程跑通。
+这两个工具现在由 `backend-node/src/mcp/mcpServer.ts` 通过 MCP 暴露。
+它们都不会修改数据，也不会调用外部业务系统，适合先把 Tool Calling + MCP 主流程跑通。
 
 ### Agent Runner 循环
 
@@ -437,7 +507,7 @@ generateQuiz(topic, count)
 每一轮：
   调模型
   如果模型返回 tool_calls：
-    后端执行工具
+    后端通过 MCP 执行工具
     把工具结果放回 messages
     继续下一轮
 
@@ -457,7 +527,7 @@ Agent 的工具阶段是非流式的：
 
 ```text
 模型决定工具
-后端执行工具
+MCP server 执行工具
 模型看工具结果
 ```
 
@@ -498,6 +568,15 @@ AI 一条消息
 
 ### 手动测试 Agent 接口
 
+也可以单独启动 MCP server 做协议调试：
+
+```bash
+npm run mcp:dev
+```
+
+正常后端开发不需要手动启动它。
+`/api/agent/stream` 会通过 `src/mcp/mcpClient.ts` 自动拉起本地 stdio MCP server。
+
 启动后端后，可以测试知识库工具：
 
 ```bash
@@ -531,4 +610,4 @@ curl -N \
 [Agent] tool calls executed: 1
 ```
 
-说明模型已经触发 Tool Calling，后端也执行了对应工具。
+说明模型已经触发 Tool Calling，后端也通过 MCP 执行了对应工具。

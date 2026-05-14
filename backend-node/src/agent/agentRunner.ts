@@ -5,18 +5,18 @@ import type {
   ChatCompletionMessageToolCall,
 } from "openai/resources/chat/completions";
 import {
-  agentTools,
   buildToolDoneEvent,
   buildToolStartEvent,
   executeAgentTool,
+  getAgentTools,
   stringifyToolResult,
 } from "./agentTools";
-import { buildAgentInstructions } from "./prompts";
+import { buildAgentInstructions } from "../chat/prompts";
 import type {
   ChatStreamEvent,
   DeepSeekAssistantMessageWithReasoning,
   NormalizedChatHistoryItem,
-} from "./types";
+} from "../shared/types";
 
 const maxAgentToolSteps = 4;
 
@@ -93,9 +93,28 @@ export async function runAgentToolLoop({
   onToolEvent,
 }: RunAgentToolLoopOptions): Promise<AgentRunResult> {
   const messages = buildAgentMessages(message, systemPrompt, history);
+
+  /**
+   * 这里拿到的是“给模型看的工具定义”。
+   *
+   * 注意这个工具列表已经经过了一次转换：
+   * MCP tools -> OpenAI-compatible tools。
+   *
+   * 模型不会知道背后是 MCP，它只知道自己可以返回 tool_calls。
+   * 后端收到 tool_calls 后，才通过 MCP client 调用真正的 MCP server。
+   */
+  const agentTools = await getAgentTools();
   let toolCallCount = 0;
 
   for (let step = 0; step < maxAgentToolSteps; step += 1) {
+    /**
+     * 工具决策阶段使用非流式请求。
+     *
+     * 原因：
+     * - 第一版学习项目里，非流式 tool calling 更容易理解和调试
+     * - DeepSeek 返回完整 assistant message 后，才能稳定拿到 tool_calls
+     * - 工具阶段结束后，最终回答仍然会走 stream: true，保证 iOS 体验
+     */
     const completion = await deepseek.chat.completions.create({
       model,
       messages,
@@ -113,16 +132,33 @@ export async function runAgentToolLoop({
     const toolCalls = assistantMessage.tool_calls || [];
 
     if (toolCalls.length === 0) {
+      /**
+       * 没有 tool_calls 表示模型认为工具阶段结束。
+       * 后续由 server.ts 使用 agentRun.messages 开启最终流式回答。
+       */
       break;
     }
 
     toolCallCount += toolCalls.length;
+
+    /**
+     * OpenAI-compatible tool calling 要求：
+     * assistant 的 tool_calls 消息必须放回 messages，
+     * 然后每个 tool_call 再配一条 role=tool 的结果消息。
+     *
+     * 这样下一轮模型才能知道：
+     * “我刚才请求了哪个工具，工具返回了什么结果。”
+     */
     messages.push(buildAssistantToolMessage(assistantMessage, toolCalls));
 
     for (const toolCall of toolCalls) {
       onToolEvent?.(buildToolStartEvent(toolCall));
 
-      const toolResult = executeAgentTool(toolCall);
+      /**
+       * 真实执行从这里进入 MCP：
+       * executeAgentTool -> mcpClient.callTool -> mcpServer handler。
+       */
+      const toolResult = await executeAgentTool(toolCall);
 
       console.log(
         `[Agent] tool call: ${toolCall.type === "function" ? toolCall.function.name : toolCall.type}, ok: ${toolResult.ok}`

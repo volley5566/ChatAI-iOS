@@ -1,15 +1,17 @@
 import fs from "fs";
 import path from "path";
-import type { KnowledgeDocument, ScoredKnowledgeDocument } from "./types";
+import type { KnowledgeDocument, ScoredKnowledgeDocument } from "../shared/types";
 
 /**
  * knowledgeDirectory 是知识库目录。
  *
- * 开发环境下 __dirname 是 backend-node/src，
- * 编译后 __dirname 是 backend-node/dist；
- * 两种情况下 ../knowledge 都指向 backend-node/knowledge。
+ * 开发环境下 __dirname 是 backend-node/src/knowledge，
+ * 编译后 __dirname 是 backend-node/dist/knowledge。
+ *
+ * 两种情况下 ../../knowledge 都指向 backend-node/knowledge。
+ * 这里故意不把知识库放进 src，避免 Markdown 文档和 TypeScript 源码混在一起。
  */
-const knowledgeDirectory = path.resolve(__dirname, "../knowledge");
+const knowledgeDirectory = path.resolve(__dirname, "../../knowledge");
 
 const maxKnowledgeDocuments = 3;
 const minKnowledgeScore = 20;
@@ -144,7 +146,7 @@ function scoreKnowledgeDocument(
 
 const knowledgeDocuments = loadKnowledgeDocuments();
 
-console.log(
+console.error(
   `Loaded ${knowledgeDocuments.length} knowledge documents from ${knowledgeDirectory}`
 );
 

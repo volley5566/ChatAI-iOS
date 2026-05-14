@@ -1,5 +1,5 @@
 import OpenAI from "openai";
-import { deepseekApiKey, deepseekBaseURL } from "./config";
+import { deepseekApiKey, deepseekBaseURL } from "../config/env";
 
 /**
  * DeepSeek API 兼容 OpenAI SDK。

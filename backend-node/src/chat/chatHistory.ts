@@ -1,4 +1,4 @@
-import type { ChatHistoryItem, NormalizedChatHistoryItem } from "./types";
+import type { ChatHistoryItem, NormalizedChatHistoryItem } from "../shared/types";
 
 /**
  * 每次最多带多少条历史消息。

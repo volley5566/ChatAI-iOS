@@ -1,13 +1,13 @@
 import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { buildRetrievalQuery } from "./chatHistory";
-import { buildKnowledgeContext, retrieveRelevantKnowledge } from "./knowledge";
+import { buildKnowledgeContext, retrieveRelevantKnowledge } from "../knowledge/knowledge";
 import { buildInstructions, buildStreamingInstructions } from "./prompts";
 import type {
   ChatResponseMode,
   NormalizedChatHistoryItem,
   PreparedChatCompletion,
   ScoredKnowledgeDocument,
-} from "./types";
+} from "../shared/types";
 
 /**
  * 组装一次 Chat Completions 请求需要的全部上下文。

@@ -1,4 +1,4 @@
-import type { ChatResponseBody } from "./types";
+import type { ChatResponseBody } from "../shared/types";
 
 function extractJsonText(rawText: string): string {
   const startIndex = rawText.indexOf("{");

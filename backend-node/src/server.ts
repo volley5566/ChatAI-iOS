@@ -1,13 +1,24 @@
 import express, { Request, Response } from "express";
 import cors from "cors";
 import { runAgentToolLoop } from "./agent/agentRunner";
+import {
+  createAgentRequestId,
+  getDurationMs,
+  logAgentError,
+  logAgentInfo,
+} from "./agent/agentObservability";
 import { logChatContext, prepareChatCompletion } from "./chat/chatCompletion";
 import { sanitizeChatHistory } from "./chat/chatHistory";
 import { model, port } from "./config/env";
 import { deepseek } from "./llm/deepseekClient";
 import { writeSseEvent } from "./http/sse";
 import { parseStructuredAnswer } from "./chat/structuredAnswer";
-import type { ChatRequestBody, ChatResponseBody, ErrorResponseBody } from "./shared/types";
+import type {
+  ChatRequestBody,
+  ChatResponseBody,
+  ChatStreamEvent,
+  ErrorResponseBody,
+} from "./shared/types";
 
 /**
  * server.ts 现在只负责 Express 路由和 HTTP 生命周期。
@@ -193,10 +204,30 @@ app.post(
     req: Request,
     res: Response<ErrorResponseBody>
   ) => {
+    const requestId = createAgentRequestId();
+    const requestStartedAt = Date.now();
     let clientClosed = false;
+    let responseCompleted = false;
+    let activePhase = "request_validation";
+
+    const writeAgentSseEvent = (event: ChatStreamEvent) => {
+      writeSseEvent(res, {
+        ...event,
+        request_id: requestId,
+      });
+    };
+
+    res.setHeader("X-Request-ID", requestId);
 
     res.on("close", () => {
       clientClosed = true;
+
+      if (!responseCompleted) {
+        logAgentInfo(requestId, "http", "client_closed", {
+          durationMs: getDurationMs(requestStartedAt),
+          activePhase,
+        });
+      }
     });
 
     try {
@@ -210,10 +241,24 @@ app.post(
       // sanitizeChatHistory() 是清洗历史消息，防止客户端乱传 system / tool 角色。
       const history = sanitizeChatHistory(body.history);
 
+      logAgentInfo(requestId, "request", "received", {
+        route: "/api/agent/stream",
+        model,
+        messageLength: message?.length || 0,
+        hasSystemPrompt: Boolean(systemPrompt),
+        historyCount: history.length,
+      });
+
       if (!message) {
+        logAgentInfo(requestId, "request_validation", "rejected", {
+          reason: "empty_message",
+          durationMs: getDurationMs(requestStartedAt),
+        });
+
         res.status(400).json({
           error: "Message cannot be empty.",
         });
+        responseCompleted = true;
         return;
       }
 
@@ -224,11 +269,12 @@ app.post(
       res.setHeader("Connection", "keep-alive");
       res.flushHeaders();
 
-      console.log(`[Agent] history messages sent to AI: ${history.length}`);
-
       // Node 进入 Agent 工具阶段。
+      activePhase = "tool_loop";
+      const toolLoopStartedAt = Date.now();
       const agentRun = await runAgentToolLoop({
         deepseek,
+        requestId,
         model,
         message,
         systemPrompt,
@@ -241,14 +287,26 @@ app.post(
            * 所以 iOS 才能显示“正在查询知识库”“已查询知识库”。
            */
           if (!clientClosed) {
-            writeSseEvent(res, event);
+            writeAgentSseEvent({
+              ...event,
+              phase: "tool_execution",
+            });
           }
         },
       });
 
-      console.log(`[Agent] tool calls executed: ${agentRun.toolCallCount}`);
+      logAgentInfo(requestId, "tool_loop", "server_observed_completed", {
+        durationMs: getDurationMs(toolLoopStartedAt),
+        modelCalledTools: agentRun.toolCallCount > 0,
+        toolCallCount: agentRun.toolCallCount,
+      });
 
       if (clientClosed) {
+        logAgentInfo(requestId, "request", "stopped_after_client_close", {
+          durationMs: getDurationMs(requestStartedAt),
+          activePhase,
+        });
+        responseCompleted = true;
         res.end();
         return;
       }
@@ -259,6 +317,18 @@ app.post(
        * 注意这里没有再传 tools。
        * 因为工具调用阶段已经结束了。现在模型只需要根据已有 messages，包括工具结果，生成最终文本。
        */
+      activePhase = "final_stream";
+      const finalStreamStartedAt = Date.now();
+      let deltaCount = 0;
+      let outputCharCount = 0;
+
+      logAgentInfo(requestId, "final_stream", "started", {
+        model,
+        messageCount: agentRun.messages.length,
+        modelCalledTools: agentRun.toolCallCount > 0,
+        toolCallCount: agentRun.toolCallCount,
+      });
+
       const stream = await deepseek.chat.completions.create({
         model,
         messages: agentRun.messages,
@@ -275,38 +345,70 @@ app.post(
         const delta = chunk.choices[0]?.delta?.content;
 
         if (delta) {
-          writeSseEvent(res, {
+          deltaCount += 1;
+          outputCharCount += delta.length;
+
+          writeAgentSseEvent({
             type: "delta",
             delta,
+            phase: "final_stream",
           });
         }
       }
 
       if (!clientClosed) {
+        const finalStreamDurationMs = getDurationMs(finalStreamStartedAt);
+        const totalDurationMs = getDurationMs(requestStartedAt);
+
+        logAgentInfo(requestId, "final_stream", "completed", {
+          durationMs: finalStreamDurationMs,
+          deltaCount,
+          outputCharCount,
+        });
+
+        logAgentInfo(requestId, "request", "completed", {
+          durationMs: totalDurationMs,
+          modelCalledTools: agentRun.toolCallCount > 0,
+          toolCallCount: agentRun.toolCallCount,
+          finalStreamDurationMs,
+          outputCharCount,
+        });
+
         // 最后发送，表示本次回答结束。
-        writeSseEvent(res, {
+        writeAgentSseEvent({
           type: "done",
+          phase: "request_completed",
+          duration_ms: totalDurationMs,
         });
       }
 
+      responseCompleted = true;
       res.end();
     } catch (error) {
-      console.error("Agent API error:", error);
+      const totalDurationMs = getDurationMs(requestStartedAt);
+
+      logAgentError(requestId, activePhase, "failed", error, {
+        durationMs: totalDurationMs,
+      });
 
       if (!res.headersSent) {
         res.status(500).json({
           error: "Failed to run AI agent.",
         });
+        responseCompleted = true;
         return;
       }
 
       if (!clientClosed) {
-        writeSseEvent(res, {
+        writeAgentSseEvent({
           type: "error",
           error: "Failed to run AI agent.",
+          phase: activePhase,
+          duration_ms: totalDurationMs,
         });
       }
 
+      responseCompleted = true;
       res.end();
     }
   }

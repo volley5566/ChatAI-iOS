@@ -1,8 +1,10 @@
 import type OpenAI from "openai";
 import type {
+  ChatCompletion,
   ChatCompletionAssistantMessageParam,
   ChatCompletionMessageParam,
   ChatCompletionMessageToolCall,
+  ChatCompletionTool,
 } from "openai/resources/chat/completions";
 import {
   buildToolDoneEvent,
@@ -11,6 +13,12 @@ import {
   getAgentTools,
   stringifyToolResult,
 } from "./agentTools";
+import {
+  getDurationMs,
+  getToolCallLogData,
+  logAgentError,
+  logAgentInfo,
+} from "./agentObservability";
 import { buildAgentInstructions } from "../chat/prompts";
 import type {
   ChatStreamEvent,
@@ -69,8 +77,17 @@ function buildAssistantToolMessage(
   return assistantToolMessage;
 }
 
+function getToolDefinitionName(tool: ChatCompletionTool): string {
+  if (tool.type === "function") {
+    return tool.function.name;
+  }
+
+  return tool.type;
+}
+
 type RunAgentToolLoopOptions = {
   deepseek: OpenAI;
+  requestId: string;
   model: string;
   message: string;
   systemPrompt: string | undefined;
@@ -86,12 +103,15 @@ type RunAgentToolLoopOptions = {
  */
 export async function runAgentToolLoop({
   deepseek,
+  requestId,
   model,
   message,
   systemPrompt,
   history,
   onToolEvent,
 }: RunAgentToolLoopOptions): Promise<AgentRunResult> {
+  const loopStartedAt = Date.now();
+
   // Agent 先构造 messages。
   // 因为 DeepSeek 不是只看当前一句话，它需要知道系统规则、历史上下文、当前问题。
   /**
@@ -104,6 +124,13 @@ export async function runAgentToolLoop({
    */
   // buildAgentMessages 它先构造消息。
   const messages = buildAgentMessages(message, systemPrompt, history);
+
+  logAgentInfo(requestId, "tool_loop", "messages_prepared", {
+    model,
+    historyCount: history.length,
+    messageCount: messages.length,
+    maxAgentToolSteps,
+  });
 
   /**
    * 这里拿到的是“给模型看的工具定义”。
@@ -127,7 +154,24 @@ export async function runAgentToolLoop({
    */
   // 然后拿工具列表。
   // 这里拿到的工具不是手写死的，而是来自 MCP server。
-  const agentTools = await getAgentTools();
+  const loadToolsStartedAt = Date.now();
+  let agentTools;
+
+  try {
+    agentTools = await getAgentTools();
+  } catch (error) {
+    logAgentError(requestId, "tool_setup", "tools_load_failed", error, {
+      durationMs: getDurationMs(loadToolsStartedAt),
+    });
+    throw error;
+  }
+
+  logAgentInfo(requestId, "tool_setup", "tools_loaded", {
+    durationMs: getDurationMs(loadToolsStartedAt),
+    toolCount: agentTools.length,
+    toolNames: agentTools.map(getToolDefinitionName),
+  });
+
   let toolCallCount = 0;
 
   for (let step = 0; step < maxAgentToolSteps; step += 1) {
@@ -166,24 +210,55 @@ export async function runAgentToolLoop({
      *   ]
      * }
      */
-    const completion = await deepseek.chat.completions.create({
+    const decisionStartedAt = Date.now();
+
+    logAgentInfo(requestId, "tool_decision", "started", {
+      step,
       model,
-      messages,
-      // tools：告诉模型有哪些工具可以用。
-      tools: agentTools,
-      // tool_choice: "auto"：让模型自己判断要不要调用工具。
-      tool_choice: "auto",
+      messageCount: messages.length,
+      toolCount: agentTools.length,
     });
+
+    let completion: ChatCompletion;
+
+    try {
+      completion = await deepseek.chat.completions.create({
+        model,
+        messages,
+        // tools：告诉模型有哪些工具可以用。
+        tools: agentTools,
+        // tool_choice: "auto"：让模型自己判断要不要调用工具。
+        tool_choice: "auto",
+      });
+    } catch (error) {
+      logAgentError(requestId, "tool_decision", "failed", error, {
+        step,
+        durationMs: getDurationMs(decisionStartedAt),
+      });
+      throw error;
+    }
 
     const assistantMessage = completion.choices[0]
       ?.message as DeepSeekAssistantMessageWithReasoning | undefined;
 
     if (!assistantMessage) {
+      logAgentInfo(requestId, "tool_decision", "no_assistant_message", {
+        step,
+        durationMs: getDurationMs(decisionStartedAt),
+      });
       break;
     }
 
     // 如果模型返回工具调用。
     const toolCalls = assistantMessage.tool_calls || [];
+
+    logAgentInfo(requestId, "tool_decision", "completed", {
+      step,
+      durationMs: getDurationMs(decisionStartedAt),
+      modelCalledTools: toolCalls.length > 0,
+      toolCallCount: toolCalls.length,
+      toolCalls: toolCalls.map(getToolCallLogData),
+    });
 
     if (toolCalls.length === 0) {
       /**
@@ -222,17 +297,40 @@ export async function runAgentToolLoop({
      * 因为 DeepSeek 需要看到工具返回了什么，才能基于工具结果生成最终答案。
      */
     for (const toolCall of toolCalls) {
+      const toolStartedAt = Date.now();
+      const toolLogData = getToolCallLogData(toolCall);
+
+      logAgentInfo(requestId, "tool_execution", "started", {
+        step,
+        ...toolLogData,
+      });
+
       onToolEvent?.(buildToolStartEvent(toolCall));
 
       /**
        * 真实执行从这里进入 MCP：
        * executeAgentTool -> mcpClient.callTool -> mcpServer handler。
        */
-      const toolResult = await executeAgentTool(toolCall);
+      let toolResult: Awaited<ReturnType<typeof executeAgentTool>>;
 
-      console.log(
-        `[Agent] tool call: ${toolCall.type === "function" ? toolCall.function.name : toolCall.type}, ok: ${toolResult.ok}`
-      );
+      try {
+        toolResult = await executeAgentTool(toolCall);
+      } catch (error) {
+        logAgentError(requestId, "tool_execution", "failed", error, {
+          step,
+          durationMs: getDurationMs(toolStartedAt),
+          ...toolLogData,
+        });
+        throw error;
+      }
+
+      logAgentInfo(requestId, "tool_execution", "completed", {
+        step,
+        durationMs: getDurationMs(toolStartedAt),
+        ...toolLogData,
+        ok: toolResult.ok,
+        result: toolResult,
+      });
 
       onToolEvent?.(buildToolDoneEvent(toolCall, toolResult));
 
@@ -243,6 +341,13 @@ export async function runAgentToolLoop({
       });
     }
   }
+
+  logAgentInfo(requestId, "tool_loop", "completed", {
+    durationMs: getDurationMs(loopStartedAt),
+    modelCalledTools: toolCallCount > 0,
+    toolCallCount,
+    finalMessageCount: messages.length,
+  });
 
   return {
     messages,

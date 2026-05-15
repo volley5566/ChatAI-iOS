@@ -60,28 +60,40 @@ export type PreparedChatCompletion = {
   aiMessages: ChatCompletionMessageParam[];
 };
 
+type ChatStreamEventMetadata = {
+  /**
+   * 后端为每次 Agent 请求生成的 trace id。
+   * iOS 可以忽略它，但排查问题时可以用它和后端日志对齐。
+   */
+  request_id?: string;
+  phase?: string;
+  duration_ms?: number;
+};
+
 /**
  * 通过 SSE 发给 iOS 的事件格式。
  */
-export type ChatStreamEvent =
-  | { type: "delta"; delta: string }
-  | { type: "done" }
-  | { type: "error"; error: string }
-  | {
-      type: "tool_start";
-      tool_call_id: string;
-      tool_name: string;
-      display_name: string;
-      message: string;
-    }
-  | {
-      type: "tool_done";
-      tool_call_id: string;
-      tool_name: string;
-      display_name: string;
-      ok: boolean;
-      message: string;
-    };
+export type ChatStreamEvent = ChatStreamEventMetadata &
+  (
+    | { type: "delta"; delta: string }
+    | { type: "done" }
+    | { type: "error"; error: string }
+    | {
+        type: "tool_start";
+        tool_call_id: string;
+        tool_name: string;
+        display_name: string;
+        message: string;
+      }
+    | {
+        type: "tool_done";
+        tool_call_id: string;
+        tool_name: string;
+        display_name: string;
+        ok: boolean;
+        message: string;
+      }
+  );
 
 /**
  * DeepSeek V4 thinking mode 会在 assistant 消息里额外返回 reasoning_content。

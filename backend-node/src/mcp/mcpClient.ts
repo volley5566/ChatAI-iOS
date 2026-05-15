@@ -56,11 +56,46 @@ type McpDirectToolResult = Extract<McpCallToolResponse, { content: unknown[] }>;
 let mcpAgentClientPromise: Promise<McpAgentClient> | undefined;
 
 function parseToolArguments(rawArguments: string): unknown {
+  /**
+   * DeepSeek/OpenAI-compatible tool call 里 function.arguments 是字符串。
+   *
+   * 正常情况下它应该是 JSON object 字符串，例如：
+   *   "{\"query\":\"SwiftUI @State\"}"
+   *
+   * 如果模型返回了坏 JSON，这里不要 throw。
+   * 返回 undefined 后，下面 callTool 会把它转成 ok:false 的工具结果，
+   * 让 Agent 最终回答可以继续，而不是因为一次参数格式错误导致整条请求失败。
+   */
   try {
     return JSON.parse(rawArguments || "{}");
   } catch {
     return undefined;
   }
+}
+
+function resetMcpAgentClient(): void {
+  /**
+   * MCP client 是进程级单例。如果 stdio MCP server 崩了、断管了，或者 SDK 调用抛错，
+   * 这个单例很可能已经不可用了。
+   *
+   * 这里的策略是：
+   * - 先把全局 promise 清空，避免后续请求继续复用坏连接
+   * - 尝试异步 close 旧 client，但不阻塞当前错误路径
+   *
+   * 下一次 getMcpAgentClient() 会重新启动 MCP server 子进程。
+   */
+  const staleClientPromise = mcpAgentClientPromise;
+  mcpAgentClientPromise = undefined;
+
+  if (!staleClientPromise) {
+    return;
+  }
+
+  void staleClientPromise
+    .then((client) => client.close())
+    .catch(() => {
+      // 旧连接本来就可能已经断开，close 失败不需要再扩大影响面。
+    });
 }
 
 function buildMcpServerLaunchArgs(): string[] {
@@ -276,8 +311,19 @@ async function getMcpAgentClient(): Promise<McpAgentClient> {
 }
 
 export async function getMcpAgentTools(): Promise<ChatCompletionTool[]> {
-  const client = await getMcpAgentClient();
-  return client.listOpenAiTools();
+  try {
+    const client = await getMcpAgentClient();
+    return await client.listOpenAiTools();
+  } catch (error) {
+    /**
+     * listTools 是 Agent 工具阶段的入口。
+     * 如果这里失败，通常意味着 MCP server 启动失败或连接已经不可用。
+     * 清掉单例后，Agent Runner 可以选择跳过工具阶段；
+     * 下一次用户请求再尝试重建 MCP 连接。
+     */
+    resetMcpAgentClient();
+    throw error;
+  }
 }
 
 export async function executeMcpToolCall(
@@ -287,7 +333,6 @@ export async function executeMcpToolCall(
     return buildToolErrorResult("unknown", "Only function tool calls are supported.");
   }
 
-  const client = await getMcpAgentClient();
   // 1. 取出工具名，比如 searchKnowledge。
   const toolName = toolCall.function.name;
 
@@ -295,7 +340,34 @@ export async function executeMcpToolCall(
   const rawArguments = parseToolArguments(toolCall.function.arguments);
 
   // 3. 通过 MCP callTool 调工具。
-  return client.callTool(toolName, rawArguments);
+  try {
+    const client = await getMcpAgentClient();
+    return await client.callTool(toolName, rawArguments);
+  } catch (firstError) {
+    /**
+     * 第一次调用失败时，最常见的可恢复原因是：
+     * - MCP server 子进程已经退出
+     * - stdio transport 断开
+     * - 缓存的 client 处于坏状态
+     *
+     * 所以这里做一次轻量 retry：
+     * 1. 清掉坏单例
+     * 2. 重新获取 client，这会重新启动 MCP server
+     * 3. 用同一组工具参数再调一次
+     *
+     * 如果第二次仍失败，就把错误抛给 Agent Runner；
+     * Runner 会把它包装成 ok:false 的工具结果，而不是让整个回答失败。
+     */
+    resetMcpAgentClient();
+
+    try {
+      const retryClient = await getMcpAgentClient();
+      return await retryClient.callTool(toolName, rawArguments);
+    } catch (retryError) {
+      resetMcpAgentClient();
+      throw retryError;
+    }
+  }
 }
 
 export async function closeMcpAgentClient(): Promise<void> {

@@ -204,13 +204,36 @@ app.post(
     req: Request,
     res: Response<ErrorResponseBody>
   ) => {
+    /**
+     * 这条 requestId 是本次 Agent 请求的“链路编号”。
+     *
+     * 后面会被写到三个地方：
+     * 1. X-Request-ID response header：方便 HTTP 调试工具查看
+     * 2. SSE event.request_id：方便 iOS 端必要时展示/上报
+     * 3. 后端结构化日志：方便按 requestId grep 完整链路
+     */
     const requestId = createAgentRequestId();
     const requestStartedAt = Date.now();
     let clientClosed = false;
     let responseCompleted = false;
+    /**
+     * activePhase 用来标记“当前请求正在做什么”。
+     *
+     * 如果中途 throw，catch 里会用它记录错误发生在哪个阶段：
+     * - request_validation
+     * - tool_loop
+     * - final_stream
+     */
     let activePhase = "request_validation";
 
     const writeAgentSseEvent = (event: ChatStreamEvent) => {
+      /**
+       * Agent 专用 SSE 写入函数。
+       *
+       * 普通聊天接口不需要 request_id；
+       * Agent 接口链路更长，包含工具阶段，所以每条事件都补上 request_id，
+       * 让客户端事件和服务端日志能对齐。
+       */
       writeSseEvent(res, {
         ...event,
         request_id: requestId,
@@ -223,6 +246,10 @@ app.post(
       clientClosed = true;
 
       if (!responseCompleted) {
+        /**
+         * close 不一定是错误：用户可能退出页面、取消请求、网络断开。
+         * 但对 Agent 调试很重要，因为它解释了为什么后端没有写 done。
+         */
         logAgentInfo(requestId, "http", "client_closed", {
           durationMs: getDurationMs(requestStartedAt),
           activePhase,
@@ -242,6 +269,10 @@ app.post(
       const history = sanitizeChatHistory(body.history);
 
       logAgentInfo(requestId, "request", "received", {
+        /**
+         * 这里不记录完整 message 内容，避免用户输入进入后端日志。
+         * 只记录长度、history 数量和是否有 system prompt，足够排查上下文规模问题。
+         */
         route: "/api/agent/stream",
         model,
         messageLength: message?.length || 0,
@@ -287,6 +318,10 @@ app.post(
            * 所以 iOS 才能显示“正在查询知识库”“已查询知识库”。
            */
           if (!clientClosed) {
+            /**
+             * tool_start / tool_done 是面向 UI 的安全摘要。
+             * 详细工具参数和工具返回只写后端日志，不直接推给 iOS。
+             */
             writeAgentSseEvent({
               ...event,
               phase: "tool_execution",
@@ -323,6 +358,10 @@ app.post(
       let outputCharCount = 0;
 
       logAgentInfo(requestId, "final_stream", "started", {
+        /**
+         * 到这里说明工具阶段已经结束。
+         * 不管工具成功、失败、超时、还是跳过，最终回答都只基于 agentRun.messages。
+         */
         model,
         messageCount: agentRun.messages.length,
         modelCalledTools: agentRun.toolCallCount > 0,
@@ -361,6 +400,11 @@ app.post(
         const totalDurationMs = getDurationMs(requestStartedAt);
 
         logAgentInfo(requestId, "final_stream", "completed", {
+          /**
+           * deltaCount / outputCharCount 用来粗略观察流式输出是否正常：
+           * - deltaCount = 0 可能表示模型没输出内容
+           * - outputCharCount 可以帮助判断回答是否异常短或异常长
+           */
           durationMs: finalStreamDurationMs,
           deltaCount,
           outputCharCount,
@@ -400,6 +444,10 @@ app.post(
       }
 
       if (!clientClosed) {
+        /**
+         * 如果错误发生在 SSE 已经建立之后，不能再返回 HTTP 500 JSON。
+         * 只能通过 SSE error 事件告诉 iOS，并附上 request_id / phase / duration_ms。
+         */
         writeAgentSseEvent({
           type: "error",
           error: "Failed to run AI agent.",

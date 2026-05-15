@@ -13,6 +13,7 @@ import {
   getAgentTools,
   stringifyToolResult,
 } from "./agentTools";
+import { buildToolErrorResult } from "./agentToolTypes";
 import {
   getDurationMs,
   getToolCallLogData,
@@ -27,6 +28,7 @@ import type {
 } from "../shared/types";
 
 const maxAgentToolSteps = 4;
+const toolExecutionTimeoutMs = 8000;
 
 export type AgentRunResult = {
   messages: ChatCompletionMessageParam[];
@@ -83,6 +85,60 @@ function getToolDefinitionName(tool: ChatCompletionTool): string {
   }
 
   return tool.type;
+}
+
+function getToolCallName(toolCall: ChatCompletionMessageToolCall): string {
+  /**
+   * 当前项目只支持 function tool call。
+   * 这里仍然保留 unknown 分支，是为了防止未来 SDK 增加新 tool_call 类型时，
+   * 日志和错误结果至少还能带一个稳定的工具名字段。
+   */
+  return toolCall.type === "function" ? toolCall.function.name : "unknown";
+}
+
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error && error.message) {
+    return error.message;
+  }
+
+  if (typeof error === "string" && error.trim()) {
+    return error;
+  }
+
+  return "Unknown error";
+}
+
+function withTimeout<T>(
+  operation: Promise<T>,
+  timeoutMs: number,
+  timeoutMessage: string
+): Promise<T> {
+  /**
+   * 给单个异步操作加超时保护。
+   *
+   * 注意：Promise 超时不能真正“杀掉”底层工作，例如已经发给 MCP server 的请求
+   * 可能仍会在后台完成。这里的目标是保护 Agent 主链路：
+   * 用户不应该因为某个工具迟迟不返回而一直等不到最终回答。
+   *
+   * operation.then(..., ...) 会同时接住底层成功和失败，避免超时返回后底层 promise
+   * 再 reject 造成未处理异常。
+   */
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => {
+      reject(new Error(timeoutMessage));
+    }, timeoutMs);
+
+    operation.then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
 }
 
 type RunAgentToolLoopOptions = {
@@ -155,7 +211,7 @@ export async function runAgentToolLoop({
   // 然后拿工具列表。
   // 这里拿到的工具不是手写死的，而是来自 MCP server。
   const loadToolsStartedAt = Date.now();
-  let agentTools;
+  let agentTools: ChatCompletionTool[] = [];
 
   try {
     agentTools = await getAgentTools();
@@ -163,7 +219,25 @@ export async function runAgentToolLoop({
     logAgentError(requestId, "tool_setup", "tools_load_failed", error, {
       durationMs: getDurationMs(loadToolsStartedAt),
     });
-    throw error;
+
+    /**
+     * 工具列表加载失败时，不把整次请求判失败。
+     *
+     * 这通常表示 MCP server 没启动成功、stdio 连接断了，或者本地工具层临时不可用。
+     * 但用户的问题仍然可以让模型用通用知识回答，所以这里降级成“无工具回答”：
+     * - 返回当前 messages
+     * - server.ts 后续仍然会走最终 stream
+     * - 日志里能看到 fallback 原因和 requestId
+     */
+    logAgentInfo(requestId, "tool_setup", "fallback_to_no_tools", {
+      durationMs: getDurationMs(loadToolsStartedAt),
+      reason: "tools_load_failed",
+    });
+
+    return {
+      messages,
+      toolCallCount: 0,
+    };
   }
 
   logAgentInfo(requestId, "tool_setup", "tools_loaded", {
@@ -172,7 +246,24 @@ export async function runAgentToolLoop({
     toolNames: agentTools.map(getToolDefinitionName),
   });
 
+  if (agentTools.length === 0) {
+    /**
+     * MCP 正常响应但没有暴露工具时，也按无工具模式继续。
+     * 这不是错误，只是说明本轮 Agent 没有可用外部能力。
+     */
+    logAgentInfo(requestId, "tool_setup", "fallback_to_no_tools", {
+      durationMs: getDurationMs(loadToolsStartedAt),
+      reason: "empty_tool_list",
+    });
+
+    return {
+      messages,
+      toolCallCount: 0,
+    };
+  }
+
   let toolCallCount = 0;
+  let stoppedBecauseMaxStepsReached = true;
 
   for (let step = 0; step < maxAgentToolSteps; step += 1) {
     /**
@@ -246,6 +337,7 @@ export async function runAgentToolLoop({
         step,
         durationMs: getDurationMs(decisionStartedAt),
       });
+      stoppedBecauseMaxStepsReached = false;
       break;
     }
 
@@ -265,6 +357,7 @@ export async function runAgentToolLoop({
        * 没有 tool_calls 表示模型认为工具阶段结束。
        * 后续由 server.ts 使用 agentRun.messages 开启最终流式回答。
        */
+      stoppedBecauseMaxStepsReached = false;
       break;
     }
 
@@ -299,9 +392,11 @@ export async function runAgentToolLoop({
     for (const toolCall of toolCalls) {
       const toolStartedAt = Date.now();
       const toolLogData = getToolCallLogData(toolCall);
+      const toolName = getToolCallName(toolCall);
 
       logAgentInfo(requestId, "tool_execution", "started", {
         step,
+        timeoutMs: toolExecutionTimeoutMs,
         ...toolLogData,
       });
 
@@ -312,16 +407,40 @@ export async function runAgentToolLoop({
        * executeAgentTool -> mcpClient.callTool -> mcpServer handler。
        */
       let toolResult: Awaited<ReturnType<typeof executeAgentTool>>;
+      let recoveredFromToolFailure = false;
 
       try {
-        toolResult = await executeAgentTool(toolCall);
+        toolResult = await withTimeout(
+          executeAgentTool(toolCall),
+          toolExecutionTimeoutMs,
+          `Tool execution timed out after ${toolExecutionTimeoutMs}ms.`
+        );
       } catch (error) {
-        logAgentError(requestId, "tool_execution", "failed", error, {
+        recoveredFromToolFailure = true;
+
+        logAgentError(requestId, "tool_execution", "recovered_as_tool_error", error, {
           step,
           durationMs: getDurationMs(toolStartedAt),
+          timeoutMs: toolExecutionTimeoutMs,
           ...toolLogData,
         });
-        throw error;
+
+        /**
+         * 这是本轮稳定性增强的关键点：
+         *
+         * 以前工具执行 throw 会一路冒泡到 server.ts，导致整个 SSE 回答失败。
+         * 现在把异常包装成一条标准 tool result：
+         *   { toolName, ok:false, error:"..." }
+         *
+         * 这样模型最终回答时仍然能看到“工具失败了”，并可以自然降级：
+         * - 说明没有拿到工具结果
+         * - 用通用知识继续回答
+         * - 或提醒用户稍后重试
+         */
+        toolResult = buildToolErrorResult(
+          toolName,
+          `Tool execution failed: ${getErrorMessage(error)}`
+        );
       }
 
       logAgentInfo(requestId, "tool_execution", "completed", {
@@ -329,6 +448,7 @@ export async function runAgentToolLoop({
         durationMs: getDurationMs(toolStartedAt),
         ...toolLogData,
         ok: toolResult.ok,
+        recoveredFromToolFailure,
         result: toolResult,
       });
 
@@ -340,6 +460,20 @@ export async function runAgentToolLoop({
         content: stringifyToolResult(toolResult),
       });
     }
+  }
+
+  if (stoppedBecauseMaxStepsReached) {
+    /**
+     * 走到这里说明每一轮模型都继续返回 tool_calls，直到达到 maxAgentToolSteps。
+     * 上限保护可以避免模型陷入“调用工具 -> 看结果 -> 继续调用工具”的无限循环。
+     *
+     * 达到上限后不再继续工具阶段，直接让模型基于已有工具结果生成最终回答。
+     */
+    logAgentInfo(requestId, "tool_loop", "max_tool_steps_reached", {
+      maxAgentToolSteps,
+      toolCallCount,
+      messageCount: messages.length,
+    });
   }
 
   logAgentInfo(requestId, "tool_loop", "completed", {

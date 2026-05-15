@@ -48,15 +48,33 @@ export type KnowledgeDocument = {
   content: string;
 };
 
-export type ScoredKnowledgeDocument = {
-  document: KnowledgeDocument;
+/**
+ * Markdown 文档切出来的一小段知识片段。
+ *
+ * 为什么需要 chunk：
+ * - 一篇 Markdown 往往包含多个主题，整篇塞给模型会带很多无关内容
+ * - 用户问题通常只命中其中一两个小节
+ * - 后续接 embedding/vector search 时，向量也应该按 chunk 存，而不是按整篇文档存
+ */
+export type KnowledgeChunk = {
+  id: string;
+  fileName: string;
+  title: string;
+  section: string;
+  citation: string;
+  keywords: string[];
+  content: string;
+};
+
+export type ScoredKnowledgeChunk = {
+  chunk: KnowledgeChunk;
   score: number;
 };
 
 export type ChatResponseMode = "structured" | "streaming";
 
 export type PreparedChatCompletion = {
-  knowledgeMatches: ScoredKnowledgeDocument[];
+  knowledgeMatches: ScoredKnowledgeChunk[];
   aiMessages: ChatCompletionMessageParam[];
 };
 

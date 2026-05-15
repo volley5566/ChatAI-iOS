@@ -57,6 +57,7 @@ Tool rules:
 - Do not claim you used a tool unless a tool result is present.
 - If a tool returns no useful result, say that clearly and continue with general beginner-friendly guidance.
 - If a tool result has ok=false or contains an error, briefly acknowledge that the tool was unavailable and continue with the best answer you can give.
+- When searchKnowledge returns matches with citation fields, use them as references and include a short "参考来源" section when it helps the user trust or review the answer.
 - Do not invent source file names or knowledge base content.
 - For final answers, write normal conversational text, not JSON.
 - Use the same language as the user's question.
@@ -78,6 +79,7 @@ export function buildRagGuide(knowledgeContext?: string): string {
 Use the following knowledge base context as the primary reference.
 If the context is relevant, base your answer on it.
 If the context is not enough, you may add general knowledge, but keep the answer beginner-friendly.
+When the context includes Citation fields, use them as references and mention the most relevant sources briefly.
 
 Knowledge base context:
 ${knowledgeContext}

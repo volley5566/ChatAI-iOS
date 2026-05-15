@@ -119,7 +119,7 @@ function buildToolDoneMessage(result: AgentToolExecutionResult): string {
 
   if (result.toolName === "searchKnowledge") {
     return typeof resultCount === "number"
-      ? `已查询知识库，找到 ${resultCount} 条相关资料`
+      ? `已查询知识库，找到 ${resultCount} 段相关资料`
       : "已查询知识库";
   }
 

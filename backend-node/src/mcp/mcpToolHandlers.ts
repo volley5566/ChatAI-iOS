@@ -84,12 +84,17 @@ export function runSearchKnowledgeTool(
   args: SearchKnowledgeArguments
 ): AgentToolExecutionResult {
   /**
-   * 当前 RAG 是学习版：Markdown + 关键词匹配。
+   * 当前 RAG 是学习版：Markdown chunk + 关键词匹配。
    *
    * 这里返回的是结构化结果，而不是直接拼 prompt：
    * - MCP client 可以稳定读取 matches 数量
-   * - Agent Runner 可以把完整结果交回模型
-   * - iOS 可以通过 tool_done 展示“找到 N 条资料”
+   * - Agent Runner 可以把完整 chunk 结果交回模型
+   * - 模型最终回答时可以用 citation 告诉用户参考来源
+   * - iOS 可以通过 tool_done 展示“找到 N 条相关资料”
+   *
+   * 注意：这里暂时不直接把 sources 推给 iOS。
+   * 当前版本先让模型在最终回答里自然展示来源；
+   * 后续如果要做独立“参考来源 UI”，可以新增 SSE event 或最终 metadata。
    */
   const matches = retrieveRelevantKnowledge(args.query);
 
@@ -99,10 +104,12 @@ export function runSearchKnowledgeTool(
     result: {
       query: args.query,
       matches: matches.map((match) => ({
-        source: match.document.fileName,
-        title: match.document.title,
+        source: match.chunk.fileName,
+        title: match.chunk.title,
+        section: match.chunk.section,
+        citation: match.chunk.citation,
         score: match.score,
-        excerpt: truncateText(match.document.content, 1200),
+        excerpt: truncateText(match.chunk.content, 1200),
       })),
     },
   };

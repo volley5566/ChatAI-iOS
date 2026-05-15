@@ -6,7 +6,7 @@ import type {
   ChatResponseMode,
   NormalizedChatHistoryItem,
   PreparedChatCompletion,
-  ScoredKnowledgeDocument,
+  ScoredKnowledgeChunk,
 } from "../shared/types";
 
 /**
@@ -65,13 +65,13 @@ export function prepareChatCompletion(
  */
 export function logChatContext(
   responseMode: ChatResponseMode,
-  knowledgeMatches: ScoredKnowledgeDocument[],
+  knowledgeMatches: ScoredKnowledgeChunk[],
   history: NormalizedChatHistoryItem[]
 ): void {
   console.log(
-    `[RAG:${responseMode}] matched documents: ${
+    `[RAG:${responseMode}] matched chunks: ${
       knowledgeMatches
-        .map((item) => `${item.document.fileName}:${item.score}`)
+        .map((item) => `${item.chunk.citation}:${item.score}`)
         .join(", ") || "none"
     }`
   );

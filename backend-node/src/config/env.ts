@@ -1,8 +1,9 @@
 import dotenv from "dotenv";
 
 /**
+ * 配置和 DeepSeek 客户端
  * 统一读取环境变量。
- *
+ * 这里是统一读取 .env
  * 让 server.ts 不再关心 .env 细节，只拿已经校验过的配置使用。
  */
 dotenv.config();

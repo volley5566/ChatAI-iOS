@@ -22,12 +22,24 @@ import type { ChatRequestBody, ChatResponseBody, ErrorResponseBody } from "./sha
  * - http/sse.ts：SSE 输出
  * - shared/types.ts：共享类型
  */
+// 创建后端服务。
 const app = express();
 
+// 允许 iOS / 浏览器跨域访问。
 app.use(cors());
+
+// express.json() 让后端能读取 JSON 请求体。
+// limit: "1mb" 是限制请求体大小，避免用户传超大内容。
 app.use(express.json({ limit: "1mb" }));
 
-//9. 健康检查接口
+/**
+ * 它暴露了 4 个接口：
+ * - GET /health：健康检查
+ * - /api/chat：非流式结构化 JSON
+ * - /api/chat/stream：普通流式回答，固定 RAG
+ * - /api/agent/stream：现在最核心的链路，Agent + Tool Calling + MCP + SSE
+ */
+// 9. 健康检查接口
 app.get("/health", (_req: Request, res: Response) => {
   res.json({
     status: "ok",
@@ -35,7 +47,7 @@ app.get("/health", (_req: Request, res: Response) => {
   });
 });
 
-//10. 聊天接口：非流式结构化 JSON
+// 10. 聊天接口：非流式结构化 JSON
 app.post(
   "/api/chat",
   async (
@@ -83,7 +95,7 @@ app.post(
   }
 );
 
-//11. 普通流式聊天接口：固定 RAG + stream: true
+// 11. 普通流式聊天接口：固定 RAG + stream: true
 app.post(
   "/api/chat/stream",
   async (
@@ -173,7 +185,8 @@ app.post(
   }
 );
 
-//12. Agent 流式接口：Tool Calling + MCP + 工具状态可视化 + 最终流式回答
+// Node.js 接住请求。
+// Agent 流式接口：Tool Calling + MCP + 工具状态可视化 + 最终流式回答。
 app.post(
   "/api/agent/stream",
   async (
@@ -187,9 +200,14 @@ app.post(
     });
 
     try {
+      // as ChatRequestBody 是 TypeScript 类型断言，告诉 TS：我认为这个对象符合这个类型。
       const body = req.body as ChatRequestBody;
+
+      // ?. 是可选链，意思是：如果 body.message 存在，就执行 .trim()；不存在就返回 undefined。
       const message = body.message?.trim();
       const systemPrompt = body.system_prompt?.trim();
+
+      // sanitizeChatHistory() 是清洗历史消息，防止客户端乱传 system / tool 角色。
       const history = sanitizeChatHistory(body.history);
 
       if (!message) {
@@ -199,6 +217,8 @@ app.post(
         return;
       }
 
+      // 然后设置 SSE 响应头。
+      // 这表示：后端不是一次性返回 JSON，而是保持连接，不断往 iOS 推送事件。
       res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
       res.setHeader("Cache-Control", "no-cache, no-transform");
       res.setHeader("Connection", "keep-alive");
@@ -206,6 +226,7 @@ app.post(
 
       console.log(`[Agent] history messages sent to AI: ${history.length}`);
 
+      // Node 进入 Agent 工具阶段。
       const agentRun = await runAgentToolLoop({
         deepseek,
         model,
@@ -213,6 +234,12 @@ app.post(
         systemPrompt,
         history,
         onToolEvent: (event) => {
+          /**
+           * onToolEvent：
+           * 当 Agent 开始调用工具时，会通过它给 iOS 推 {"type":"tool_start", ...}
+           * 当工具完成时，会推 {"type":"tool_done", ...}
+           * 所以 iOS 才能显示“正在查询知识库”“已查询知识库”。
+           */
           if (!clientClosed) {
             writeSseEvent(res, event);
           }
@@ -229,6 +256,8 @@ app.post(
       /**
        * 工具调用阶段已经结束，这里不再传 tools / tool_choice。
        * 模型只能基于 agentRun.messages 里的工具结果生成最终文本。
+       * 注意这里没有再传 tools。
+       * 因为工具调用阶段已经结束了。现在模型只需要根据已有 messages，包括工具结果，生成最终文本。
        */
       const stream = await deepseek.chat.completions.create({
         model,
@@ -236,6 +265,8 @@ app.post(
         stream: true,
       });
 
+      // 然后 Node 一段段读取 DeepSeek 返回。
+      // 每收到一段，就通过 SSE 发给 iOS。
       for await (const chunk of stream) {
         if (clientClosed) {
           break;
@@ -252,6 +283,7 @@ app.post(
       }
 
       if (!clientClosed) {
+        // 最后发送，表示本次回答结束。
         writeSseEvent(res, {
           type: "done",
         });

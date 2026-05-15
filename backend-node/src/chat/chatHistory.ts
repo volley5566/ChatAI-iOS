@@ -39,6 +39,8 @@ export function sanitizeChatHistory(history: unknown): NormalizedChatHistoryItem
       const role = historyItem.role;
       const content = historyItem.content;
 
+      // 这个很关键。
+      // 后端只允许客户端传，不允许客户端伪造，不允许客户端伪造。
       if (role !== "user" && role !== "assistant") {
         return undefined;
       }

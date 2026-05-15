@@ -1,4 +1,6 @@
 /**
+ * 它把角色说明、RAG context、输出格式规则拼起来
+ *
  * 结构化接口使用的输出规则。
  */
 export const structuredOutputGuide = `

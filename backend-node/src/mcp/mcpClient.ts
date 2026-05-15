@@ -19,6 +19,22 @@ type McpAgentClient = {
 };
 
 /**
+ * 工具调用方。
+ *
+ * 整体调用流程：
+ * DeepSeek tool calling 格式
+ *         ↓
+ * agentTools.ts 翻译
+ *         ↓
+ * mcpClient.ts
+ *         ↓
+ * MCP 协议
+ *         ↓
+ * mcpServer.ts
+ *         ↓
+ * mcpToolHandlers.ts 真实工具
+ */
+/**
  * MCP SDK 的 callTool 可能返回两种形态：
  * - 普通工具结果：包含 content / structuredContent
  * - task 工具结果：包含 toolResult
@@ -186,6 +202,10 @@ async function createMcpAgentClient(): Promise<McpAgentClient> {
    * command 使用 process.execPath，表示用当前 Node 可执行文件启动，
    * 避免不同机器上 node 路径不一致的问题。
    */
+  // 它会启动 MCP server 子进程。
+  // 当前项目用的是 stdio transport，也就是通过子进程的 stdin/stdout 交换 MCP 消息。
+  // MCP Client 第一次使用时，会自动启动 MCP Server 子进程。
+  // 当前项目里 MCP 是本地 stdio 模式：Node 后端启动一个 MCP Server 子进程，通过 stdin/stdout 通信。
   const transport = new StdioClientTransport({
     command: process.execPath,
     args: buildMcpServerLaunchArgs(),
@@ -268,9 +288,13 @@ export async function executeMcpToolCall(
   }
 
   const client = await getMcpAgentClient();
+  // 1. 取出工具名，比如 searchKnowledge。
   const toolName = toolCall.function.name;
+
+  // 2. 把模型给的 JSON 字符串参数 parse 成对象。
   const rawArguments = parseToolArguments(toolCall.function.arguments);
 
+  // 3. 通过 MCP callTool 调工具。
   return client.callTool(toolName, rawArguments);
 }
 

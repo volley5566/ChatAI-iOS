@@ -3,6 +3,8 @@ import path from "path";
 import type { KnowledgeDocument, ScoredKnowledgeDocument } from "../shared/types";
 
 /**
+ * 是本地 Markdown 知识库检索
+ *
  * knowledgeDirectory 是知识库目录。
  *
  * 开发环境下 __dirname 是 backend-node/src/knowledge，
@@ -126,7 +128,11 @@ function scoreKnowledgeDocument(
       score += 20;
     }
   }
-
+  // 然后通过关键词打分。
+  /**
+   * 这个是学习版 RAG：不是向量数据库，而是关键词匹配。优点是简单、可控、容易理解。
+   * 后面二轮迭代可以换成 embedding + vector database。
+   */
   for (const term of queryTerms) {
     if (titleText.includes(term)) {
       score += 12;

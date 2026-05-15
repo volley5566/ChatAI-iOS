@@ -10,6 +10,8 @@ import type {
 } from "../shared/types";
 
 /**
+ * 负责组装模型请求
+ *
  * 组装一次 Chat Completions 请求需要的全部上下文。
  *
  * /api/chat 和 /api/chat/stream 共用这段逻辑：
@@ -32,11 +34,16 @@ export function prepareChatCompletion(
       ? buildStreamingInstructions(systemPrompt, knowledgeContext)
       : buildInstructions(systemPrompt, knowledgeContext);
 
+  // 最终发给模型的是：
+  // system prompt
+  // 历史 user/assistant
+  // 当前 user message
   const aiMessages: ChatCompletionMessageParam[] = [
     {
       role: "system",
       content: instructions,
     },
+    // 这里的 ...history.map(...) 是展开数组。
     ...history.map((item): ChatCompletionMessageParam => ({
       role: item.role,
       content: item.content,

@@ -7,6 +7,8 @@ import {
 } from "./mcpToolHandlers";
 
 /**
+ * 是工具提供方
+ *
  * 这个文件是“工具提供方”：MCP Server。
  *
  * 可以把它理解成一个标准化的工具插座：
@@ -38,6 +40,8 @@ const mcpServer = new McpServer({
  * 只有当模型返回 tool_call，后端 MCP client 调用 callTool 时，
  * 这里的 handler 才会真正运行。
  */
+// 它注册了两个工具。
+// MCP Server 执行真实工具。
 mcpServer.registerTool(
   "searchKnowledge",
   {
@@ -45,6 +49,10 @@ mcpServer.registerTool(
     description:
       "Search the local Markdown knowledge base for iOS, SwiftUI, backend, RAG, streaming, MCP, and project concepts.",
     inputSchema: {
+      // 里面有 schema。
+      // 这里用 zod 做参数校验。
+      // 这就是 MCP server 的安全边界：模型传来的参数，必须符合 schema，才会真正执行。
+      // 这表示模型必须传 { query: string }，否则工具不执行。
       query: z
         .string()
         .trim()
@@ -57,7 +65,12 @@ mcpServer.registerTool(
       idempotentHint: true,
     },
   },
+  // 真正执行在这里。
   async ({ query }) => {
+    /**
+     * runSearchKnowledgeTool 会去本地 Markdown 知识库检索，然后返回 matches。
+     * 这就是你可以理解成：MCP 是工具入口，知识库是其中一个具体工具能力。
+     */
     const toolResult = runSearchKnowledgeTool({ query });
 
     /**

@@ -42,6 +42,7 @@ export async function getAgentTools(): Promise<ChatCompletionTool[]> {
 export async function executeAgentTool(
   toolCall: ChatCompletionMessageToolCall
 ): Promise<AgentToolExecutionResult> {
+  // MCP Client 调 MCP Server。
   return executeMcpToolCall(toolCall);
 }
 

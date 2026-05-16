@@ -98,7 +98,18 @@ function buildToolDoneMessage(result: AgentToolExecutionResult): string {
 export function buildToolDoneEventFromParts(
   toolCallId: string,
   toolName: string,
-  result: AgentToolExecutionResult
+  result: AgentToolExecutionResult,
+  /**
+   * 工具从 tool_start 到 tool_done 的耗时（毫秒）。
+   *
+   * 加这个字段是为了第三阶段的“工具进度更标准”：
+   * - iOS 可以直接展示“查询知识库 完成 (213ms)”
+   * - 后端日志和 SSE 事件能用同一个 duration 对齐
+   *
+   * 调用方目前一定会传；保持可选是为了让历史调用点（比如未来加的单元测试）
+   * 不需要立即跟着改。
+   */
+  durationMs?: number
 ): ChatStreamEvent {
   return {
     type: "tool_done",
@@ -107,5 +118,6 @@ export function buildToolDoneEventFromParts(
     display_name: getAgentToolDisplayName(toolName),
     ok: result.ok,
     message: buildToolDoneMessage(result),
+    duration_ms: durationMs,
   };
 }

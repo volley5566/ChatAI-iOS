@@ -1,6 +1,11 @@
 import { ChatDeepSeek } from "@langchain/deepseek";
 import type { BaseMessage } from "@langchain/core/messages";
-import { deepseekBaseURL, model, requireDeepSeekApiKey } from "../config/env";
+import {
+  chatModelHttpMaxRetries,
+  deepseekBaseURL,
+  model,
+  requireDeepSeekApiKey,
+} from "../config/env";
 import { messageContentToString } from "./chatPrompt";
 
 type CreateLangChainChatModelOptions = {
@@ -30,6 +35,19 @@ export function createLangChainChatModel(
     model,
     apiKey: requireDeepSeekApiKey(),
     streaming: options.streaming ?? false,
+    /**
+     * maxRetries 是 @langchain/openai 在 HTTP 层做的自动重试：
+     * 单次 fetch 失败 / 429 / 5xx 时按指数退避重试，最多这么多次。
+     *
+     * 注意它和 Agent 里挂的 modelRetryMiddleware 是“两层重试”：
+     * - 这里 maxRetries：包住一次模型 SDK 调用，针对网络/瞬时错误
+     * - middleware：包住整个 Agent 的 model node，针对一轮决策失败
+     *
+     * 单独看任意一层都太脆弱，叠在一起才是“可观测+可恢复”的标准做法。
+     * 实际重试上限大致是 chatModelHttpMaxRetries × (agentModelRetryMaxAttempts + 1)，
+     * 默认 2 × 3 = 6 次，够覆盖偶发抖动又不会无限循环。
+     */
+    maxRetries: chatModelHttpMaxRetries,
     /**
      * modelKwargs 会被 @langchain/openai 原样合并到 Chat Completions 请求体。
      *

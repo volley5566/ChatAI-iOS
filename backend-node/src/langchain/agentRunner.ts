@@ -1,10 +1,13 @@
 import {
   AIMessage,
+  AIMessageChunk,
   BaseMessage,
   HumanMessage,
 } from "@langchain/core/messages";
 import {
   createAgent,
+  modelCallLimitMiddleware,
+  modelRetryMiddleware,
   toolCallLimitMiddleware,
 } from "langchain";
 import type { ClientTool } from "@langchain/core/tools";
@@ -14,6 +17,11 @@ import {
   logAgentError,
   logAgentInfo,
 } from "../agent/agentObservability";
+import {
+  agentModelCallLimit,
+  agentModelRetryMaxAttempts,
+  agentRecursionLimit,
+} from "../config/env";
 import type {
   ChatStreamEvent,
   NormalizedChatHistoryItem,
@@ -37,26 +45,21 @@ type RunLangChainAgentStreamOptions = {
   shouldStop?: () => boolean;
 };
 
-const langChainAgentRecursionLimit = 8;
-
 /**
- * LangChain Agent Runner。
+ * LangChain Agent Runner（第三阶段）。
  *
- * 第二阶段后，Agent 的核心循环不再由我们手写：
+ * Agent 的“决定 -> 调工具 -> 再决定 -> 最终回答”循环交给 LangChain createAgent；
+ * 我们这一层负责：
  *
- *   while step < maxSteps
- *     model decides tool_calls
- *     backend executes tools
- *     append tool messages
+ *   1. 构造系统提示词和历史消息
+ *   2. 从 MCP 动态创建 LangChain tools
+ *   3. 装上几个 “更标准” 的 middleware（重试、调用次数上限、工具次数上限）
+ *   4. 用 streamEvents(v2) 把 token 一边产生一边推给上层（onDelta）
+ *   5. 把工具事件、模型调用事件统一写进结构化日志
  *
- * 这部分交给 LangChain createAgent。
- *
- * 我们保留的职责是：
- * - 构造系统提示词和历史消息
- * - 从 MCP 动态创建 LangChain tools
- * - 把工具执行过程转成 iOS SSE 事件
- * - 把 LangChain 的最终文本 token 转成 delta
- * - 写项目自己的 requestId 日志
+ * 第二阶段时我们还在用 agent.invoke()，最终一次性发整段 delta；
+ * 第三阶段切到 streamEvents，是为了把“token 级流式”这个体验拿回来——
+ * 同时保留 LangChain 的工具循环、retry、观测点。
  */
 export async function runLangChainAgentStream({
   requestId,
@@ -80,20 +83,20 @@ export async function runLangChainAgentStream({
 
   const agent = createAgent({
     /**
-     * DeepSeek 对 tool message 的顺序校验比较严格：
-     * 每条 role=tool 的消息前面必须紧跟带 tool_calls 的 assistant 消息。
+     * 关键变化：streaming: true。
      *
-     * Agent 这里还额外关闭 thinking mode：
-     * DeepSeek thinking mode 会返回 reasoning_content，并要求工具下一轮原样带回；
-     * 当前 LangChain OpenAI converter 不会把这个字段带回请求体，所以工具链路
-     * 使用 non-thinking mode 更稳定。
+     * 第二阶段时这里写 false，因为 agent.invoke 模式下不需要流式，
+     * 但代价是最终回答只能等模型完整返回后再一次性 onDelta。
      *
-     * server.ts 仍然通过 SSE 输出 delta。当前实现会在 Agent 完成后发送一次
-     * 完整文本 delta；后续如果 LangChain/DeepSeek streaming tool-call 兼容稳定，
-     * 再把这里升级回 token 级流式。
+     * 第三阶段切到 streamEvents 之后，底层 ChatDeepSeek 必须开 streaming，
+     * 这样 on_chat_model_stream 事件才会带 token chunks。
+     *
+     * disableThinking / disableParallelToolCalls 维持第二阶段的判断：
+     * - thinking 模式要求下一轮 reasoning_content 回传，当前 converter 不支持
+     * - parallel tool calls 关掉是为了让日志和 iOS UI 一次只对齐一个工具
      */
     model: createLangChainChatModel({
-      streaming: false,
+      streaming: true,
       disableThinking: true,
       disableParallelToolCalls: true,
     }),
@@ -108,29 +111,143 @@ export async function runLangChainAgentStream({
   logAgentInfo(requestId, "langchain_agent", "started", {
     messageCount: messages.length,
     toolCount: tools.length,
-    recursionLimit: langChainAgentRecursionLimit,
+    recursionLimit: agentRecursionLimit,
+    modelRetryMaxAttempts: agentModelRetryMaxAttempts,
+    modelCallLimit: agentModelCallLimit,
   });
 
-  const finalState = await agent.invoke(
+  /**
+   * streamEvents v2 返回一个 IterableReadableStream<StreamEvent>。
+   * 我们订阅的事件类型主要有：
+   *
+   *   on_chat_model_start  → 模型一次调用开始
+   *   on_chat_model_stream → 流式 token chunk（这就是要转发给 iOS 的 delta）
+   *   on_chat_model_end    → 模型一次调用结束
+   *   on_tool_start        → 工具一次执行开始
+   *   on_tool_end          → 工具一次执行结束
+   *
+   * 工具相关的 SSE（tool_start / tool_done）我们仍然在 agentTools.ts 的
+   * wrapper 内部自己发——因为那里能拿到 toolCallId、result.ok、duration。
+   * streamEvents 的 on_tool_start/end 这里只用来写日志，避免重复发给 iOS。
+   *
+   * recursionLimit 是 Agent 的最后安全网：
+   * “无论模型怎么决策，总迭代步数的上限”。
+   */
+  const eventStream = agent.streamEvents(
+    { messages },
     {
-      messages,
-    },
-    {
-      recursionLimit: langChainAgentRecursionLimit,
+      version: "v2",
+      recursionLimit: agentRecursionLimit,
     }
   );
 
   /**
-   * LangChain Agent 完成后，最终 state.messages 里会包含完整对话：
-   * HumanMessage -> AIMessage(tool_calls) -> ToolMessage -> AIMessage(final answer)
-   *
-   * 注意：不要直接把中间 ToolMessage 的内容发给 iOS。
-   * ToolMessage 通常是完整 JSON，只应该给模型看；iOS 只显示 tool_start/tool_done 摘要。
+   * 用 wallclock 计算每次模型调用耗时——多个模型调用并发不可能发生，
+   * 因为 createAgent 的图是串行的；不过为了健壮性，用 Map 按 runId 存。
    */
-  outputText = extractFinalAssistantText(finalState.messages) || "";
+  const modelCallStarts = new Map<string, number>();
 
-  if (outputText && !shouldStop?.()) {
-    onDelta?.(outputText);
+  try {
+    for await (const event of eventStream) {
+      /**
+       * iOS 端关闭连接后，server.ts 会把 clientClosed 置 true，
+       * 这里通过 shouldStop 早退：
+       * - 不再 onDelta（再发就 EPIPE）
+       * - 不主动 abort agent，让它在 LangChain 内部自然走完
+       *   （不会有任何 IO 副作用，最多浪费一次模型调用）
+       *
+       * 想真正 abort 可以加 AbortController，但学习项目里没必要。
+       */
+      if (shouldStop?.()) {
+        logAgentInfo(requestId, "langchain_agent", "client_closed_during_stream", {
+          durationMs: getDurationMs(startedAt),
+          outputCharCount: outputText.length,
+        });
+        break;
+      }
+
+      switch (event.event) {
+        case "on_chat_model_start": {
+          modelCallStarts.set(event.run_id, Date.now());
+          logAgentInfo(requestId, "model_call", "started", {
+            runId: event.run_id,
+            modelName: event.name,
+          });
+          break;
+        }
+
+        case "on_chat_model_stream": {
+          /**
+           * event.data.chunk 是 AIMessageChunk。
+           * 内容可能是：
+           *   - string："Hello world"
+           *   - MessageContentComplex[]：[{ type: "text", text: "Hello" }, ...]
+           *
+           * messageContentToString 已经统一处理过两种格式。
+           *
+           * 在 Agent 决定调用工具的那一轮，content 通常是空字符串，
+           * 真正的 tool_call 信息走在 chunk.tool_call_chunks 里——我们这里直接
+           * 用 if (text) 过滤掉空 token，剩下的就只剩“给用户看的回答正文”。
+           */
+          const chunk = (event.data as { chunk?: AIMessageChunk } | undefined)?.chunk;
+          const text = chunk ? messageContentToString(chunk.content) : "";
+
+          if (text) {
+            outputText += text;
+
+            if (!shouldStop?.()) {
+              onDelta?.(text);
+            }
+          }
+          break;
+        }
+
+        case "on_chat_model_end": {
+          const modelStartedAt = modelCallStarts.get(event.run_id);
+          modelCallStarts.delete(event.run_id);
+
+          logAgentInfo(requestId, "model_call", "completed", {
+            runId: event.run_id,
+            modelName: event.name,
+            durationMs: modelStartedAt ? Date.now() - modelStartedAt : undefined,
+          });
+          break;
+        }
+
+        case "on_tool_start": {
+          /**
+           * 这条日志和 agentTools.ts 里发出的 SSE tool_start 是“同一件事”，
+           * 但目标不同：
+           * - SSE：给 iOS 实时展示进度
+           * - 日志：给后端按 requestId grep 工具时间线
+           *
+           * 所以两边都保留，不算重复。
+           */
+          logAgentInfo(requestId, "tool_execution", "started", {
+            runId: event.run_id,
+            toolName: event.name,
+          });
+          break;
+        }
+
+        case "on_tool_end": {
+          logAgentInfo(requestId, "tool_execution", "completed", {
+            runId: event.run_id,
+            toolName: event.name,
+          });
+          break;
+        }
+
+        default:
+          break;
+      }
+    }
+  } catch (error) {
+    logAgentError(requestId, "langchain_agent", "stream_failed", error, {
+      durationMs: getDurationMs(startedAt),
+      outputCharCount: outputText.length,
+    });
+    throw error;
   }
 
   logAgentInfo(requestId, "langchain_agent", "completed", {
@@ -197,12 +314,49 @@ async function loadLangChainTools(
 
 function buildAgentMiddleware() {
   /**
-   * 这一步把“不要重复乱调工具”的规则从 prompt 升级成代码约束。
+   * 第三阶段：用 LangChain 官方 middleware 把“边界保护”做得更标准。
    *
-   * Prompt 负责告诉模型“应该怎么做”；
-   * middleware 负责硬性限制“最多能做几次”。
+   * 我们装了三类 middleware：
+   *
+   * 1. modelRetryMiddleware
+   *    一次 model 节点失败时按指数退避自动重试。
+   *    onFailure:"continue" 表示——所有重试都失败后，不抛异常打断 Agent，
+   *    而是把错误包成一条 AIMessage 让 Agent 自己处理（一般是直接回答用户）。
+   *    这条 middleware 是“瞬时错误的安全网”，能挡住偶发 5xx / 429 / 网络抖动。
+   *
+   *    注意它和 ChatDeepSeek 自身的 maxRetries 是两层结构：
+   *    - SDK 层 maxRetries：单次 fetch 重试（针对“一次 HTTP 调用失败”）
+   *    - middleware 层：整个 model node 重试（针对“一次决策完整失败”）
+   *
+   * 2. modelCallLimitMiddleware
+   *    硬性限制整次 Agent 最多调用模型多少次。
+   *    它是成本兜底——recursionLimit 拦的是 Agent 总迭代步数，
+   *    modelCallLimit 拦的是真金白银的模型调用次数。
+   *    threadLimit 是“同一 thread/会话里的累计上限”；
+   *    runLimit 是“本次 run 内的上限”。学习项目按 run 限就够。
+   *
+   * 3. toolCallLimitMiddleware (×3)
+   *    第二阶段就有的逻辑：
+   *    - searchKnowledge 一次足够，避免模型反复查同一个知识库
+   *    - generateQuiz 同理
+   *    - 全局再加一道，防止模型在所有工具之间反复横跳
+   *    exitBehavior:"continue" 表示——达到上限后不抛错，
+   *    只是不再允许调用，模型必须用现有信息回答。
+   *
+   * 把这些规则从 prompt 升级成 middleware 的好处是：
+   * - prompt 是“软劝告”，模型可能不听
+   * - middleware 是“硬约束”，达到上限就执行不了
+   * - 行为可观测（middleware 自己会输出事件）
    */
   return [
+    modelRetryMiddleware({
+      maxRetries: agentModelRetryMaxAttempts,
+      onFailure: "continue",
+    }),
+    modelCallLimitMiddleware({
+      runLimit: agentModelCallLimit,
+      exitBehavior: "end",
+    }),
     toolCallLimitMiddleware({
       toolName: "searchKnowledge",
       runLimit: 1,
@@ -218,24 +372,4 @@ function buildAgentMiddleware() {
       exitBehavior: "continue",
     }),
   ];
-}
-
-function extractFinalAssistantText(messages: unknown): string | undefined {
-  if (!Array.isArray(messages)) {
-    return undefined;
-  }
-
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-
-    if (message instanceof AIMessage) {
-      const text = messageContentToString(message.content);
-
-      if (text.trim()) {
-        return text;
-      }
-    }
-  }
-
-  return undefined;
 }

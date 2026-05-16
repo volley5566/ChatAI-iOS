@@ -9,7 +9,7 @@ import {
 } from "./agent/agentObservability";
 import { logChatContext, prepareChatCompletion } from "./chat/chatCompletion";
 import { sanitizeChatHistory } from "./chat/chatHistory";
-import { model, port } from "./config/env";
+import { logLangSmithStatus, model, port } from "./config/env";
 import { writeSseEvent } from "./http/sse";
 import { parseStructuredAnswer } from "./chat/structuredAnswer";
 import {
@@ -430,4 +430,12 @@ app.post(
 
 app.listen(port, () => {
   console.log(`AI backend is running at http://localhost:${port}`);
+  /**
+   * 第三阶段：进程启动时打印一次 LangSmith trace 状态。
+   *
+   * LangSmith 本身不需要任何 SDK 代码——只要 .env 里有
+   * LANGSMITH_TRACING=true / LANGSMITH_API_KEY，LangChain 就会自动上报。
+   * 这里打印是为了让你能在控制台一眼看出当前请求会不会被 trace。
+   */
+  logLangSmithStatus();
 });

@@ -71,7 +71,7 @@ mcpServer.registerTool(
      * runSearchKnowledgeTool 会去本地 Markdown 知识库检索，然后返回 matches。
      * 这就是你可以理解成：MCP 是工具入口，知识库是其中一个具体工具能力。
      */
-    const toolResult = runSearchKnowledgeTool({ query });
+    const toolResult = await runSearchKnowledgeTool({ query });
 
     /**
      * MCP tool result 支持两种常用输出：

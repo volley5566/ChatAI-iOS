@@ -80,11 +80,12 @@ export function normalizeGenerateQuizArguments(
   };
 }
 
-export function runSearchKnowledgeTool(
+export async function runSearchKnowledgeTool(
   args: SearchKnowledgeArguments
-): AgentToolExecutionResult {
+): Promise<AgentToolExecutionResult> {
   /**
-   * 当前 RAG 是学习版：Markdown chunk + 关键词匹配。
+   * 当前 RAG 已经由 LangChain 接管：
+   * Markdown loader -> splitter -> embeddings -> MemoryVectorStore -> similarity search。
    *
    * 这里返回的是结构化结果，而不是直接拼 prompt：
    * - MCP client 可以稳定读取 matches 数量
@@ -96,7 +97,7 @@ export function runSearchKnowledgeTool(
    * 当前版本先让模型在最终回答里自然展示来源；
    * 后续如果要做独立“参考来源 UI”，可以新增 SSE event 或最终 metadata。
    */
-  const matches = retrieveRelevantKnowledge(args.query);
+  const matches = await retrieveRelevantKnowledge(args.query);
 
   return {
     toolName: "searchKnowledge",
@@ -149,10 +150,10 @@ export function runGenerateQuizTool(
   };
 }
 
-export function executeLocalAgentTool(
+export async function executeLocalAgentTool(
   toolName: string,
   rawArguments: unknown
-): AgentToolExecutionResult {
+): Promise<AgentToolExecutionResult> {
   /**
    * 这个函数是本地执行器，保留它有两个用途：
    *

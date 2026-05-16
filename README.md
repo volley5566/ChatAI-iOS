@@ -109,17 +109,52 @@ http://192.168.1.23:8000
 backend-node/knowledge/
 ```
 
-当前第一版 RAG 使用 Markdown 文档 + 关键词匹配：
+当前第二版 RAG 已经接入 LangChain：
 
 ```text
 用户提问
-  -> 后端搜索 backend-node/knowledge/*.md
-  -> 找到相关资料
-  -> 把资料和问题一起发给 AI
-  -> AI 按结构化 JSON 返回
+  -> LangChain DirectoryLoader / TextLoader 读取 Markdown
+  -> RecursiveCharacterTextSplitter 切 chunk
+  -> LocalKeywordEmbeddings 生成本地学习版向量
+  -> MemoryVectorStore 做相似度检索
+  -> ChatPromptTemplate 组装 RAG prompt
+  -> ChatDeepSeek 生成回答
+  -> Node.js 通过 JSON 或 SSE 返回给 iOS
 ```
 
 新增知识时，可以继续往 `backend-node/knowledge/` 里添加 `.md` 文件。
+
+本地调试检索结果：
+
+```bash
+cd backend-node
+npm run rag:debug -- "SwiftUI @State 和 @Binding 有什么区别"
+```
+
+这条命令不会调用 DeepSeek，只检查 LangChain 的 loader、splitter、embedding、vector store 和 retriever 是否命中正确资料。
+
+当前默认 embedding provider 是 `local-keyword`。它不需要额外 API key，适合学习完整 RAG 链路。
+后续如果要升级成真正语义 embedding，可以替换 `backend-node/src/langchain/embeddings.ts` 里的工厂函数。
+
+RAG 相关环境变量：
+
+```text
+EMBEDDINGS_PROVIDER=local-keyword
+RAG_TOP_K=5
+RAG_CHUNK_SIZE=1200
+RAG_CHUNK_OVERLAP=160
+RAG_MIN_SIMILARITY=0.08
+```
+
+学习时可以先重点观察两个参数：
+
+```text
+RAG_TOP_K
+  控制每次给模型多少段资料。太少可能漏资料，太多会增加 prompt 噪音。
+
+RAG_CHUNK_SIZE / RAG_CHUNK_OVERLAP
+  控制文档切分大小和相邻 chunk 的重叠范围。chunk 太大容易混入无关内容，太小容易丢上下文。
+```
 
 ## 5. 后端代码结构
 
@@ -136,7 +171,7 @@ backend-node/src/llm/deepseekClient.ts
   创建 DeepSeek/OpenAI-compatible SDK 客户端
 
 backend-node/src/chat/chatCompletion.ts
-  普通聊天接口的 RAG 上下文和 messages 组装
+  普通聊天接口的 LangChain RAG 上下文和 messages 组装
 
 backend-node/src/chat/chatHistory.ts
   清洗 history，限制历史长度，组装检索 query
@@ -148,7 +183,28 @@ backend-node/src/chat/structuredAnswer.ts
   解析 /api/chat 的结构化 JSON 回答，并提供兜底解析
 
 backend-node/src/knowledge/knowledge.ts
-  读取 backend-node/knowledge/*.md，并做轻量关键词检索
+  知识库外观层，向上保留 retrieveRelevantKnowledge，底层调用 LangChain retriever
+
+backend-node/src/langchain/documentLoader.ts
+  使用 LangChain DirectoryLoader / TextLoader 读取 Markdown 知识库
+
+backend-node/src/langchain/localEmbeddings.ts
+  本地学习版 Embeddings，把中英文关键词 hash 成向量，方便无额外 key 跑通 RAG
+
+backend-node/src/langchain/embeddings.ts
+  Embeddings 工厂，后续替换真实 embedding provider 时优先改这里
+
+backend-node/src/langchain/ragRetriever.ts
+  LangChain TextSplitter + MemoryVectorStore + similarity search 主链路
+
+backend-node/src/langchain/chatPrompt.ts
+  使用 ChatPromptTemplate 组装普通 RAG 聊天 prompt，并提供格式转换
+
+backend-node/src/langchain/chatModel.ts
+  创建 LangChain ChatDeepSeek，并封装普通 invoke / stream 调用
+
+backend-node/src/langchain/ragDebug.ts
+  RAG 检索调试脚本，不启动后端也能查看命中的 chunk
 
 backend-node/src/agent/agentRunner.ts
   Agent Runner，负责 tool_call 循环和 DeepSeek reasoning_content 回传
@@ -179,14 +235,15 @@ backend-node/src/shared/types.ts
 
 ```text
 server.ts
-  -> 普通聊天：chat/* + knowledge/* + llm/* + http/*
-  -> Agent 聊天：agent/* -> mcp/* -> knowledge/*
-  -> 共用：config/* + shared/*
+  -> 普通聊天：chat/* -> knowledge/* -> langchain/* -> http/*
+  -> Agent 聊天：agent/* -> mcp/* -> knowledge/* -> langchain/*
+  -> 共用：config/* + shared/* + llm/*
 ```
 
 这样后续新增工具时，主要改 `src/mcp/mcpServer.ts` 和 `src/mcp/mcpToolHandlers.ts`；
 调整 Agent 循环时，主要改 `src/agent/agentRunner.ts`；
-调整知识库检索时，主要改 `src/knowledge/knowledge.ts`。
+调整知识库检索时，优先改 `src/langchain/ragRetriever.ts`；
+如果只是替换 embedding provider，优先改 `src/langchain/embeddings.ts`。
 
 ## 6. 多轮上下文
 

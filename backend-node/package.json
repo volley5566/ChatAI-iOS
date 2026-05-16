@@ -6,6 +6,7 @@
   "scripts": {
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "build": "tsc",
+    "rag:debug": "node -r ts-node/register/transpile-only src/langchain/ragDebug.ts",
     "mcp:dev": "node -r ts-node/register/transpile-only src/mcp/mcpServer.ts",
     "mcp:start": "node dist/mcp/mcpServer.js",
     "start": "node dist/server.js"
@@ -15,10 +16,15 @@
   "license": "ISC",
   "type": "commonjs",
   "dependencies": {
+    "@langchain/classic": "^1.0.32",
+    "@langchain/core": "^1.1.46",
+    "@langchain/deepseek": "^1.0.25",
+    "@langchain/textsplitters": "^1.0.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "langchain": "^1.4.0",
     "openai": "^6.37.0",
     "zod": "^4.4.3"
   },

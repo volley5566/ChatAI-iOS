@@ -2,6 +2,7 @@ import type {
   ChatCompletionAssistantMessageParam,
   ChatCompletionMessageParam,
 } from "openai/resources/chat/completions";
+import type { BaseMessage } from "@langchain/core/messages";
 
 /**
  * iOS 发给后端的聊天请求体。
@@ -76,6 +77,11 @@ export type ChatResponseMode = "structured" | "streaming";
 export type PreparedChatCompletion = {
   knowledgeMatches: ScoredKnowledgeChunk[];
   aiMessages: ChatCompletionMessageParam[];
+  /**
+   * LangChain ChatDeepSeek 直接消费 BaseMessage[]。
+   * aiMessages 暂时保留给 OpenAI-compatible SDK 和 Agent 过渡层使用。
+   */
+  langChainMessages: BaseMessage[];
 };
 
 type ChatStreamEventMetadata = {

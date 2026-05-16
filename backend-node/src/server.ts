@@ -13,6 +13,10 @@ import { model, port } from "./config/env";
 import { deepseek } from "./llm/deepseekClient";
 import { writeSseEvent } from "./http/sse";
 import { parseStructuredAnswer } from "./chat/structuredAnswer";
+import {
+  invokeLangChainChat,
+  streamLangChainChat,
+} from "./langchain/chatModel";
 import type {
   ChatRequestBody,
   ChatResponseBody,
@@ -78,7 +82,7 @@ app.post(
         return;
       }
 
-      const { knowledgeMatches, aiMessages } = prepareChatCompletion(
+      const { knowledgeMatches, langChainMessages } = await prepareChatCompletion(
         message,
         systemPrompt,
         history,
@@ -87,12 +91,16 @@ app.post(
 
       logChatContext("structured", knowledgeMatches, history);
 
-      const completion = await deepseek.chat.completions.create({
-        model,
-        messages: aiMessages,
-      });
-
-      const rawAnswer = completion.choices[0]?.message?.content || "";
+      /**
+       * 普通结构化接口现在使用 LangChain ChatDeepSeek。
+       *
+       * 这一条链路是：
+       *   LangChain Retriever -> ChatPromptTemplate -> ChatDeepSeek -> JSON parser
+       *
+       * Agent 接口仍保留低层 OpenAI-compatible SDK，
+       * 因为那边还要精细控制 MCP tool_call 和 SSE 进度事件。
+       */
+      const rawAnswer = await invokeLangChainChat(langChainMessages);
       const structuredAnswer = parseStructuredAnswer(rawAnswer);
 
       res.json(structuredAnswer);
@@ -132,7 +140,7 @@ app.post(
         return;
       }
 
-      const { knowledgeMatches, aiMessages } = prepareChatCompletion(
+      const { knowledgeMatches, langChainMessages } = await prepareChatCompletion(
         message,
         systemPrompt,
         history,
@@ -146,18 +154,12 @@ app.post(
       res.setHeader("Connection", "keep-alive");
       res.flushHeaders();
 
-      const stream = await deepseek.chat.completions.create({
-        model,
-        messages: aiMessages,
-        stream: true,
-      });
+      const stream = streamLangChainChat(langChainMessages);
 
-      for await (const chunk of stream) {
+      for await (const delta of stream) {
         if (clientClosed) {
           break;
         }
-
-        const delta = chunk.choices[0]?.delta?.content;
 
         if (delta) {
           writeSseEvent(res, {

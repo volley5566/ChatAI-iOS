@@ -2,6 +2,10 @@ import type { ChatCompletionMessageParam } from "openai/resources/chat/completio
 import { buildRetrievalQuery } from "./chatHistory";
 import { buildKnowledgeContext, retrieveRelevantKnowledge } from "../knowledge/knowledge";
 import { buildInstructions, buildStreamingInstructions } from "./prompts";
+import {
+  buildLangChainRagMessages,
+  langChainMessagesToOpenAiMessages,
+} from "../langchain/chatPrompt";
 import type {
   ChatResponseMode,
   NormalizedChatHistoryItem,
@@ -19,14 +23,14 @@ import type {
  * - 把知识库命中结果拼成 system prompt
  * - 把 system、历史消息、当前用户问题组装成 messages
  */
-export function prepareChatCompletion(
+export async function prepareChatCompletion(
   message: string,
   systemPrompt: string | undefined,
   history: NormalizedChatHistoryItem[],
   responseMode: ChatResponseMode
-): PreparedChatCompletion {
+): Promise<PreparedChatCompletion> {
   const retrievalQuery = buildRetrievalQuery(message, history);
-  const knowledgeMatches = retrieveRelevantKnowledge(retrievalQuery);
+  const knowledgeMatches = await retrieveRelevantKnowledge(retrievalQuery);
   const knowledgeContext = buildKnowledgeContext(knowledgeMatches);
 
   const instructions =
@@ -34,29 +38,25 @@ export function prepareChatCompletion(
       ? buildStreamingInstructions(systemPrompt, knowledgeContext)
       : buildInstructions(systemPrompt, knowledgeContext);
 
-  // 最终发给模型的是：
-  // system prompt
-  // 历史 user/assistant
-  // 当前 user message
-  const aiMessages: ChatCompletionMessageParam[] = [
-    {
-      role: "system",
-      content: instructions,
-    },
-    // 这里的 ...history.map(...) 是展开数组。
-    ...history.map((item): ChatCompletionMessageParam => ({
-      role: item.role,
-      content: item.content,
-    })),
-    {
-      role: "user",
-      content: message,
-    },
-  ];
+  /**
+   * 第二轮 LangChain 集成后，普通聊天的 prompt 组装交给 ChatPromptTemplate。
+   *
+   * LangChain 输出 BaseMessage[]，这是 ChatDeepSeek 最自然的输入格式。
+   * 同时我们再转换一份 OpenAI-compatible messages，方便日志、对照测试、
+   * 以及后续需要低层 SDK 时继续复用。
+   */
+  const langChainMessages = await buildLangChainRagMessages(
+    instructions,
+    history,
+    message
+  );
+  const aiMessages: ChatCompletionMessageParam[] =
+    langChainMessagesToOpenAiMessages(langChainMessages);
 
   return {
     knowledgeMatches,
     aiMessages,
+    langChainMessages,
   };
 }
 

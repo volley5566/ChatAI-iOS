@@ -73,7 +73,7 @@ export async function runLangChainAgentStream({
   const startedAt = Date.now();
   let toolCallCount = 0;
   let outputText = "";
-
+  //Agent Runner 加载工具(LangChain Phase 2 入口)
   const tools = await loadLangChainTools(requestId, {
     onToolEvent,
     onToolCompleted: () => {
@@ -94,15 +94,24 @@ export async function runLangChainAgentStream({
      * disableThinking / disableParallelToolCalls 维持第二阶段的判断：
      * - thinking 模式要求下一轮 reasoning_content 回传，当前 converter 不支持
      * - parallel tool calls 关掉是为了让日志和 iOS UI 一次只对齐一个工具
+     * 
+     * createAgent 是 LangChain 给你预设好的 ReAct Agent。ReAct = Reasoning + Acting,模式是:
+     * Thought  → 我应该用哪个工具?
+     * Action   → 调用 searchKnowledge(input: "@State")
+     * Observation → 工具返回的结果
+     * Thought  → 我现在有足够信息回答了
+     * Final Answer → 给用户的回答
+     * 
+     * 这个循环你不用手写——createAgent 内部用一个状态机帮你跑。
      */
-    model: createLangChainChatModel({
+    model: createLangChainChatModel({// ← 谁来推理
       streaming: true,
       disableThinking: true,
       disableParallelToolCalls: true,
     }),
-    tools,
-    systemPrompt: buildAgentInstructions(systemPrompt),
-    middleware: buildAgentMiddleware(),
+    tools,// ← 可用工具列表
+    systemPrompt: buildAgentInstructions(systemPrompt),// ← 系统提示词
+    middleware: buildAgentMiddleware(),// ← 中间件
     version: "v2",
   });
 
@@ -148,6 +157,10 @@ export async function runLangChainAgentStream({
   const modelCallStarts = new Map<string, number>();
 
   try {
+    /**
+     * 把"用户消息 + 历史"塞进 Agent,Agent 开始自己跑;每跑一步就吐出一个事件,
+     * 我们在 for await (const event of eventStream) 里接住每个事件
+     */
     for await (const event of eventStream) {
       /**
        * iOS 端关闭连接后，server.ts 会把 clientClosed 置 true，
@@ -175,8 +188,8 @@ export async function runLangChainAgentStream({
           });
           break;
         }
-
-        case "on_chat_model_stream": {
+        // streamEvents 是 LangChain 提供的"看 Agent 内部发生了什么"的窗口。Agent 内部跑的时候,每经过一个阶段就吐一个事件。
+        case "on_chat_model_stream": {//← 这里是 token! 
           /**
            * event.data.chunk 是 AIMessageChunk。
            * 内容可能是：
@@ -189,14 +202,15 @@ export async function runLangChainAgentStream({
            * 真正的 tool_call 信息走在 chunk.tool_call_chunks 里——我们这里直接
            * 用 if (text) 过滤掉空 token，剩下的就只剩“给用户看的回答正文”。
            */
+          //从 event.data.chunk.content 里取出文本
           const chunk = (event.data as { chunk?: AIMessageChunk } | undefined)?.chunk;
           const text = chunk ? messageContentToString(chunk.content) : "";
 
-          if (text) {
+          if (text) {// ← 过滤空字符串
             outputText += text;
 
             if (!shouldStop?.()) {
-              onDelta?.(text);
+              onDelta?.(text);// ← 触发回调链:onDelta → writeAgentSseEvent → SSE
             }
           }
           break;

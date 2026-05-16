@@ -152,6 +152,7 @@ final class ChatViewModel: ObservableObject {
         let messageText = trimmedInputText
 
         // 如果输入为空，就直接退出，不发送。
+        //guard 是 Swift 的"提前 return"语法。条件不成立直接退出,类似 Kotlin 的 ?: return
         guard !messageText.isEmpty else {
             return
         }
@@ -209,7 +210,7 @@ final class ChatViewModel: ObservableObject {
             //
             // 工具阶段会通过 tool_start / tool_done 告诉 iOS 当前进度。
             // 工具阶段完成后，最终回答才会通过 delta 一段段推给 iOS。
-            let stream = try chatAPI.sendAgentStreamingMessage(
+            let stream = try chatAPI.sendAgentStreamingMessage(//调网络层拿流式接口 AsyncThrowingStream类似 Kotlin 的 Flow<T>
                 messageText,
                 systemPrompt: AppConfig.defaultSystemPrompt,
                 history: history
@@ -227,8 +228,9 @@ final class ChatViewModel: ObservableObject {
             // 后面流式内容来了
             //    ↓
             // 不断更新这个空气泡
-            let assistantMessage = ChatMessage(role: .assistant, content: "")
-            assistantMessageID = assistantMessage.id
+            //后面每收到一段 delta,不是 append 新消息,而是用 ID 找到这条空气泡然后替换 content。这样列表始终是"用户一条 → AI 一条",不会变成"用户一条 → AI 片段 1 → AI 片段 2 → AI 片段 3"。
+            let assistantMessage = ChatMessage(role: .assistant, content: "")// 空气泡 就是这里创建了一个空的气泡 然后后续内容就往里添加即可
+            assistantMessageID = assistantMessage.id// 记下 ID
             messages.append(assistantMessage)
 
             // 这个就是读取流式数据。
@@ -238,9 +240,10 @@ final class ChatViewModel: ObservableObject {
             // delta       AI 正文片段
             // toolStart   工具开始执行
             // toolDone    工具执行完成
-            for try await update in stream {
+            for try await update in stream {//for try await ... in stream 是 Swift 异步序列的"消费方式" 等于 Kotlin 的 flow.collect { update -> ... }
                 switch update {
-                case .delta(let delta):
+                case .delta(let delta):// 文本片段
+                    //收到 delta:累积并更新 UI
                     streamedAnswer += delta
 
                     if let assistantMessageID {
@@ -250,7 +253,7 @@ final class ChatViewModel: ObservableObject {
                         )
                     }
 
-                case .toolStart(let toolUpdate):
+                case .toolStart(let toolUpdate):// 工具开始
                     if let assistantMessageID {
                         updateAgentToolStep(
                             messageID: assistantMessageID,
@@ -259,7 +262,7 @@ final class ChatViewModel: ObservableObject {
                         )
                     }
 
-                case .toolDone(let toolUpdate):
+                case .toolDone(let toolUpdate):// 工具结束
                     if let assistantMessageID {
                         updateAgentToolStep(
                             messageID: assistantMessageID,
@@ -325,7 +328,7 @@ final class ChatViewModel: ObservableObject {
     /// 所以不能再只用 structuredAnswer 判断 AI 消息是否可进入历史。
     private func recentHistoryItems() -> [ChatHistoryItem] {
         messages
-            // 丢掉第一条消息。
+            // 丢掉第一条消息。 // 跳过欢迎语
             .dropFirst()
             // 只保留内容不为空的消息。
             .filter { message in
@@ -347,9 +350,9 @@ final class ChatViewModel: ObservableObject {
                 !message.toHistoryItem().content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
             }
             // 只取最后 maxHistoryMessages 条。
-            .suffix(maxHistoryMessages)
+            .suffix(maxHistoryMessages)// 只取最近 6 条
             // 把 ChatMessage 转成 ChatHistoryItem，就是 convert 的 map 过程。
-            .map { $0.toHistoryItem() }
+            .map { $0.toHistoryItem() }// 转网络层模型
     }
 
     /// 更新某一条消息的正文。

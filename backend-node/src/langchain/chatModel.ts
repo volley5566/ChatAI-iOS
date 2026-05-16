@@ -31,6 +31,10 @@ type CreateLangChainChatModelOptions = {
 export function createLangChainChatModel(
   options: CreateLangChainChatModelOptions = {}
 ): ChatDeepSeek {
+  /**
+   * ChatDeepSeek 内部其实继承自 ChatOpenAI(DeepSeek 用的是 OpenAI 兼容 API)。
+   * streaming: true 让底层 SDK 走 /v1/chat/completions 的 SSE 模式
+   */
   return new ChatDeepSeek({
     model,
     apiKey: requireDeepSeekApiKey(),
@@ -47,7 +51,7 @@ export function createLangChainChatModel(
      * 实际重试上限大致是 chatModelHttpMaxRetries × (agentModelRetryMaxAttempts + 1)，
      * 默认 2 × 3 = 6 次，够覆盖偶发抖动又不会无限循环。
      */
-    maxRetries: chatModelHttpMaxRetries,
+    maxRetries: chatModelHttpMaxRetries,// HTTP 层重试
     /**
      * modelKwargs 会被 @langchain/openai 原样合并到 Chat Completions 请求体。
      *
@@ -58,7 +62,7 @@ export function createLangChainChatModel(
      *
      * 普通 /api/chat 和 /api/chat/stream 不需要这些限制，所以默认不设置。
      */
-    modelKwargs: buildDeepSeekModelKwargs(options),
+    modelKwargs: buildDeepSeekModelKwargs(options),// thinking=disabled 等
     configuration: {
       baseURL: deepseekBaseURL,
     },

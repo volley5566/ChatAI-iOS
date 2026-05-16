@@ -247,7 +247,7 @@ async function createMcpAgentClient(): Promise<McpAgentClient> {
   };
 }
 
-async function getMcpAgentClient(): Promise<McpAgentClient> {
+async function getMcpAgentClient(): Promise<McpAgentClient> {//Promise 级单例:并发请求第一次同时来,第二个会等同一个 Promise,不会重复启动子进程
   /**
    * Promise 级别的单例能处理并发初始化：
    * 如果两个请求同时进来，第一个请求开始连接 MCP server，
@@ -255,7 +255,7 @@ async function getMcpAgentClient(): Promise<McpAgentClient> {
    */
   if (!mcpAgentClientPromise) {
     mcpAgentClientPromise = createMcpAgentClient().catch((error: unknown) => {
-      mcpAgentClientPromise = undefined;
+      mcpAgentClientPromise = undefined; // 失败清空,下次重试
       throw error;
     });
   }
@@ -265,8 +265,8 @@ async function getMcpAgentClient(): Promise<McpAgentClient> {
 
 export async function getMcpToolDefinitions(): Promise<McpTool[]> {
   try {
-    const client = await getMcpAgentClient();
-    return await client.listTools();
+    const client = await getMcpAgentClient();//单例,第一次会启动 MCP 子进程
+    return await client.listTools();  // JSON-RPC over stdio
   } catch (error) {
     /**
      * listTools 是 LangChain Agent 工具阶段的入口。

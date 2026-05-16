@@ -356,7 +356,7 @@ final class ChatAPIClient: ChatAPI {
         // 现在有两个流式接口：
         // - /api/chat/stream：普通流式聊天
         // - /api/agent/stream：Tool Calling Agent，后端会先执行工具，再流式返回最终回答
-        let url = baseURL.appending(path: path)
+        let url = baseURL.appending(path: path)//拼 URL
 
         // 2. 创建 URLRequest。
         //
@@ -368,7 +368,7 @@ final class ChatAPIClient: ChatAPI {
         //   "history": [...]
         // }
         // 响应体是 text/event-stream，也就是 SSE
-        var request = URLRequest(url: url)
+        var request = URLRequest(url: url)//-URLRequest ≈ Retrofit 的 @POST + @Body,或 OkHttp 的 Request.Builder
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
 
@@ -386,6 +386,12 @@ final class ChatAPIClient: ChatAPI {
         // - 如果网络失败、后端返回 error 事件，stream 会 finish(throwing:)。
         //
         // 这样 UI 层不用理解 SSE 协议，只关心“文本片段或工具状态”。
+        //
+        //AsyncThrowingStream 是 Swift 的"我自己控制何时吐数据"的工具。
+        //- continuation.yield(x) = 吐一个值给下游
+        //- continuation.finish() = 流正常结束
+        //- continuation.finish(throwing:) = 流抛异常结束
+        //- onTermination = 下游不要了/出错了,清理这里(取消网络 task)
         return AsyncThrowingStream { continuation in
             let task = Task {
                 do {
@@ -405,7 +411,7 @@ final class ChatAPIClient: ChatAPI {
                     //
                     // bytes(for:) 收到响应头后就返回，
                     // 后续响应体可以一行一行读取。
-                    let (bytes, response) = try await urlSession.bytes(for: request)
+                    let (bytes, response) = try await urlSession.bytes(for: request)//发起请求 + 拿到字节流 urlSession.bytes(for:) 和普通 data(for:) 的区别——bytes 在响应头一到就 return,后续 body 通过 bytes.lines 一行一行异步迭代,不用等整个响应结束。这正是流式接口需要的行为。
 
                     guard let httpResponse = response as? HTTPURLResponse else {
                         continuation.finish(throwing: ChatAPIError.invalidResponse)
@@ -450,7 +456,7 @@ final class ChatAPIClient: ChatAPI {
                     // 因为后端已经把每个事件压成一行 JSON，
                     // iOS 这里只需要处理 data: 开头的行即可。
                     // 逐行读取 SSE。
-                    for try await line in bytes.lines {
+                    for try await line in bytes.lines {//所以 iOS 端读 bytes.lines 是天然适配 SSE 的
                         // 只处理 data: 开头的行。
                         guard line.hasPrefix(dataPrefix) else {
                             continue
@@ -469,7 +475,7 @@ final class ChatAPIClient: ChatAPI {
                         // String 转 Data：
                         // 因为 JSONDecoder 解码需要的是 Data，不是 String，
                         // 所以要把 JSON 字符串转成 UTF-8 Data。
-                        let event = try decoder.decode(ChatStreamEvent.self, from: eventData)
+                        let event = try decoder.decode(ChatStreamEvent.self, from: eventData)//让 Swift struct 自动转 JSON
 
                         // 处理不同 SSE 事件。
                         switch event.type {
@@ -537,7 +543,7 @@ final class ChatAPIClient: ChatAPI {
 /// iOS 发给 Node.js 的 JSON 请求体。
 /// Codable / Encodable 的作用：
 /// 让 Swift 结构体可以自动变成 JSON。
-private struct ChatRequestBody: Encodable {
+private struct ChatRequestBody: Encodable {//- Encodable ≈ Moshi/Gson 的 @Serializable
     // Encodable：这个 Swift 结构体可以被 JSONEncoder 编码成 JSON。
     let message: String
     let systemPrompt: String
@@ -547,7 +553,7 @@ private struct ChatRequestBody: Encodable {
     /// 后端现在用下划线命名 system_prompt。
     /// CodingKeys 用来告诉 JSONEncoder：
     /// Swift 的 systemPrompt 要编码成 JSON 里的 system_prompt。
-    enum CodingKeys: String, CodingKey {
+    enum CodingKeys: String, CodingKey {//把 Swift 驼峰 systemPrompt 映射成 JSON 下划线 system_prompt
         case message
         case systemPrompt = "system_prompt"
         case history

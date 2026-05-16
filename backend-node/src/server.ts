@@ -199,6 +199,7 @@ app.post(
 
 // Node.js 接住请求。
 // Agent 流式接口：Tool Calling + MCP + 工具状态可视化 + 最终流式回答。
+//- app.post(path, handler) 注册一条路由
 app.post(
   "/api/agent/stream",
   async (
@@ -213,7 +214,7 @@ app.post(
      * 2. SSE event.request_id：方便 iOS 端必要时展示/上报
      * 3. 后端结构化日志：方便按 requestId grep 完整链路
      */
-    const requestId = createAgentRequestId();
+    const requestId = createAgentRequestId(); // ① 生成 trace id
     const requestStartedAt = Date.now();
     let clientClosed = false;
     let responseCompleted = false;
@@ -240,9 +241,9 @@ app.post(
       });
     };
 
-    res.setHeader("X-Request-ID", requestId);
+    res.setHeader("X-Request-ID", requestId);// ② 写响应头
 
-    res.on("close", () => {
+    res.on("close", () => {// ③ 监听断连
       clientClosed = true;
 
       if (!responseCompleted) {
@@ -298,7 +299,7 @@ app.post(
       res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
       res.setHeader("Cache-Control", "no-cache, no-transform");
       res.setHeader("Connection", "keep-alive");
-      res.flushHeaders();
+      res.flushHeaders();//flushHeaders() 立刻把响应头发出去,不等到有 body。这样 iOS 端能更快收到响应头,也能让 nginx 等代理别缓冲数据。
 
       /**
        * Node 进入 LangChain Agent 阶段。
@@ -313,13 +314,13 @@ app.post(
       const agentStartedAt = Date.now();
       let deltaCount = 0;
       let outputCharCount = 0;
-
+      //调 Agent Runner(委派给 LangChain 层)
       const agentRun = await runLangChainAgentStream({
         requestId,
         message,
         systemPrompt,
         history,
-        onToolEvent: (event) => {
+        onToolEvent: (event) => {// 工具进度回调 - 工具事件发生 → 转成 SSE 发给 iOS
           if (!clientClosed) {
             writeAgentSseEvent({
               ...event,
@@ -327,7 +328,7 @@ app.post(
             });
           }
         },
-        onDelta: (delta) => {
+        onDelta: (delta) => {// token 流式回调 - 模型吐 token → 转成 SSE delta 发给 iOS
           if (clientClosed) {
             return;
           }
@@ -341,7 +342,7 @@ app.post(
             phase: "final_stream",
           });
         },
-        shouldStop: () => clientClosed,
+        shouldStop: () => clientClosed,// 提前终止信号- 我想提前停 → 返回 true
       });
 
       logAgentInfo(requestId, "langchain_agent", "server_observed_completed", {

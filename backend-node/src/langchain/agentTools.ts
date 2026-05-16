@@ -26,7 +26,7 @@ type CreateLangChainAgentToolsOptions = {
  * 好处：
  * - MCP 仍然是工具协议边界，负责工具注册、参数 schema、安全注解
  * - LangChain Agent 负责工具选择和执行编排
- * - iOS 仍然收到熟悉的 tool_start / tool_done 事件
+ * - iOS 仍然收到熟悉的 tool_start /tool_done 事件
  *
  * 后续新增 MCP 工具时，只要它出现在 listTools() 中，
  * 这里就能自动包装成 LangChain Tool。
@@ -34,7 +34,7 @@ type CreateLangChainAgentToolsOptions = {
 export async function createLangChainAgentTools(
   options: CreateLangChainAgentToolsOptions = {}
 ): Promise<ClientTool[]> {
-  const mcpTools = await getMcpToolDefinitions();
+  const mcpTools = await getMcpToolDefinitions(); // ← 这里跟 MCP server 通信
   return mcpTools.map((mcpTool) => createLangChainToolFromMcpTool(mcpTool, options));
 }
 

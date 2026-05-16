@@ -5,6 +5,8 @@ import { messageContentToString } from "./chatPrompt";
 
 type CreateLangChainChatModelOptions = {
   streaming?: boolean;
+  disableThinking?: boolean;
+  disableParallelToolCalls?: boolean;
 };
 
 /**
@@ -14,12 +16,12 @@ type CreateLangChainChatModelOptions = {
  *
  *   ChatPromptTemplate -> BaseMessage[] -> ChatDeepSeek
  *
- * Agent 工具循环暂时仍保留原来的 OpenAI SDK 低层调用，
- * 因为那边有 MCP tool_call、SSE 进度事件、reasoning_content 兼容逻辑。
+ * Agent 接口也会复用这个工厂创建 streaming model，
+ * 再交给 LangChain createAgent 管理工具决策和最终输出。
  *
  * 这种拆法的目标是：
- * - 普通 RAG 链路尽量 LangChain 化
- * - Agent/MCP 学习主线不被黑盒 Agent 抽象吞掉
+ * - 所有 DeepSeek 调用统一从这里创建
+ * - 普通 RAG 和 Agent 链路都使用同一套 LangChain model 配置
  */
 export function createLangChainChatModel(
   options: CreateLangChainChatModelOptions = {}
@@ -28,10 +30,39 @@ export function createLangChainChatModel(
     model,
     apiKey: requireDeepSeekApiKey(),
     streaming: options.streaming ?? false,
+    /**
+     * modelKwargs 会被 @langchain/openai 原样合并到 Chat Completions 请求体。
+     *
+     * Agent 工具链路会打开两个额外选项：
+     * - thinking disabled：避免 DeepSeek thinking mode 要求下一轮回传 reasoning_content。
+     *   当前 LangChain OpenAI converter 能读取 reasoning_content，但不会在下一轮请求中带回。
+     * - parallel_tool_calls false：当前学习项目希望一轮只执行一个工具，方便日志和 iOS UI 对齐。
+     *
+     * 普通 /api/chat 和 /api/chat/stream 不需要这些限制，所以默认不设置。
+     */
+    modelKwargs: buildDeepSeekModelKwargs(options),
     configuration: {
       baseURL: deepseekBaseURL,
     },
   });
+}
+
+function buildDeepSeekModelKwargs(
+  options: CreateLangChainChatModelOptions
+): Record<string, unknown> {
+  const modelKwargs: Record<string, unknown> = {};
+
+  if (options.disableThinking) {
+    modelKwargs.thinking = {
+      type: "disabled",
+    };
+  }
+
+  if (options.disableParallelToolCalls) {
+    modelKwargs.parallel_tool_calls = false;
+  }
+
+  return modelKwargs;
 }
 
 export async function invokeLangChainChat(messages: BaseMessage[]): Promise<string> {

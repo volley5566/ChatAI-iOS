@@ -1,11 +1,7 @@
 import path from "path";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-import type { Tool } from "@modelcontextprotocol/sdk/types.js";
-import type {
-  ChatCompletionMessageToolCall,
-  ChatCompletionTool,
-} from "openai/resources/chat/completions";
+import type { Tool as McpTool } from "@modelcontextprotocol/sdk/types.js";
 import {
   buildToolErrorResult,
   isObjectRecord,
@@ -13,7 +9,7 @@ import {
 } from "../agent/agentToolTypes";
 
 type McpAgentClient = {
-  listOpenAiTools(): Promise<ChatCompletionTool[]>;
+  listTools(): Promise<McpTool[]>;
   callTool(toolName: string, rawArguments: unknown): Promise<AgentToolExecutionResult>;
   close(): Promise<void>;
 };
@@ -22,9 +18,9 @@ type McpAgentClient = {
  * 工具调用方。
  *
  * 整体调用流程：
- * DeepSeek tool calling 格式
+ * LangChain Agent
  *         ↓
- * agentTools.ts 翻译
+ * LangChain Tool wrapper
  *         ↓
  * mcpClient.ts
  *         ↓
@@ -54,24 +50,6 @@ type McpDirectToolResult = Extract<McpCallToolResponse, { content: unknown[] }>;
  * - 让 Agent 请求路径更稳定
  */
 let mcpAgentClientPromise: Promise<McpAgentClient> | undefined;
-
-function parseToolArguments(rawArguments: string): unknown {
-  /**
-   * DeepSeek/OpenAI-compatible tool call 里 function.arguments 是字符串。
-   *
-   * 正常情况下它应该是 JSON object 字符串，例如：
-   *   "{\"query\":\"SwiftUI @State\"}"
-   *
-   * 如果模型返回了坏 JSON，这里不要 throw。
-   * 返回 undefined 后，下面 callTool 会把它转成 ok:false 的工具结果，
-   * 让 Agent 最终回答可以继续，而不是因为一次参数格式错误导致整条请求失败。
-   */
-  try {
-    return JSON.parse(rawArguments || "{}");
-  } catch {
-    return undefined;
-  }
-}
 
 function resetMcpAgentClient(): void {
   /**
@@ -119,31 +97,6 @@ function buildMcpServerLaunchArgs(): string[] {
   }
 
   return ["-r", "ts-node/register/transpile-only", serverEntry];
-}
-
-function toOpenAiTool(tool: Tool): ChatCompletionTool {
-  /**
-   * DeepSeek/OpenAI-compatible Chat Completions 不认识 MCP Tool 对象，
-   * 它认识的是 OpenAI-compatible function tool。
-   *
-   * 所以这里做一次协议适配：
-   * MCP inputSchema -> OpenAI function.parameters
-   *
-   * 这也是当前工程最关键的一层桥：
-   * 模型仍然按熟悉的 tools/tool_choice 工作，
-   * 后端真实执行已经走 MCP。
-   */
-  return {
-    type: "function",
-    function: {
-      name: tool.name,
-      description: tool.description || `MCP tool: ${tool.name}`,
-      parameters: {
-        ...tool.inputSchema,
-        additionalProperties: false,
-      },
-    },
-  };
 }
 
 function hasDirectToolResult(result: McpCallToolResponse): result is McpDirectToolResult {
@@ -247,12 +200,12 @@ async function createMcpAgentClient(): Promise<McpAgentClient> {
     cwd: path.resolve(__dirname, "../.."),
     stderr: "inherit",
   });
-  let cachedTools: ChatCompletionTool[] | undefined;
+  let cachedTools: McpTool[] | undefined;
 
   await client.connect(transport);
 
   return {
-    async listOpenAiTools(): Promise<ChatCompletionTool[]> {
+    async listTools(): Promise<McpTool[]> {
       /**
        * 工具列表通常不会在运行时频繁变化。
        * 第一次从 MCP server 读取后缓存起来，后续每轮 Agent 请求复用。
@@ -262,7 +215,7 @@ async function createMcpAgentClient(): Promise<McpAgentClient> {
       }
 
       const toolsResult = await client.listTools();
-      cachedTools = toolsResult.tools.map(toOpenAiTool);
+      cachedTools = toolsResult.tools;
       return cachedTools;
     },
 
@@ -271,8 +224,8 @@ async function createMcpAgentClient(): Promise<McpAgentClient> {
       rawArguments: unknown
     ): Promise<AgentToolExecutionResult> {
       /**
-       * 模型返回的 function.arguments 是 JSON 字符串。
-       * parse 后必须确认是对象，才允许交给 MCP server。
+       * LangChain Tool wrapper 会把模型生成的 arguments 转成普通对象。
+       * 这里仍然做一次对象校验，避免异常输入直接穿透到 MCP server。
        *
        * 更细的字段校验由 MCP server 的 zod schema 完成。
        */
@@ -310,15 +263,15 @@ async function getMcpAgentClient(): Promise<McpAgentClient> {
   return mcpAgentClientPromise;
 }
 
-export async function getMcpAgentTools(): Promise<ChatCompletionTool[]> {
+export async function getMcpToolDefinitions(): Promise<McpTool[]> {
   try {
     const client = await getMcpAgentClient();
-    return await client.listOpenAiTools();
+    return await client.listTools();
   } catch (error) {
     /**
-     * listTools 是 Agent 工具阶段的入口。
+     * listTools 是 LangChain Agent 工具阶段的入口。
      * 如果这里失败，通常意味着 MCP server 启动失败或连接已经不可用。
-     * 清掉单例后，Agent Runner 可以选择跳过工具阶段；
+     * 清掉单例后，Agent Runner 可以选择跳过工具阶段或降级；
      * 下一次用户请求再尝试重建 MCP 连接。
      */
     resetMcpAgentClient();
@@ -326,20 +279,11 @@ export async function getMcpAgentTools(): Promise<ChatCompletionTool[]> {
   }
 }
 
-export async function executeMcpToolCall(
-  toolCall: ChatCompletionMessageToolCall
+export async function callMcpTool(
+  toolName: string,
+  rawArguments: unknown
 ): Promise<AgentToolExecutionResult> {
-  if (toolCall.type !== "function") {
-    return buildToolErrorResult("unknown", "Only function tool calls are supported.");
-  }
-
-  // 1. 取出工具名，比如 searchKnowledge。
-  const toolName = toolCall.function.name;
-
-  // 2. 把模型给的 JSON 字符串参数 parse 成对象。
-  const rawArguments = parseToolArguments(toolCall.function.arguments);
-
-  // 3. 通过 MCP callTool 调工具。
+  // 通过 MCP callTool 调工具。
   try {
     const client = await getMcpAgentClient();
     return await client.callTool(toolName, rawArguments);

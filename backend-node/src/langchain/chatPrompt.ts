@@ -1,9 +1,7 @@
-import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import {
   AIMessage,
   BaseMessage,
   HumanMessage,
-  SystemMessage,
 } from "@langchain/core/messages";
 import {
   ChatPromptTemplate,
@@ -26,8 +24,8 @@ import type { NormalizedChatHistoryItem } from "../shared/types";
  * - history 用 MessagesPlaceholder 插入多轮上下文
  * - 当前问题放 human message
  *
- * 这样你能看到 LangChain prompt 的标准写法，同时输出仍然可以转成
- * OpenAI-compatible messages，方便和现有 DeepSeek / Agent 代码共存。
+ * 这样你能看到 LangChain prompt 的标准写法，并且普通聊天接口可以直接
+ * 把 BaseMessage[] 交给 ChatDeepSeek。
  */
 const ragChatPrompt = ChatPromptTemplate.fromMessages([
   ["system", "{instructions}"],
@@ -44,43 +42,6 @@ export async function buildLangChainRagMessages(
     instructions,
     history: history.map(toLangChainHistoryMessage),
     message,
-  });
-}
-
-export function langChainMessagesToOpenAiMessages(
-  messages: BaseMessage[]
-): ChatCompletionMessageParam[] {
-  /**
-   * /api/chat 和 /api/chat/stream 已经可以用 LangChain ChatDeepSeek。
-   *
-   * 但项目里仍然保留 OpenAI-compatible SDK：
-   * - Agent tool loop 还在用 tools/tool_choice 的低层格式
-   * - DeepSeek reasoning_content 需要精细兼容
-   *
-   * 所以这里保留一个转换函数，方便不同层按自己的格式消费同一份 prompt。
-   */
-  return messages.map((message): ChatCompletionMessageParam => {
-    const content = messageContentToString(message.content);
-    const messageType = message._getType();
-
-    if (messageType === "system") {
-      return {
-        role: "system",
-        content,
-      };
-    }
-
-    if (messageType === "human") {
-      return {
-        role: "user",
-        content,
-      };
-    }
-
-    return {
-      role: "assistant",
-      content,
-    };
   });
 }
 
@@ -114,25 +75,4 @@ function toLangChainHistoryMessage(item: NormalizedChatHistoryItem): BaseMessage
   }
 
   return new AIMessage(item.content);
-}
-
-export function toLangChainMessages(
-  messages: ChatCompletionMessageParam[]
-): BaseMessage[] {
-  /**
-   * 这个函数主要给“旧 OpenAI-compatible messages -> LangChain model”过渡使用。
-   * 普通 RAG 路径会优先从 ChatPromptTemplate 直接生成 BaseMessage。
-   */
-  return messages.map((message) => {
-    const content = typeof message.content === "string" ? message.content : "";
-
-    switch (message.role) {
-      case "system":
-        return new SystemMessage(content);
-      case "user":
-        return new HumanMessage(content);
-      default:
-        return new AIMessage(content);
-    }
-  });
 }

@@ -1,7 +1,3 @@
-import type {
-  ChatCompletionAssistantMessageParam,
-  ChatCompletionMessageParam,
-} from "openai/resources/chat/completions";
 import type { BaseMessage } from "@langchain/core/messages";
 
 /**
@@ -76,10 +72,10 @@ export type ChatResponseMode = "structured" | "streaming";
 
 export type PreparedChatCompletion = {
   knowledgeMatches: ScoredKnowledgeChunk[];
-  aiMessages: ChatCompletionMessageParam[];
   /**
    * LangChain ChatDeepSeek 直接消费 BaseMessage[]。
-   * aiMessages 暂时保留给 OpenAI-compatible SDK 和 Agent 过渡层使用。
+   * 第一阶段开始，普通聊天接口不再把 prompt 转成 OpenAI SDK 的 messages；
+   * 第二阶段后，Agent 也改由 LangChain createAgent 直接管理消息。
    */
   langChainMessages: BaseMessage[];
 };
@@ -118,14 +114,3 @@ export type ChatStreamEvent = ChatStreamEventMetadata &
         message: string;
       }
   );
-
-/**
- * DeepSeek V4 thinking mode 会在 assistant 消息里额外返回 reasoning_content。
- *
- * OpenAI SDK 的通用类型目前不包含这个 DeepSeek 扩展字段，
- * 但 DeepSeek 官方要求 tool call 下一轮必须原样带回。
- */
-export type DeepSeekAssistantMessageWithReasoning =
-  ChatCompletionAssistantMessageParam & {
-    reasoning_content?: string | null;
-  };

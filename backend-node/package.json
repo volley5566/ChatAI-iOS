@@ -7,6 +7,7 @@
     "dev": "ts-node-dev --respawn --transpile-only src/server.ts",
     "build": "tsc",
     "rag:debug": "node -r ts-node/register/transpile-only src/langchain/ragDebug.ts",
+    "agent:debug": "node -r ts-node/register/transpile-only src/langchain/agentDebug.ts",
     "mcp:dev": "node -r ts-node/register/transpile-only src/mcp/mcpServer.ts",
     "mcp:start": "node dist/mcp/mcpServer.js",
     "start": "node dist/server.js"
@@ -25,7 +26,6 @@
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
     "langchain": "^1.4.0",
-    "openai": "^6.37.0",
     "zod": "^4.4.3"
   },
   "devDependencies": {

@@ -33,8 +33,8 @@ const mcpServer = new McpServer({
  *
  * MCP 的工具定义里最重要的是 inputSchema：
  * - MCP client 会通过 listTools 读取这个 schema
- * - 后端再把它转换成 OpenAI-compatible tools
- * - 模型看到 schema 后，才知道应该传 { query: string }
+ * - langchain/agentTools.ts 会把它包装成 LangChain tool
+ * - LangChain Agent 看到 schema 后，才知道应该传 { query: string }
  *
  * 注意：模型不会直接执行这里的函数。
  * 只有当模型返回 tool_call，后端 MCP client 调用 callTool 时，

@@ -1,6 +1,6 @@
 import express, { Request, Response } from "express";
 import cors from "cors";
-import { runAgentToolLoop } from "./agent/agentRunner";
+import { runLangChainAgentStream } from "./agent/agentRunner";
 import {
   createAgentRequestId,
   getDurationMs,
@@ -10,7 +10,6 @@ import {
 import { logChatContext, prepareChatCompletion } from "./chat/chatCompletion";
 import { sanitizeChatHistory } from "./chat/chatHistory";
 import { model, port } from "./config/env";
-import { deepseek } from "./llm/deepseekClient";
 import { writeSseEvent } from "./http/sse";
 import { parseStructuredAnswer } from "./chat/structuredAnswer";
 import {
@@ -29,10 +28,10 @@ import type {
  *
  * 具体业务已经拆到独立模块：
  * - config/env.ts：环境变量
- * - llm/deepseekClient.ts：模型客户端
+ * - langchain/*：LangChain RAG、ChatDeepSeek、Tool、Agent
  * - chat/*：普通聊天上下文、history 清洗、prompt、结构化解析
  * - knowledge/knowledge.ts：RAG 知识库
- * - agent/*：Agent loop、Tool Calling 与 MCP 适配层
+ * - agent/*：Agent SSE 事件和观测辅助
  * - mcp/*：MCP client/server 与真实工具实现
  * - http/sse.ts：SSE 输出
  * - shared/types.ts：共享类型
@@ -97,8 +96,8 @@ app.post(
        * 这一条链路是：
        *   LangChain Retriever -> ChatPromptTemplate -> ChatDeepSeek -> JSON parser
        *
-       * Agent 接口仍保留低层 OpenAI-compatible SDK，
-       * 因为那边还要精细控制 MCP tool_call 和 SSE 进度事件。
+       * Agent 接口在第二阶段也已经切到 LangChain createAgent，
+       * 但它有独立的 SSE 事件格式，所以仍由 /api/agent/stream 单独处理。
        */
       const rawAnswer = await invokeLangChainChat(langChainMessages);
       const structuredAnswer = parseStructuredAnswer(rawAnswer);
@@ -223,8 +222,7 @@ app.post(
      *
      * 如果中途 throw，catch 里会用它记录错误发生在哪个阶段：
      * - request_validation
-     * - tool_loop
-     * - final_stream
+     * - langchain_agent
      */
     let activePhase = "request_validation";
 
@@ -302,40 +300,56 @@ app.post(
       res.setHeader("Connection", "keep-alive");
       res.flushHeaders();
 
-      // Node 进入 Agent 工具阶段。
-      activePhase = "tool_loop";
-      const toolLoopStartedAt = Date.now();
-      const agentRun = await runAgentToolLoop({
-        deepseek,
+      /**
+       * Node 进入 LangChain Agent 阶段。
+       *
+       * 第二阶段后，Agent 决策、工具调用循环、ToolMessage 组装都交给
+       * LangChain createAgent。server.ts 只负责：
+       * - 把工具状态转成 SSE
+       * - 把最终 token 转成 delta
+       * - 记录 request 级别日志
+       */
+      activePhase = "langchain_agent";
+      const agentStartedAt = Date.now();
+      let deltaCount = 0;
+      let outputCharCount = 0;
+
+      const agentRun = await runLangChainAgentStream({
         requestId,
-        model,
         message,
         systemPrompt,
         history,
         onToolEvent: (event) => {
-          /**
-           * onToolEvent：
-           * 当 Agent 开始调用工具时，会通过它给 iOS 推 {"type":"tool_start", ...}
-           * 当工具完成时，会推 {"type":"tool_done", ...}
-           * 所以 iOS 才能显示“正在查询知识库”“已查询知识库”。
-           */
           if (!clientClosed) {
-            /**
-             * tool_start / tool_done 是面向 UI 的安全摘要。
-             * 详细工具参数和工具返回只写后端日志，不直接推给 iOS。
-             */
             writeAgentSseEvent({
               ...event,
               phase: "tool_execution",
             });
           }
         },
+        onDelta: (delta) => {
+          if (clientClosed) {
+            return;
+          }
+
+          deltaCount += 1;
+          outputCharCount += delta.length;
+
+          writeAgentSseEvent({
+            type: "delta",
+            delta,
+            phase: "final_stream",
+          });
+        },
+        shouldStop: () => clientClosed,
       });
 
-      logAgentInfo(requestId, "tool_loop", "server_observed_completed", {
-        durationMs: getDurationMs(toolLoopStartedAt),
+      logAgentInfo(requestId, "langchain_agent", "server_observed_completed", {
+        durationMs: getDurationMs(agentStartedAt),
         modelCalledTools: agentRun.toolCallCount > 0,
         toolCallCount: agentRun.toolCallCount,
+        deltaCount,
+        outputCharCount,
       });
 
       if (clientClosed) {
@@ -348,57 +362,7 @@ app.post(
         return;
       }
 
-      /**
-       * 工具调用阶段已经结束，这里不再传 tools / tool_choice。
-       * 模型只能基于 agentRun.messages 里的工具结果生成最终文本。
-       * 注意这里没有再传 tools。
-       * 因为工具调用阶段已经结束了。现在模型只需要根据已有 messages，包括工具结果，生成最终文本。
-       */
-      activePhase = "final_stream";
-      const finalStreamStartedAt = Date.now();
-      let deltaCount = 0;
-      let outputCharCount = 0;
-
-      logAgentInfo(requestId, "final_stream", "started", {
-        /**
-         * 到这里说明工具阶段已经结束。
-         * 不管工具成功、失败、超时、还是跳过，最终回答都只基于 agentRun.messages。
-         */
-        model,
-        messageCount: agentRun.messages.length,
-        modelCalledTools: agentRun.toolCallCount > 0,
-        toolCallCount: agentRun.toolCallCount,
-      });
-
-      const stream = await deepseek.chat.completions.create({
-        model,
-        messages: agentRun.messages,
-        stream: true,
-      });
-
-      // 然后 Node 一段段读取 DeepSeek 返回。
-      // 每收到一段，就通过 SSE 发给 iOS。
-      for await (const chunk of stream) {
-        if (clientClosed) {
-          break;
-        }
-
-        const delta = chunk.choices[0]?.delta?.content;
-
-        if (delta) {
-          deltaCount += 1;
-          outputCharCount += delta.length;
-
-          writeAgentSseEvent({
-            type: "delta",
-            delta,
-            phase: "final_stream",
-          });
-        }
-      }
-
       if (!clientClosed) {
-        const finalStreamDurationMs = getDurationMs(finalStreamStartedAt);
         const totalDurationMs = getDurationMs(requestStartedAt);
 
         logAgentInfo(requestId, "final_stream", "completed", {
@@ -407,7 +371,7 @@ app.post(
            * - deltaCount = 0 可能表示模型没输出内容
            * - outputCharCount 可以帮助判断回答是否异常短或异常长
            */
-          durationMs: finalStreamDurationMs,
+          durationMs: getDurationMs(agentStartedAt),
           deltaCount,
           outputCharCount,
         });
@@ -416,7 +380,7 @@ app.post(
           durationMs: totalDurationMs,
           modelCalledTools: agentRun.toolCallCount > 0,
           toolCallCount: agentRun.toolCallCount,
-          finalStreamDurationMs,
+          finalStreamDurationMs: getDurationMs(agentStartedAt),
           outputCharCount,
         });
 

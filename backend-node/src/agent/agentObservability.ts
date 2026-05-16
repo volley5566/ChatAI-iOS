@@ -1,5 +1,4 @@
 import { randomUUID } from "crypto";
-import type { ChatCompletionMessageToolCall } from "openai/resources/chat/completions";
 
 /**
  * Agent 可观测性工具。
@@ -227,44 +226,4 @@ export function logAgentError(
     ...data,
     error: serializeError(error),
   });
-}
-
-function parseToolArguments(rawArguments: string): unknown {
-  /**
-   * 日志里希望看到“工具参数对象”，而不是转义后的 JSON 字符串。
-   * 如果模型返回的 arguments 不是合法 JSON，就保留原字符串，
-   * 这样排查时能看到模型到底返回了什么。
-   */
-  if (!rawArguments) {
-    return {};
-  }
-
-  try {
-    return JSON.parse(rawArguments);
-  } catch {
-    return rawArguments;
-  }
-}
-
-export function getToolCallLogData(
-  toolCall: ChatCompletionMessageToolCall
-): Record<string, unknown> {
-  /**
-   * 把 OpenAI-compatible tool_call 整理成日志友好的字段。
-   *
-   * 这个函数只用于日志，不影响真正传给 MCP 的参数。
-   * 真正执行时仍由 mcpClient.ts 重新 parse 并做对象校验。
-   */
-  if (toolCall.type !== "function") {
-    return {
-      toolCallId: toolCall.id,
-      toolType: toolCall.type,
-    };
-  }
-
-  return {
-    toolCallId: toolCall.id,
-    toolName: toolCall.function.name,
-    arguments: parseToolArguments(toolCall.function.arguments),
-  };
 }

@@ -1,11 +1,7 @@
-import type { ChatCompletionMessageParam } from "openai/resources/chat/completions";
 import { buildRetrievalQuery } from "./chatHistory";
 import { buildKnowledgeContext, retrieveRelevantKnowledge } from "../knowledge/knowledge";
 import { buildInstructions, buildStreamingInstructions } from "./prompts";
-import {
-  buildLangChainRagMessages,
-  langChainMessagesToOpenAiMessages,
-} from "../langchain/chatPrompt";
+import { buildLangChainRagMessages } from "../langchain/chatPrompt";
 import type {
   ChatResponseMode,
   NormalizedChatHistoryItem,
@@ -41,21 +37,17 @@ export async function prepareChatCompletion(
   /**
    * 第二轮 LangChain 集成后，普通聊天的 prompt 组装交给 ChatPromptTemplate。
    *
-   * LangChain 输出 BaseMessage[]，这是 ChatDeepSeek 最自然的输入格式。
-   * 同时我们再转换一份 OpenAI-compatible messages，方便日志、对照测试、
-   * 以及后续需要低层 SDK 时继续复用。
+   * LangChain 输出 BaseMessage[]，这是 ChatDeepSeek 最自然的输入格式，
+   * 也能和 Agent createAgent 的消息体系保持一致。
    */
   const langChainMessages = await buildLangChainRagMessages(
     instructions,
     history,
     message
   );
-  const aiMessages: ChatCompletionMessageParam[] =
-    langChainMessagesToOpenAiMessages(langChainMessages);
 
   return {
     knowledgeMatches,
-    aiMessages,
     langChainMessages,
   };
 }

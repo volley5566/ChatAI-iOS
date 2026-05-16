@@ -14,10 +14,11 @@
 ```text
 iOS SwiftUI
   -> Node.js /api/agent/stream
-  -> Tool Calling / Agent Runner
+  -> LangChain createAgent
+  -> LangChain Tools
   -> MCP Client
   -> MCP Server / Tools
-  -> DeepSeek OpenAI-compatible API
+  -> ChatDeepSeek / DeepSeek API
   -> Node.js 通过 SSE 返回最终文本片段
   -> iOS 实时更新同一条 AI 消息气泡
 ```
@@ -167,11 +168,8 @@ backend-node/src/server.ts
 backend-node/src/config/env.ts
   读取和校验 .env 配置
 
-backend-node/src/llm/deepseekClient.ts
-  创建 DeepSeek/OpenAI-compatible SDK 客户端
-
 backend-node/src/chat/chatCompletion.ts
-  普通聊天接口的 LangChain RAG 上下文和 messages 组装
+  普通聊天接口的 LangChain RAG 上下文和 BaseMessage[] 组装
 
 backend-node/src/chat/chatHistory.ts
   清洗 history，限制历史长度，组装检索 query
@@ -198,7 +196,7 @@ backend-node/src/langchain/ragRetriever.ts
   LangChain TextSplitter + MemoryVectorStore + similarity search 主链路
 
 backend-node/src/langchain/chatPrompt.ts
-  使用 ChatPromptTemplate 组装普通 RAG 聊天 prompt，并提供格式转换
+  使用 ChatPromptTemplate 组装普通 RAG 聊天 prompt
 
 backend-node/src/langchain/chatModel.ts
   创建 LangChain ChatDeepSeek，并封装普通 invoke / stream 调用
@@ -206,11 +204,20 @@ backend-node/src/langchain/chatModel.ts
 backend-node/src/langchain/ragDebug.ts
   RAG 检索调试脚本，不启动后端也能查看命中的 chunk
 
+backend-node/src/langchain/agentTools.ts
+  把 MCP listTools() 返回的工具定义动态包装成 LangChain tools
+
+backend-node/src/langchain/agentRunner.ts
+  LangChain createAgent 主链路，负责工具决策、工具执行编排和最终流式输出
+
+backend-node/src/langchain/agentDebug.ts
+  Agent 本地调试脚本，不启动 iOS 也能观察 tool_start / tool_done / delta
+
 backend-node/src/agent/agentRunner.ts
-  Agent Runner，负责 tool_call 循环和 DeepSeek reasoning_content 回传
+  兼容入口，向上 re-export LangChain Agent Runner，避免 server.ts 路径大改
 
 backend-node/src/agent/agentTools.ts
-  Tool Calling 适配层，把 MCP tools 暴露成 OpenAI-compatible tools，并生成工具状态事件
+  Agent SSE 工具事件辅助，把工具执行过程整理成 iOS 可展示的 tool_start / tool_done
 
 backend-node/src/agent/agentToolTypes.ts
   Agent 内部工具结果类型和基础校验函数
@@ -236,12 +243,12 @@ backend-node/src/shared/types.ts
 ```text
 server.ts
   -> 普通聊天：chat/* -> knowledge/* -> langchain/* -> http/*
-  -> Agent 聊天：agent/* -> mcp/* -> knowledge/* -> langchain/*
-  -> 共用：config/* + shared/* + llm/*
+  -> Agent 聊天：agent/* -> langchain/* -> mcp/* -> knowledge/*
+  -> 共用：config/* + shared/*
 ```
 
 这样后续新增工具时，主要改 `src/mcp/mcpServer.ts` 和 `src/mcp/mcpToolHandlers.ts`；
-调整 Agent 循环时，主要改 `src/agent/agentRunner.ts`；
+调整 Agent 循环时，主要改 `src/langchain/agentRunner.ts`；
 调整知识库检索时，优先改 `src/langchain/ragRetriever.ts`；
 如果只是替换 embedding provider，优先改 `src/langchain/embeddings.ts`。
 
@@ -435,27 +442,28 @@ curl -N \
 
 如果不加 `-N`，curl 可能会等攒够一批内容后再显示，看起来就不像实时流式输出。
 
-## 8. Tool Calling / Agent / MCP
+## 8. LangChain Tool / Agent / MCP
 
-当前 App 默认使用第一版 Agent 流式接口：
+当前 App 默认使用第二阶段 LangChain Agent 流式接口：
 
 ```text
 POST /api/agent/stream
 ```
 
-它在普通流式输出前，增加了一个 Tool Calling 阶段：
+它把工具决策、工具执行编排和最终回答流式输出交给 LangChain createAgent：
 
 ```text
 iOS 发送 message + history
   -> Node.js 通过 MCP client 从 MCP server 获取可用工具
-  -> Node.js 把可用工具列表转成 OpenAI-compatible tools 交给模型
-  -> 模型判断是否需要调用工具
-  -> Node.js 通过 SSE 发送 tool_start
-  -> Node.js 通过 MCP client 调用 MCP server
+  -> langchain/agentTools.ts 把 MCP tools 包装成 LangChain tools
+  -> langchain/agentRunner.ts 创建 LangChain Agent
+  -> Agent 判断是否需要调用工具
+  -> Tool wrapper 通过 SSE 发送 tool_start
+  -> Tool wrapper 通过 MCP client 调用 MCP server
   -> MCP server 校验参数并执行真正的工具
-  -> Node.js 通过 SSE 发送 tool_done
-  -> Node.js 把工具结果交回模型
-  -> 模型生成最终回答
+  -> Tool wrapper 通过 SSE 发送 tool_done
+  -> LangChain 把工具结果作为 ToolMessage 交回 Agent
+  -> Agent 基于工具结果生成最终回答
   -> Node.js 通过 SSE 流式返回给 iOS
 ```
 
@@ -468,19 +476,18 @@ flowchart TD
     VM --> API["ChatAPIClient"]
     API -->|POST /api/agent/stream| EXP["Node.js Express server.ts"]
 
-    EXP --> AR["agent/agentRunner.ts"]
-    AR --> AT["agent/agentTools.ts<br/>MCP 与 OpenAI tools 适配层"]
+    EXP --> AR["langchain/agentRunner.ts<br/>createAgent"]
+    AR --> AT["langchain/agentTools.ts<br/>MCP -> LangChain tools"]
     AT --> MC["mcp/mcpClient.ts"]
     MC -->|stdio JSON-RPC| MS["mcp/mcpServer.ts"]
     MS --> MH["mcp/mcpToolHandlers.ts"]
     MH --> KB["knowledge/*.md<br/>本地知识库"]
 
-    AR -->|tools + messages| LLM["DeepSeek<br/>OpenAI-compatible API"]
-    LLM -->|tool_calls| AR
-    AR -->|callTool| MC
-    MC -->|tool result| AR
-    AR -->|final messages, stream:true| LLM
-    LLM -->|delta chunks| EXP
+    AR -->|model + tools + messages| LC["LangChain Agent"]
+    LC -->|ChatDeepSeek| LLM["DeepSeek API"]
+    LC -->|tool call| AT
+    AT -->|tool result JSON| LC
+    LC -->|delta chunks| EXP
     EXP -->|SSE: tool_start/tool_done/delta/done| API
     API --> VM
     VM --> V
@@ -527,19 +534,19 @@ MCP Server
 在这个项目里：
 
 ```text
-agentRunner
-  -> agentTools
+langchain/agentRunner
+  -> langchain/agentTools
   -> mcpClient
   -> mcpServer
   -> mcpToolHandlers
 ```
 
-也就是说，DeepSeek 仍然只看到 OpenAI-compatible tools；
-但后端真正执行工具时，已经通过 MCP client/server 标准链路完成。
+也就是说，LangChain Agent 负责“怎么决定和编排工具”，
+MCP server 负责“工具定义、参数校验和真实执行”。
 
 ### 当前支持的工具
 
-第一版 Agent 只开放两个低风险学习工具：
+当前 Agent 开放两个低风险学习工具：
 
 ```text
 searchKnowledge(query)
@@ -552,49 +559,41 @@ generateQuiz(topic, count)
 这两个工具现在由 `backend-node/src/mcp/mcpServer.ts` 通过 MCP 暴露。
 它们都不会修改数据，也不会调用外部业务系统，适合先把 Tool Calling + MCP 主流程跑通。
 
-### Agent Runner 循环
+### LangChain Agent 循环
 
-后端里有一个简单 Agent Runner。
+后端现在使用 LangChain createAgent 管理循环。
 
 它的工作方式是：
 
 ```text
-最多循环 4 轮
+最多执行 2 次工具调用
 
-每一轮：
-  调模型
-  如果模型返回 tool_calls：
-    后端通过 MCP 执行工具
-    把工具结果放回 messages
-    继续下一轮
+Agent 收到用户问题
+  -> 模型判断是否需要工具
+  -> 如果需要：LangChain 调用对应 tool wrapper
+  -> tool wrapper 通过 MCP 执行真实工具
+  -> LangChain 把工具结果放回 Agent 上下文
+  -> Agent 继续判断或生成最终回答
 
-  如果模型没有返回 tool_calls：
-    结束工具阶段
-    进入最终回答阶段
+如果不需要工具：
+  -> Agent 直接生成最终回答
 ```
 
-为什么要限制最多 4 轮？
+为什么还要限制工具次数？
 
 因为模型有可能反复调用工具。比如一直搜索知识库、一直换 query。
-设置上限可以避免一次请求无限执行。
+`toolCallLimitMiddleware` 可以避免一次请求无限执行工具。
 
 ### 为什么最终回答仍然流式返回
 
-Agent 的工具阶段是非流式的：
+LangChain Agent 支持把最终回答作为 message text stream 读出来。
+后端把这些文本片段转成现有 iOS 能识别的 SSE delta：
 
 ```text
-模型决定工具
-MCP server 执行工具
-模型看工具结果
-```
-
-工具阶段完成后，后端再开启 `stream: true`，把最终回答通过 SSE 返回给 iOS。
-
-这样第一版实现更容易理解：
-
-```text
-工具调用阶段：稳定、易调试
-最终回答阶段：用户体验仍然是流式
+LangChain message.text
+  -> server.ts onDelta
+  -> SSE delta
+  -> iOS 追加到当前 AI 气泡
 ```
 
 ### iOS 如何展示 Agent 执行过程
@@ -621,9 +620,16 @@ AI 一条消息
 
 但 AI 消息内部能看到 Agent 调用了哪个工具。
 
-后续如果要做更高级版本，可以继续升级成“流式 tool_call 参数拼接”，但第一版没必要一开始就做这么复杂。
-
 ### 手动测试 Agent 接口
+
+不启动后端时，可以直接跑本地 Agent 调试脚本：
+
+```bash
+cd backend-node
+npm run agent:debug -- "SwiftUI @State 和 @Binding 有什么区别？请先查知识库再回答。"
+```
+
+如果终端里看到 `tool_start` / `tool_done`，说明 LangChain Agent 已经成功调用 MCP 工具。
 
 也可以单独启动 MCP server 做协议调试：
 
@@ -663,8 +669,8 @@ curl -N \
 如果后端日志里看到类似：
 
 ```text
-[Agent] tool call: searchKnowledge, ok: true
-[Agent] tool calls executed: 1
+[Agent] {"phase":"tool_setup","event":"langchain_tools_loaded",...}
+[Agent] {"phase":"langchain_agent","event":"completed",...}
 ```
 
 说明模型已经触发 Tool Calling，后端也通过 MCP 执行了对应工具。

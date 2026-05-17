@@ -22,6 +22,13 @@ import type {
   ChatStreamEvent,
   ErrorResponseBody,
 } from "./shared/types";
+import {
+  createThread,
+  deleteThread,
+  getThreadMessages,
+  listThreads,
+  touchThread,
+} from "./db/threadsRepository";
 
 /**
  * server.ts 现在只负责 Express 路由和 HTTP 生命周期。
@@ -285,6 +292,21 @@ app.post(
       const rawThreadId = body.thread_id?.trim();
       const threadId = rawThreadId || undefined;
 
+      /**
+       * Phase 5.4:有 threadId 就 touch 一下 Prisma threads 表。
+       *
+       * 这个调用做两件事:
+       *   1. 如果 thread 不存在 → 自动创建一行(iOS 直接发消息也能用,不必先 POST /api/threads)
+       *   2. 如果 thread 存在 → 刷新 updatedAt(对话列表能按"最近活跃"排序)
+       *
+       * 注意 await 一下——确保 Prisma 写完再启动 Agent。
+       * touch 失败会让整个请求挂掉(我们故意不 try/catch),
+       * 因为 db 都写不了,后续 checkpointer 也大概率出问题,早 fail 早暴露。
+       */
+      if (threadId) {
+        await touchThread(threadId);
+      }
+
       logAgentInfo(requestId, "request", "received", {
         /**
          * 这里不记录完整 message 内容，避免用户输入进入后端日志。
@@ -456,6 +478,128 @@ app.post(
     }
   }
 );
+
+// ════════════════════════════════════════════════════════════════════
+// Phase 5.4 — 对话管理接口(供 iOS 端管理 thread 列表用)
+// ════════════════════════════════════════════════════════════════════
+//
+// 这 4 个接口都很简单——所有重活都在 threadsRepository 里做了,
+// 路由层只负责"参数校验 + 包装 HTTP 响应"。
+//
+// 接口设计风格:
+// - 都返回 JSON,不用 SSE(对话管理是离散操作,不是流式)
+// - 错误统一返回 { error: string },HTTP 状态码遵守 REST 惯例
+//   - 400 参数不合法
+//   - 404 资源不存在
+//   - 500 服务端错误
+
+/**
+ * POST /api/threads
+ *
+ * 创建新对话。
+ * 请求体可带可选 title(没传就用 null,等以后由模型生成)。
+ *
+ * 返回新创建的 thread summary。iOS 端拿到 id 后,后续 /api/agent/stream
+ * 就用这个 id 发消息。
+ *
+ * 但注意:iOS 也可以**直接发** /api/agent/stream 带新 id 跳过这个接口,
+ * 因为 /api/agent/stream 内部会 touchThread 自动创建(见 5.3 的改动)。
+ * 这个接口主要给"用户主动'新建对话'" 这种 UI 交互用。
+ */
+app.post("/api/threads", async (req: Request, res: Response) => {
+  try {
+    const body = req.body as { title?: string };
+    const thread = await createThread({ title: body.title });
+    res.status(201).json(thread);
+  } catch (error) {
+    console.error("[Threads] create failed:", error);
+    res.status(500).json({ error: "Failed to create thread." });
+  }
+});
+
+/**
+ * GET /api/threads
+ *
+ * 列出所有对话,按最近活跃倒序。
+ * iOS 端"对话列表页"启动时拉一次。
+ *
+ * 返回格式:{ threads: ThreadSummary[] }
+ * 用对象包一层是为了将来加分页字段(total / next_cursor)时不破坏协议。
+ */
+app.get("/api/threads", async (_req: Request, res: Response) => {
+  try {
+    const threads = await listThreads();
+    res.json({ threads });
+  } catch (error) {
+    console.error("[Threads] list failed:", error);
+    res.status(500).json({ error: "Failed to list threads." });
+  }
+});
+
+/**
+ * GET /api/threads/:id/messages
+ *
+ * 拉某个对话的全部可展示消息。
+ * iOS 端切换对话时拉一次,填充聊天界面。
+ *
+ * 返回 { messages: ThreadMessage[] }
+ *   - 只包含 user / assistant 两类
+ *   - 内部消息(tool_calls 中间消息、ToolMessage)已过滤
+ */
+app.get("/api/threads/:id/messages", async (req: Request, res: Response) => {
+  /**
+   * Express 的 req.params.id 类型是 `string | string[]`(防御性类型,
+   * 因为 Express 理论上允许同名参数多个,虽然 ":id" 这种路径参数实际只会是 string)。
+   * 用 typeof 守卫一下,把类型收窄到 string。
+   */
+  const rawId = req.params.id;
+  const threadId = typeof rawId === "string" ? rawId.trim() : undefined;
+
+  if (!threadId) {
+    res.status(400).json({ error: "Thread id is required." });
+    return;
+  }
+
+  try {
+    const messages = await getThreadMessages(threadId);
+    res.json({ messages });
+  } catch (error) {
+    console.error(`[Threads] get messages failed for ${threadId}:`, error);
+    res.status(500).json({ error: "Failed to load thread messages." });
+  }
+});
+
+/**
+ * DELETE /api/threads/:id
+ *
+ * 删除对话——双向删:
+ *   - Prisma threads 表删一行
+ *   - LangGraph checkpoints / writes 表删该 thread 所有快照
+ *
+ * 成功返回 204 No Content(REST 惯例:删除操作不返回内容)。
+ *
+ * 不存在的 id 也返回 204(幂等性):
+ *   - iOS 多次点删除按钮不会报错
+ *   - 不暴露"这个 id 存在不存在"的信息
+ */
+app.delete("/api/threads/:id", async (req: Request, res: Response) => {
+  // 同 GET /api/threads/:id/messages 那里,类型守卫收窄 req.params.id
+  const rawId = req.params.id;
+  const threadId = typeof rawId === "string" ? rawId.trim() : undefined;
+
+  if (!threadId) {
+    res.status(400).json({ error: "Thread id is required." });
+    return;
+  }
+
+  try {
+    await deleteThread(threadId);
+    res.status(204).end();
+  } catch (error) {
+    console.error(`[Threads] delete failed for ${threadId}:`, error);
+    res.status(500).json({ error: "Failed to delete thread." });
+  }
+});
 
 app.listen(port, () => {
   console.log(`AI backend is running at http://localhost:${port}`);

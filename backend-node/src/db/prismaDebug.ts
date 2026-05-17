@@ -1,4 +1,4 @@
-import { PrismaClient } from "@prisma/client";
+import { prisma } from "./prisma";
 
 /**
  * Phase 5 — Prisma Client 验证脚本。
@@ -27,8 +27,6 @@ import { PrismaClient } from "@prisma/client";
  */
 
 async function main() {
-  const prisma = new PrismaClient();
-
   try {
     console.log("[PrismaDebug] 1. 连接数据库...");
     // PrismaClient 是 lazy connect,第一次 query 才真正连接。

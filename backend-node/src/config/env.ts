@@ -104,18 +104,23 @@ export const toolExecutionTimeoutMs = readIntegerEnv(
  * 把"Agent Runner 用 createAgent(Phase 3) 还是用手写 StateGraph(Phase 4)"
  * 做成 env 配置,目的是**安全灰度**:
  *
- * - USE_LANGGRAPH=false(默认)→ 走老的 runLangChainAgentStream
- *   行为完全等价于 Phase 3,如果新代码有 bug 也不影响主流程
+ * - USE_LANGGRAPH=true(Phase 5.5 起的默认)→ 走新的 runLangGraphAgentStream
+ *   享受 checkpointer 持久化、thread_id 跨请求记忆等 Phase 5 能力
  *
- * - USE_LANGGRAPH=true → 走新的 runLangGraphAgentStream
- *   验证完所有 case 后,可以把默认值切到 true,再后续清理老代码
+ * - USE_LANGGRAPH=false → 走老的 runLangChainAgentStream
+ *   行为完全等价于 Phase 3,主要给"想对比看看 createAgent 写法"的学习场景保留
+ *   注意:这条路径**不支持 checkpointer**,thread_id 会被忽略,持久化也不会生效
  *
  * 这是大型重构常用的"feature flag"模式——新旧实现并行存活,
  * 通过开关切换流量,有问题秒回滚。
+ *
+ * Phase 5.5 默认翻转的原因:LangGraph + checkpointer 已经是主推荐路径,
+ * 默认 false 会让新人(包括没设过 env 的自己)发现"咦怎么 AI 不记事",
+ * 排查半天才发现是 flag 没开——属于"默认值不合理导致的坑"。
+ * 翻转后,显式 USE_LANGGRAPH=false 才回退到老路径,意图清楚。
  */
 const useLangGraphRaw = (process.env.USE_LANGGRAPH || "").trim().toLowerCase();
-export const useLangGraph =
-  useLangGraphRaw === "true" || useLangGraphRaw === "1";
+export const useLangGraph = useLangGraphRaw !== "false" && useLangGraphRaw !== "0";
 
 /**
  * LangSmith 接入。

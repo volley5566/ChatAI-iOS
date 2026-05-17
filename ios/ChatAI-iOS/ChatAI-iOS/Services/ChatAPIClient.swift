@@ -105,6 +105,47 @@ protocol ChatAPI {
         history: [ChatHistoryItem],
         threadID: String?
     ) throws -> AsyncThrowingStream<ChatStreamUpdate, Error>
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 5.5.4 — 对话管理 API
+    //
+    // 这 4 个接口和聊天接口的本质区别:
+    //   - 聊天接口走 SSE 流式 → AsyncThrowingStream
+    //   - 对话管理是离散的 CRUD 操作 → 普通 async/await
+    //
+    // 都不会失败重试——5.5 阶段只做最简单的"调一次,成功就用,失败就提示用户"。
+    // 后续如果加"网络抖动自动重试"那是 Service 层 wrapper 的事,不污染 API 协议。
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 新建一个对话。
+    ///
+    /// 对应后端 POST /api/threads。
+    /// title 可选——传 nil 时后端存 null,以后可由模型根据首条消息生成标题。
+    ///
+    /// 返回新建对话的元信息(含 id),iOS 端拿到 id 后,
+    /// 后续 sendAgentStreamingMessage(..., threadID: ...) 就能持久化。
+    func createThread(title: String?) async throws -> ThreadSummary
+
+    /// 列出所有对话,按最近活跃倒序。
+    ///
+    /// 对应后端 GET /api/threads。
+    /// 给"对话列表页"(5.6 才会做的 UI)使用。
+    func listThreads() async throws -> [ThreadSummary]
+
+    /// 拉某个对话的全部可展示消息。
+    ///
+    /// 对应后端 GET /api/threads/:id/messages。
+    /// 切换到历史对话时调一次,把消息填回聊天界面。
+    ///
+    /// 返回的是 ThreadMessage(role + content),
+    /// 不是 ChatMessage——ViewModel 自己负责转换。
+    func getThreadMessages(threadID: String) async throws -> [ThreadMessage]
+
+    /// 删除一个对话(同时清掉后端 checkpointer 里的 state 快照)。
+    ///
+    /// 对应后端 DELETE /api/threads/:id。
+    /// 幂等——id 不存在也返回成功(后端 204)。
+    func deleteThread(threadID: String) async throws
 }
 
 /// iOS 调用 Node.js 后端时可能遇到的错误。
@@ -556,6 +597,178 @@ final class ChatAPIClient: ChatAPI {
             }
         }
     }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 5.5.4 — 对话管理 API 实现
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 新建对话。POST /api/threads
+    ///
+    /// 流程:
+    /// 1. (可选)把 title 包成请求体 JSON
+    /// 2. 发 POST,后端建库后返回新 thread
+    /// 3. 解码成 ThreadSummary 返回
+    func createThread(title: String?) async throws -> ThreadSummary {
+        /**
+         * 构造请求体——只有 title 一个字段,而且可选。
+         *
+         * 这里没用上面的 ChatRequestBody(那个是聊天用),也没专门建一个 struct,
+         * 直接用 [String: String] 字典编码 JSON。理由:字段只有一个、不会复用,
+         * 多建一个 struct 反而代码噪音。
+         *
+         * 如果以后 title 之外还要传别的(比如 model preference / system prompt template),
+         * 再升级成专用 struct 不迟。
+         */
+        var bodyDict: [String: String] = [:]
+        if let title, !title.isEmpty {
+            bodyDict["title"] = title
+        }
+        let bodyData = try JSONEncoder().encode(bodyDict)
+
+        let data = try await performJSONRequest(method: "POST", path: "api/threads", body: bodyData)
+        return try Self.makeThreadDecoder().decode(ThreadSummary.self, from: data)
+    }
+
+    /// 列出全部对话。GET /api/threads
+    func listThreads() async throws -> [ThreadSummary] {
+        let data = try await performJSONRequest(method: "GET", path: "api/threads", body: nil)
+        /**
+         * 后端返回的是 { "threads": [...] } 而不是裸数组——
+         * 这是后端约定,留出未来加 total / next_cursor 这种分页字段的空间。
+         * iOS 这边定义个本地 wrapper struct 接住,再返回数组,
+         * 让外层 API 看起来更简洁。
+         */
+        let wrapper = try Self.makeThreadDecoder().decode(ThreadListResponseBody.self, from: data)
+        return wrapper.threads
+    }
+
+    /// 拉某个对话的消息历史。GET /api/threads/:id/messages
+    func getThreadMessages(threadID: String) async throws -> [ThreadMessage] {
+        /**
+         * URL 路径里的 :id 用 ID 替换,记得做 URL 安全转义——
+         * 虽然后端用 uuid(只含 0-9a-f-),正常不会出问题,
+         * 但万一以后 id 格式换了带特殊字符,addingPercentEncoding 能兜底。
+         */
+        let encodedID = threadID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? threadID
+        let data = try await performJSONRequest(method: "GET", path: "api/threads/\(encodedID)/messages", body: nil)
+
+        /**
+         * 同 listThreads,后端用 { "messages": [...] } 包了一层。
+         * 这里也用 wrapper struct 接住。
+         */
+        let wrapper = try Self.makeThreadDecoder().decode(ThreadMessagesResponseBody.self, from: data)
+        return wrapper.messages
+    }
+
+    /// 删除一个对话。DELETE /api/threads/:id
+    func deleteThread(threadID: String) async throws {
+        let encodedID = threadID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? threadID
+        /**
+         * DELETE 成功后端返回 204 No Content(没有响应体)。
+         * performJSONRequest 会拿到一个空 Data,这里直接丢掉就行。
+         */
+        _ = try await performJSONRequest(method: "DELETE", path: "api/threads/\(encodedID)", body: nil)
+    }
+
+    /// 4 个对话管理接口共用的 HTTP 底层。
+    ///
+    /// 它做的事:
+    ///   1. 拼 URL
+    ///   2. 设 method / Content-Type
+    ///   3. (有 body 就)塞请求体
+    ///   4. 发请求,检查 HTTP 状态码
+    ///   5. 把响应 Data 原样返回,由调用方按自己的 schema 解码
+    ///
+    /// 不包含 JSON 解码,因为 4 个接口的响应 schema 都不一样
+    /// (ThreadSummary / { threads } / { messages } / 空 body)。
+    private func performJSONRequest(method: String, path: String, body: Data?) async throws -> Data {
+        let url = baseURL.appending(path: path)
+
+        var request = URLRequest(url: url)
+        request.httpMethod = method
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        if let body {
+            request.httpBody = body
+        }
+
+        let (data, response) = try await urlSession.data(for: request)
+
+        guard let httpResponse = response as? HTTPURLResponse else {
+            throw ChatAPIError.invalidResponse
+        }
+
+        guard (200...299).contains(httpResponse.statusCode) else {
+            /**
+             * 后端失败时一致返回 { "error": "..." },尝试解码这个 schema 给用户看。
+             * 解不出就退回到状态码兜底信息。
+             */
+            if let errorBody = try? JSONDecoder().decode(ChatErrorResponseBody.self, from: data) {
+                throw ChatAPIError.serverMessage(errorBody.error)
+            }
+            throw ChatAPIError.serverMessage("请求失败,HTTP 状态码:\(httpResponse.statusCode)")
+        }
+
+        return data
+    }
+
+    /// 专用于 Thread 系列接口的 JSONDecoder。
+    ///
+    /// 关键点:**ISO 8601 + 毫秒**。
+    ///
+    /// 后端 Node 的 `Date.prototype.toISOString()` 输出是
+    /// `"2026-05-17T08:00:00.000Z"` ——**带 .sss 毫秒部分**。
+    ///
+    /// 而 JSONDecoder 默认的 .iso8601 策略用的是 ISO8601DateFormatter 的默认配置,
+    /// **不识别小数秒**——直接用会抛 dataCorrupted 错误。
+    ///
+    /// 这里手动创建 ISO8601DateFormatter,带上 .withFractionalSeconds 选项,
+    /// 用 .custom 策略喂给 decoder。
+    ///
+    /// static + 每次新建:JSONDecoder 不是线程安全的 stateful 对象,
+    /// 不同请求最好各拿一份;但 formatter 是 thread-safe 的,可以在 closure 里复用。
+    private static func makeThreadDecoder() -> JSONDecoder {
+        let decoder = JSONDecoder()
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+
+        decoder.dateDecodingStrategy = .custom { decoder in
+            let container = try decoder.singleValueContainer()
+            let string = try container.decode(String.self)
+            if let date = formatter.date(from: string) {
+                return date
+            }
+            /**
+             * 兜底:如果哪一天后端改成不输出毫秒了(比如换成 PostgreSQL 的 timestamptz),
+             * 用一个不带 .withFractionalSeconds 的 formatter 再试一次。
+             * 不抛错,优雅降级。
+             */
+            let fallback = ISO8601DateFormatter()
+            fallback.formatOptions = [.withInternetDateTime]
+            if let date = fallback.date(from: string) {
+                return date
+            }
+            throw DecodingError.dataCorruptedError(
+                in: container,
+                debugDescription: "无法解析 ISO 8601 时间字符串:\(string)"
+            )
+        }
+        return decoder
+    }
+}
+
+/// 对应后端 GET /api/threads 的 { "threads": [...] } 包装层。
+///
+/// 用 private 而不是放到 Models/ 里,
+/// 是因为这个包装结构是"网络协议层细节",
+/// UI 层只关心展开后的 [ThreadSummary],不需要知道有这层包装。
+private struct ThreadListResponseBody: Decodable {
+    let threads: [ThreadSummary]
+}
+
+/// 对应后端 GET /api/threads/:id/messages 的 { "messages": [...] } 包装层。
+/// 同理,private 收在网络层内部。
+private struct ThreadMessagesResponseBody: Decodable {
+    let messages: [ThreadMessage]
 }
 
 /// iOS 发给 Node.js 的 JSON 请求体。

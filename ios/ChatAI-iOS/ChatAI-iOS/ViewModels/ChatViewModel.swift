@@ -24,12 +24,19 @@ import Foundation
 // final：这个类不能被继承。
 // ObservableObject：这个对象可以被 SwiftUI 观察，View 可以观察这个 ViewModel。
 final class ChatViewModel: ObservableObject {
-    /// 每次请求最多带几条历史消息。
+    /// Phase 5.5.5 — 当前对话的 thread id。
     ///
-    /// 只带最近 6 条，是为了避免聊天越久，请求内容无限变大。
-    /// 最近 6 条通常可以覆盖 3 轮问答，足够处理：
-    /// “请更详细回答”“继续”“举个例子”这类追问。
-    private let maxHistoryMessages = 6
+    /// 生命周期:
+    ///   - 初始为 nil(还没发任何消息)
+    ///   - 用户点击发送第一条消息时,sendMessage() 会先调 createThread() 拿到 id 存进来
+    ///   - 后续消息一律带这个 id 发,后端的 checkpointer 负责持久化
+    ///   - resetConversation() 会把它清回 nil,等于"开始一段新对话"
+    ///
+    /// 为什么用 private var,不用 @Published?
+    ///   5.5 阶段没有 UI 直接观察它(对话列表 UI 是 5.6 的事)。
+    ///   暂时只供 ViewModel 自己用,保持 private 最简单。
+    ///   5.6 引入对话列表时,如果需要顶部显示"当前对话 xxx",再升级成 @Published。
+    private var currentThreadID: String?
 
     /// 聊天消息列表。页面会根据它自动刷新。
     /// @Published：这个变量一变化，就通知 SwiftUI 页面刷新。
@@ -157,21 +164,15 @@ final class ChatViewModel: ObservableObject {
             return
         }
 
-        // 在追加当前用户消息之前，先整理历史。
-        // 因为当前 message 会单独作为 message 字段发给后端，
-        // history 里只需要放“之前发生过的对话”。
-        // 第二步：整理历史消息
-        let history = recentHistoryItems()
-
         // 先把用户输入追加到聊天列表。
         // 这样用户点击发送后，能马上看到自己的消息。
-        // 第三步：先显示用户消息
+        // 第二步：先显示用户消息
         messages.append(
             // 用户一点发送，就马上把用户消息追加到列表。
             ChatMessage(role: .user, content: messageText)
         )
 
-        // 第四步：清空输入框，设置状态。
+        // 第三步：清空输入框，设置状态。
         // 清空输入框，避免用户重复发送同一段内容。
         inputText = ""
         errorMessage = nil
@@ -199,6 +200,21 @@ final class ChatViewModel: ObservableObject {
         var streamedAnswer = ""
 
         do {
+            // Phase 5.5.5 — 确保 thread 存在。
+            //
+            // 如果 currentThreadID 还是 nil(这是用户首次发消息),
+            // 先调后端 POST /api/threads 拿一个新 id 存进来。
+            // 之后这次以及后续所有消息,都会带着同一个 id 发,
+            // 后端 checkpointer 会自动管理历史。
+            //
+            // 失败处理:createThread 抛错会直接进入下面的 catch,
+            // 显示错误,不会带着 nil threadID fallback 到老路径——
+            // 那种 fallback 会让用户以为消息发出去了,实际后续找不回,体验是错乱的。
+            if currentThreadID == nil {
+                let thread = try await chatAPI.createThread(title: nil)
+                currentThreadID = thread.id
+            }
+
             // 调用网络层，请求 Node.js Agent 流式接口。
             //
             // sendAgentStreamingMessage 返回的不是完整答案，
@@ -210,12 +226,15 @@ final class ChatViewModel: ObservableObject {
             //
             // 工具阶段会通过 tool_start / tool_done 告诉 iOS 当前进度。
             // 工具阶段完成后，最终回答才会通过 delta 一段段推给 iOS。
+            //
+            // history 固定传空数组——后端拿到 thread_id 时,
+            // 只会用请求里的 message 字段,完整历史从 checkpointer 加载。
+            // 继续传 history 是浪费带宽,而且会让"历史的真相在哪"变得不清晰。
             let stream = try chatAPI.sendAgentStreamingMessage(//调网络层拿流式接口 AsyncThrowingStream类似 Kotlin 的 Flow<T>
                 messageText,
                 systemPrompt: AppConfig.defaultSystemPrompt,
-                history: history,
-                // Phase 5.5.3 占位:5.5.5 会引入 currentThreadID 状态,把这里替换成真实的对话 id。
-                threadID: nil
+                history: [],
+                threadID: currentThreadID
             )
 
             // 先追加一条空的 AI 消息，给后续 delta 一个固定容器。
@@ -299,6 +318,11 @@ final class ChatViewModel: ObservableObject {
     }
 
     /// 清空聊天记录，保留一条欢迎语。
+    ///
+    /// Phase 5.5.5 起,"清空"按钮的语义升级为"开始一段新对话":
+    ///   - 把 currentThreadID 切回 nil → 下次发消息会调 createThread 拿新 id
+    ///   - 不调 deleteThread——历史 thread 还在数据库里,
+    ///     5.6 的对话列表 UI 可以让用户回到那个对话
     func resetConversation() {
         messages = [
             ChatMessage(
@@ -309,52 +333,13 @@ final class ChatViewModel: ObservableObject {
         inputText = ""
         errorMessage = nil
         isSending = false
+        currentThreadID = nil
     }
 
     /// 去掉输入框前后的空格和换行。
     /// 用户只输入空格时，也会被当成空消息。
     private var trimmedInputText: String {
         inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-    }
-
-    /// 整理最近几条历史消息，发送给后端。
-    ///
-    /// 这里会排除最开始那条欢迎语。
-    ///
-    /// 为什么用 dropFirst？
-    /// messages 第一条是 App 自己放进去的欢迎语，
-    /// 它不是用户和 AI 的真实问答内容。
-    ///
-    /// 流式输出后，assistant 消息可能没有 structuredAnswer，
-    /// 但它的 content 就是真实 AI 回答。
-    /// 所以不能再只用 structuredAnswer 判断 AI 消息是否可进入历史。
-    private func recentHistoryItems() -> [ChatHistoryItem] {
-        messages
-            // 丢掉第一条消息。 // 跳过欢迎语
-            .dropFirst()
-            // 只保留内容不为空的消息。
-            .filter { message in
-                // trimmingCharacters(in: .whitespacesAndNewlines)
-                // 去掉字符串前面和后面的空格、换行。
-                //
-                // in: .whitespacesAndNewlines 是什么意思？
-                // 这里的 in: 是参数名：我要按照什么规则来 trim 字符？
-                //
-                // .whitespacesAndNewlines 是一个系统内置的字符集合：空格 + 换行。
-                // 包含：
-                // - 普通空格
-                // - tab
-                // - 换行 \n
-                // - 回车 \r
-                //
-                // 它会把 content 字符串开头和结尾的空格、换行都去掉。
-                // .isEmpty 表示：去掉前后空格和换行后，看看这个字符串是不是空的。
-                !message.toHistoryItem().content.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
-            }
-            // 只取最后 maxHistoryMessages 条。
-            .suffix(maxHistoryMessages)// 只取最近 6 条
-            // 把 ChatMessage 转成 ChatHistoryItem，就是 convert 的 map 过程。
-            .map { $0.toHistoryItem() }// 转网络层模型
     }
 
     /// 更新某一条消息的正文。

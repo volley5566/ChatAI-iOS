@@ -26,6 +26,7 @@ import {
   shouldContinue,
 } from "./agentGraphNodes";
 import { messageContentToString } from "./chatPrompt";
+import { getSqliteCheckpointer } from "../db/sqliteCheckpointer";
 
 /**
  * Phase 4 — 把图拼起来。
@@ -86,6 +87,22 @@ type RunLangGraphAgentStreamOptions = {
   message: string;
   systemPrompt: string | undefined;
   history: NormalizedChatHistoryItem[];
+  /**
+   * Phase 5.2 新增 —— 对话 ID。
+   *
+   * 传了的话:
+   *   - LangGraph 会用这个 id 在 checkpointer 里找已有的 state 快照
+   *   - 没找到就当新对话开始
+   *   - 跑完图会把新的 state 快照存回 checkpointer
+   *
+   * 不传(undefined):
+   *   - 走"无持久化"模式
+   *   - 图跑完 state 立刻丢弃,等价于 Phase 4 老行为
+   *   - 这种模式仍然支持,主要为了让 server.ts 在 iOS 端没改造前不挂
+   *
+   * 一般 thread_id 由 server 层生成 UUID,iOS 端记着用。
+   */
+  threadId?: string;
   onToolEvent?: (event: ChatStreamEvent) => void;
   onDelta?: (delta: string) => void;
   shouldStop?: () => boolean;
@@ -100,6 +117,7 @@ export async function runLangGraphAgentStream({
   message,
   systemPrompt,
   history,
+  threadId,
   onToolEvent,
   onDelta,
   shouldStop,
@@ -157,6 +175,22 @@ export async function runLangGraphAgentStream({
     tools,
   });
 
+  /**
+   * Phase 5.2:有 threadId 就挂上 checkpointer,让 state 自动存档。
+   *
+   * 没 threadId(undefined)就走老行为(不持久化)——这条路径主要给
+   * server.ts 在 iOS 端还没改造之前用的兼容路径。
+   *
+   * compile({ checkpointer }) 的效果:
+   *   - 每次节点跑完,LangGraph 自动把更新后的 state 写到 checkpointer
+   *   - 下次同 thread_id 调用 streamEvents 时,LangGraph 自动从 checkpointer
+   *     读出上次的 state,接着往下跑
+   *
+   * 注意 checkpointer 是图编译期决定的,**编译后不能改**。所以这里要在
+   * .compile() 调用时决定要不要传它。
+   */
+  const checkpointer = threadId ? getSqliteCheckpointer() : undefined;
+
   const graph = new StateGraph(AgentState)
     /**
      * .addNode 把节点函数注册到图里,起一个名字(后面 addEdge 要用)。
@@ -188,37 +222,54 @@ export async function runLangGraphAgentStream({
      *   - 所有 edge 的端点都已经 addNode
      *   - 没有"死节点"(没有任何边能到达的节点)
      *   - 没有缺路径(START 必须能到 END)
+     *
+     * checkpointer 是可选的:传了就启用持久化,不传就纯内存模式。
      */
-    .compile();
+    .compile({ checkpointer });
 
   /**
-   * 第三步:准备初始 state(把用户消息和 history 转成 BaseMessage 数组)。
+   * 第三步:准备初始 state(送进图的 messages 列表)。
+   *
+   * 这里要根据是否启用 checkpointer 分两种构造方式:
+   *
+   * - 有 threadId(走 checkpointer):
+   *     state.messages 已经在数据库里,LangGraph 会自动加载。
+   *     我们**只塞新消息**,LangGraph 用 messagesStateReducer 自动追加。
+   *     如果再传一遍 history,会和数据库里已有的重复!
+   *
+   * - 没 threadId(无持久化):
+   *     state 是空的(图启动时白板从默认值 [] 开始),
+   *     所以要把 history + 当前消息一起塞进去。
    */
-  const initialMessages = buildInitialMessages(message, history);
+  const initialMessages = threadId
+    ? [new HumanMessage(message)]
+    : buildInitialMessages(message, history);
 
   logAgentInfo(requestId, "langgraph_agent", "started", {
     messageCount: initialMessages.length,
     toolCount: tools.length,
     recursionLimit: agentRecursionLimit,
+    threadId: threadId ?? "(none, no persistence)",
   });
 
   /**
    * 第四步:用 streamEvents 跑图,token 一边产生一边推给 iOS。
    *
-   * 这里和 Phase 3 一样用 streamEvents(v2),拿 on_chat_model_stream 事件
-   * 来转发 token。
+   * Phase 5.2 新增:传 configurable.thread_id。
+   *   - LangGraph 会用它找 checkpointer 里已有的 state(如果有)
+   *   - 跑完后把新 state 写回 checkpointer
    *
-   * 区别只在底层 graph 不一样:
-   *   Phase 3: createAgent 产生的图
-   *   Phase 4: 我们手写的 StateGraph
+   * 没传 thread_id 也能跑(checkpointer 也是可选的),那就是纯内存模式。
    *
-   * 但 streamEvents 接口是 Runnable 共有的,所以行为一致。
+   * 注意 configurable 是 LangGraph 的"特殊配置入口",
+   * thread_id 是其中**最常用的字段**——所有 checkpointer 都靠它隔离不同对话。
    */
   const eventStream = graph.streamEvents(
     { messages: initialMessages },
     {
       version: "v2",
       recursionLimit: agentRecursionLimit,
+      configurable: threadId ? { thread_id: threadId } : undefined,
     }
   );
 

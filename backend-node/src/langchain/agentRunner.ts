@@ -40,6 +40,15 @@ type RunLangChainAgentStreamOptions = {
   message: string;
   systemPrompt: string | undefined;
   history: NormalizedChatHistoryItem[];
+  /**
+   * Phase 5.2 加这个字段是为了"接口对齐":
+   * 路由层会把 threadId 同时传给 Phase 3 和 Phase 4,所以两边必须有这个参数。
+   *
+   * 但 Phase 3(createAgent)路径**不接入 checkpointer**——保留它作为
+   * 无持久化的"快速回退路径"。这里只是收下 threadId 然后忽略,
+   * 让上层调用接口统一。
+   */
+  threadId?: string;
   onToolEvent?: (event: ChatStreamEvent) => void;
   onDelta?: (delta: string) => void;
   shouldStop?: () => boolean;
@@ -66,10 +75,16 @@ export async function runLangChainAgentStream({
   message,
   systemPrompt,
   history,
+  /**
+   * Phase 3 路径忽略 threadId(我们故意不接 checkpointer)。
+   * 加 void 是为了消除"声明了但没用"的 lint 警告。
+   */
+  threadId: _threadId,
   onToolEvent,
   onDelta,
   shouldStop,
 }: RunLangChainAgentStreamOptions): Promise<LangChainAgentRunResult> {
+  void _threadId;
   const startedAt = Date.now();
   let toolCallCount = 0;
   let outputText = "";

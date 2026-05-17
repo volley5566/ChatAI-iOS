@@ -8,31 +8,60 @@ import { closeMcpAgentClient } from "../mcp/mcpClient";
  * 测一次就能验证两条路径。
  */
 import { runLangChainAgentStream } from "../agent/agentRunner";
+import { closeSqliteCheckpointer } from "../db/sqliteCheckpointer";
 
 /**
  * LangChain Agent 本地调试脚本。
  *
- * 运行方式：
+ * 运行方式:
  *
- *   npm run agent:debug -- "SwiftUI @State 和 @Binding 有什么区别？请先查知识库再回答。"
+ *   # 不带 thread_id —— 无持久化模式(老行为)
+ *   npm run agent:debug -- "SwiftUI @State 是什么?"
  *
- * 和 rag:debug 的区别：
- * - rag:debug 只测试 Document -> Splitter -> Embedding -> Vector Store -> Retriever
- * - agent:debug 会真的调用 ChatDeepSeek，让 LangChain Agent 自己决定是否使用 MCP tools
+ *   # 带 thread_id —— 启用 checkpointer 持久化(Phase 5.2 新增)
+ *   USE_LANGGRAPH=true npm run agent:debug -- --thread-id=test1 "我叫 Nathan"
+ *   USE_LANGGRAPH=true npm run agent:debug -- --thread-id=test1 "我叫什么名字?"
+ *   ↑ 第二次跑模型应该能"记起" Nathan,说明 checkpointer 工作了
  *
- * 所以这个脚本需要 .env 里有 DEEPSEEK_API_KEY。
+ * 注意:
+ * - 只有 USE_LANGGRAPH=true(走 Phase 4 StateGraph)时,thread_id 才生效
+ * - Phase 3 路径(createAgent)故意不接 checkpointer,传 thread_id 也会被忽略
  */
 async function main(): Promise<void> {
-  const message = process.argv.slice(2).join(" ").trim();
+  /**
+   * 简易参数解析:
+   *   - 任何 `--thread-id=xxx` 形式的参数被识别为 thread id
+   *   - 剩下的合在一起就是用户消息
+   */
+  const rawArgs = process.argv.slice(2);
+  let threadId: string | undefined;
+  const messageParts: string[] = [];
+
+  for (const arg of rawArgs) {
+    if (arg.startsWith("--thread-id=")) {
+      threadId = arg.slice("--thread-id=".length).trim() || undefined;
+    } else {
+      messageParts.push(arg);
+    }
+  }
+
+  const message = messageParts.join(" ").trim();
 
   if (!message) {
-    console.error("Usage: npm run agent:debug -- \"your question\"");
+    console.error(
+      'Usage: npm run agent:debug -- [--thread-id=<id>] "your question"'
+    );
     process.exitCode = 1;
     return;
   }
 
   console.log("[LangChain Agent Debug] Query:");
   console.log(message);
+  if (threadId) {
+    console.log(`[LangChain Agent Debug] Thread ID: ${threadId} (checkpointer enabled)`);
+  } else {
+    console.log("[LangChain Agent Debug] No thread ID (no persistence)");
+  }
   console.log("");
 
   try {
@@ -41,10 +70,11 @@ async function main(): Promise<void> {
       message,
       systemPrompt: "You are a friendly iOS tutor.",
       history: [],
+      threadId, // ← Phase 5.2 新增
       onToolEvent: (event) => {
         /**
          * 这里直接打印 SSE 事件对象。
-         * 如果看到 tool_start / tool_done，说明 LangChain Agent 确实调用了工具。
+         * 如果看到 tool_start / tool_done,说明 LangChain Agent 确实调用了工具。
          */
         console.log("");
         console.log(`[LangChain Agent Debug] ${event.type}`);
@@ -53,7 +83,7 @@ async function main(): Promise<void> {
       },
       onDelta: (delta) => {
         /**
-         * 最终回答仍然按 token/delta 输出，
+         * 最终回答仍然按 token/delta 输出,
          * 这样本地脚本和 iOS SSE 的体验保持一致。
          */
         process.stdout.write(delta);
@@ -68,9 +98,13 @@ async function main(): Promise<void> {
   } finally {
     /**
      * mcpClient.ts 会启动 stdio MCP server 子进程。
-     * 调试脚本结束时主动关闭，避免 Node 因为子进程还开着而挂住。
+     * 调试脚本结束时主动关闭,避免 Node 因为子进程还开着而挂住。
      */
     await closeMcpAgentClient();
+    /**
+     * Phase 5.2:同样关掉 SqliteSaver 的连接,让进程能干净退出。
+     */
+    closeSqliteCheckpointer();
   }
 }
 

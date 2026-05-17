@@ -95,10 +95,15 @@ protocol ChatAPI {
     /// Agent 接口会先在后端执行 Tool Calling，
     /// 然后再把最终回答一段段推给 iOS。
     /// Agent 流式回答，包含工具状态和文本片段。
+    ///
+    /// Phase 5.5 新增 threadID 参数:
+    /// - 传入有效 id → 后端启用 LangGraph checkpointer,自动加载历史 + 写回新 state
+    /// - 传 nil → 走旧路径(无持久化,靠 history 数组带历史),兼容老 ViewModel
     func sendAgentStreamingMessage(
         _ message: String,
         systemPrompt: String,
-        history: [ChatHistoryItem]
+        history: [ChatHistoryItem],
+        threadID: String?
     ) throws -> AsyncThrowingStream<ChatStreamUpdate, Error>
 }
 
@@ -194,7 +199,10 @@ final class ChatAPIClient: ChatAPI {
         let requestBody = ChatRequestBody(
             message: message,
             systemPrompt: systemPrompt,
-            history: history
+            history: history,
+            // 非流式结构化接口 /api/chat 后端不走 checkpointer,
+            // thread_id 在这里没意义,固定 nil(JSON 里会被自动省略)。
+            threadID: nil
         )
         request.httpBody = try JSONEncoder().encode(requestBody)
 
@@ -259,7 +267,10 @@ final class ChatAPIClient: ChatAPI {
             path: "api/chat/stream",
             message: message,
             systemPrompt: systemPrompt,
-            history: history
+            history: history,
+            // 普通流式接口 /api/chat/stream 后端也不走 checkpointer,
+            // 这里固定 nil——保持普通流式作为"对比测试用"的纯净老路径。
+            threadID: nil
         )
 
         // 普通流式接口只需要文本 delta。
@@ -309,7 +320,8 @@ final class ChatAPIClient: ChatAPI {
     func sendAgentStreamingMessage(
         _ message: String,
         systemPrompt: String,
-        history: [ChatHistoryItem]
+        history: [ChatHistoryItem],
+        threadID: String?
     ) throws -> AsyncThrowingStream<ChatStreamUpdate, Error> {
         // Agent 流式聊天是当前 App 默认入口。
         //
@@ -318,11 +330,15 @@ final class ChatAPIClient: ChatAPI {
         // - 模型可以返回 tool_call
         // - 后端执行工具并把结果交回模型
         // - 最终回答仍然通过同一套 SSE 解析逻辑返回给 iOS
+        //
+        // Phase 5.5:threadID 一路透传到 sendStreamingRequest → ChatRequestBody → JSON 的 thread_id 字段,
+        // 后端收到非空 thread_id 时启用 checkpointer,实现跨请求的对话持久化。
         try sendStreamingRequest(
             path: "api/agent/stream",
             message: message,
             systemPrompt: systemPrompt,
-            history: history
+            history: history,
+            threadID: threadID
         )
     }
 
@@ -339,7 +355,8 @@ final class ChatAPIClient: ChatAPI {
         path: String,
         message: String,
         systemPrompt: String,
-        history: [ChatHistoryItem]
+        history: [ChatHistoryItem],
+        threadID: String?
     ) throws -> AsyncThrowingStream<ChatStreamUpdate, Error> {
         // path 由上层入口传入。
         //
@@ -375,7 +392,8 @@ final class ChatAPIClient: ChatAPI {
         let requestBody = ChatRequestBody(
             message: message,
             systemPrompt: systemPrompt,
-            history: history
+            history: history,
+            threadID: threadID
         )
         request.httpBody = try JSONEncoder().encode(requestBody)
 
@@ -549,6 +567,17 @@ private struct ChatRequestBody: Encodable {//- Encodable ≈ Moshi/Gson 的 @Ser
     let systemPrompt: String
     let history: [ChatHistoryItem]
 
+    /// Phase 5.5 新增:对话 id。
+    ///
+    /// 可选(String?)的原因——和后端 ChatRequestBody.thread_id 字段呼应:
+    /// - nil  → JSON 里这个字段直接不出现,后端走 Phase 4 行为(无持久化,靠 history 数组带历史)
+    /// - 非 nil → 后端启用 LangGraph checkpointer,自动从 SQLite 加载历史 + 写回新 state
+    ///
+    /// 配合下方 CodingKeys,默认行为已经满足:
+    /// Swift 的 Optional + JSONEncoder 默认 strategy 是"nil 字段不编码",
+    /// 所以老路径(threadID = nil)发出的 JSON 完全等价于之前的版本,后端零感知。
+    let threadID: String?
+
     /// Swift 通常用驼峰命名 systemPrompt；
     /// 后端现在用下划线命名 system_prompt。
     /// CodingKeys 用来告诉 JSONEncoder：
@@ -557,6 +586,7 @@ private struct ChatRequestBody: Encodable {//- Encodable ≈ Moshi/Gson 的 @Ser
         case message
         case systemPrompt = "system_prompt"
         case history
+        case threadID = "thread_id"
     }
 }
 

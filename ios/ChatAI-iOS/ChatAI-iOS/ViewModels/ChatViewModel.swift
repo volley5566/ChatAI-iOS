@@ -213,7 +213,9 @@ final class ChatViewModel: ObservableObject {
             let stream = try chatAPI.sendAgentStreamingMessage(//调网络层拿流式接口 AsyncThrowingStream类似 Kotlin 的 Flow<T>
                 messageText,
                 systemPrompt: AppConfig.defaultSystemPrompt,
-                history: history
+                history: history,
+                // Phase 5.5.3 占位:5.5.5 会引入 currentThreadID 状态,把这里替换成真实的对话 id。
+                threadID: nil
             )
 
             // 先追加一条空的 AI 消息，给后续 delta 一个固定容器。

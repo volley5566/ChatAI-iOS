@@ -5,7 +5,17 @@ dist
 
 # Phase 5: SQLite 数据库文件不进 git
 # (但 prisma/migrations 必须进 git,否则别人 checkout 后没法重建数据库)
+#
+# 这里覆盖 4 种 SQLite 衍生文件:
+#   - *.db          主数据库
+#   - *.db-journal  rollback journal(传统模式)
+#   - *.db-wal      Write-Ahead Log(WAL 模式,SQLite 现代默认)
+#   - *.db-shm      共享内存索引(WAL 模式配套)
+# 后两者是 LangGraph checkpointer 启用 WAL 后自动产生的,跑着就在变,
+# 跟踪它们没意义,只会让 git status 一直显示脏。
 prisma/dev.db
 prisma/dev.db-journal
 prisma/*.db
 prisma/*.db-journal
+prisma/*.db-wal
+prisma/*.db-shm

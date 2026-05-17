@@ -269,16 +269,36 @@ app.post(
       // sanitizeChatHistory() 是清洗历史消息，防止客户端乱传 system / tool 角色。
       const history = sanitizeChatHistory(body.history);
 
+      /**
+       * Phase 5.3:接收 thread_id。
+       *
+       * 处理三件事:
+       *   1. trim:防止前后空格被认成有效 id
+       *   2. 空字符串视为没传:`""` 是无意义的 id,转成 undefined
+       *   3. **不做强校验**(不要求是 UUID 格式)——
+       *      让 iOS 端 / 测试脚本灵活塞任意字符串,
+       *      只要客户端自己保证唯一性即可
+       *
+       * 如果将来要做"thread_id 必须是 UUID v4"这种校验,
+       * 可以加 zod 或正则,但学习项目目前不需要。
+       */
+      const rawThreadId = body.thread_id?.trim();
+      const threadId = rawThreadId || undefined;
+
       logAgentInfo(requestId, "request", "received", {
         /**
          * 这里不记录完整 message 内容，避免用户输入进入后端日志。
          * 只记录长度、history 数量和是否有 system prompt，足够排查上下文规模问题。
+         *
+         * threadId 是后端生成或客户端传的 trace id,不算用户内容,记进日志没问题。
+         * 没传就显示 "(none)" 一眼能看出走的是无持久化模式。
          */
         route: "/api/agent/stream",
         model,
         messageLength: message?.length || 0,
         hasSystemPrompt: Boolean(systemPrompt),
         historyCount: history.length,
+        threadId: threadId || "(none, no persistence)",
       });
 
       if (!message) {
@@ -320,6 +340,14 @@ app.post(
         message,
         systemPrompt,
         history,
+        /**
+         * Phase 5.3 新增 —— 把 threadId 透传给 runner。
+         *
+         * 路由层(agent/agentRunner.ts)会:
+         * - 如果 USE_LANGGRAPH=true:把 threadId 给 Phase 4 → 启用 checkpointer
+         * - 如果 USE_LANGGRAPH=false:Phase 3 路径会收下但忽略(故意不接持久化)
+         */
+        threadId,
         onToolEvent: (event) => {// 工具进度回调 - 工具事件发生 → 转成 SSE 发给 iOS
           if (!clientClosed) {
             writeAgentSseEvent({

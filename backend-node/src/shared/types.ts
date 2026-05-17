@@ -7,6 +7,22 @@ export type ChatRequestBody = {
   message?: string;
   system_prompt?: string;
   history?: ChatHistoryItem[];
+  /**
+   * Phase 5.3 新增:对话 ID。
+   *
+   * 用途:
+   * - 后端有这个 id 就启用 LangGraph checkpointer,从数据库读历史 + 跑完写回
+   * - 没传(undefined/缺字段)走"无持久化模式",和 Phase 4 一样靠 history 数组带历史
+   *
+   * 这样设计是为了**向后兼容**——老版本 iOS 不传 thread_id 仍能用,
+   * 新版本 iOS 传了就自动享受持久化能力。
+   *
+   * iOS 端 Step 5.5 才会改 ChatViewModel 开始管理这个字段。
+   *
+   * 命名用 snake_case 是为了和现有字段(system_prompt)风格一致——
+   * 这是 iOS → 后端的"HTTP 协议层"约定。
+   */
+  thread_id?: string;
 };
 
 export type ChatResponseBody = {

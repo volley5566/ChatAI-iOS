@@ -1,5 +1,13 @@
 import { closeMcpAgentClient } from "../mcp/mcpClient";
-import { runLangChainAgentStream } from "./agentRunner";
+/**
+ * 注意:这里 import 的是 `../agent/agentRunner`(路由层),不是
+ * `./agentRunner`(Phase 3 实现)。
+ *
+ * 路由层会根据 env `USE_LANGGRAPH` 决定走 Phase 3 createAgent 还是
+ * Phase 4 手写 StateGraph。这样这个 debug 脚本和 server.ts 行为一致,
+ * 测一次就能验证两条路径。
+ */
+import { runLangChainAgentStream } from "../agent/agentRunner";
 
 /**
  * LangChain Agent 本地调试脚本。

@@ -8,6 +8,7 @@
     "build": "tsc",
     "rag:debug": "node -r ts-node/register/transpile-only src/langchain/ragDebug.ts",
     "agent:debug": "node -r ts-node/register/transpile-only src/langchain/agentDebug.ts",
+    "prisma:debug": "node -r ts-node/register/transpile-only src/db/prismaDebug.ts",
     "mcp:dev": "node -r ts-node/register/transpile-only src/mcp/mcpServer.ts",
     "mcp:start": "node dist/mcp/mcpServer.js",
     "start": "node dist/server.js"
@@ -21,8 +22,10 @@
     "@langchain/core": "^1.1.46",
     "@langchain/deepseek": "^1.0.25",
     "@langchain/langgraph": "^1.3.0",
+    "@langchain/langgraph-checkpoint-sqlite": "^1.0.1",
     "@langchain/textsplitters": "^1.0.1",
     "@modelcontextprotocol/sdk": "^1.29.0",
+    "@prisma/client": "^6.19.3",
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
@@ -33,6 +36,7 @@
     "@types/cors": "^2.8.19",
     "@types/express": "^5.0.6",
     "@types/node": "^25.7.0",
+    "prisma": "^6.19.3",
     "ts-node": "^10.9.2",
     "ts-node-dev": "^2.0.0",
     "typescript": "^6.0.3"

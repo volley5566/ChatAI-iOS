@@ -2,3 +2,10 @@ node_modules
 dist
 .env
 .DS_Store
+
+# Phase 5: SQLite 数据库文件不进 git
+# (但 prisma/migrations 必须进 git,否则别人 checkout 后没法重建数据库)
+prisma/dev.db
+prisma/dev.db-journal
+prisma/*.db
+prisma/*.db-journal

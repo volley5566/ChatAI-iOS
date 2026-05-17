@@ -1,0 +1,72 @@
+// ============================================================
+// Prisma Schema —— Phase 5(Checkpointer 持久化)
+// ============================================================
+//
+// 这个文件是"数据库的设计图"。Prisma 通过它生成:
+//   1. SQLite 数据库(./prisma/dev.db)
+//   2. TypeScript client(node_modules/@prisma/client)
+//
+// 工作流:
+//   改这个文件 → 跑 `npx prisma migrate dev` → 数据库 + client 同步更新
+//
+// 注意:
+// LangGraph 的 SqliteSaver(checkpointer)会用**同一个 .db 文件**,
+// 但它会在运行时自己建 `checkpoints` / `writes` / `checkpoint_blobs` 这些表,
+// 不需要在这里声明。我们 Prisma 只管自己的"业务表"(threads 等)。
+
+// generator client:告诉 Prisma 要生成 JavaScript/TypeScript 客户端。
+generator client {
+  provider = "prisma-client-js"
+}
+
+// datasource db:告诉 Prisma 用什么数据库 + 怎么连。
+// 这里用 SQLite,数据库文件就是项目根目录下的 prisma/dev.db。
+//
+// DATABASE_URL 写在 .env 里(后面 5.1.4 会加)。
+// 写成环境变量的好处:
+//   - 不同环境(dev / test / prod)用不同 db,不用改代码
+//   - 不会把数据库路径硬编码到代码里
+datasource db {
+  provider = "sqlite"
+  url      = env("DATABASE_URL")
+}
+
+// ============================================================
+// 第一版业务表:Thread(对话)
+// ============================================================
+//
+// 一个 Thread 就是一段对话(类似 ChatGPT 左侧列表里的每条)。
+// 它本身不存对话消息——消息存在 LangGraph 自管的 checkpoints 表里。
+//
+// 那 Thread 表存啥?它存"对话的元信息":
+//   - id:对话的唯一标识,iOS 端用它来切换对话
+//   - title:对话标题(比如"SwiftUI @State 入门"),可为空
+//   - createdAt / updatedAt:用来排序对话列表
+//
+// 物理表名用 snake_case `threads`(SQL 惯例),
+// 通过 `@@map("threads")` 映射;Prisma TypeScript 客户端里仍然用 PascalCase Thread。
+model Thread {
+  // 主键。用 uuid() 而不是自增数字,理由:
+  //   - 暴露给 iOS / URL,uuid 不会泄露"共有多少条"信息
+  //   - 多端同步友好(uuid 全局唯一,不会冲突)
+  //   - 调试日志里 uuid 不会和别的 id 混淆
+  id String @id @default(uuid())
+
+  // 对话标题。
+  // - 可空:刚创建对话还没标题,等用户发第一条消息后由模型生成
+  // - 用 String?(末尾问号)表示可空
+  title String?
+
+  // 创建时间。
+  // @default(now()) 让数据库在插入时自动填当前时间,代码里不用手填。
+  createdAt DateTime @default(now())
+
+  // 最后更新时间。
+  // @updatedAt 是 Prisma 的特殊语法:每次 update() 时自动刷新。
+  // 我们用它实现"对话列表按最新活跃时间排序"。
+  updatedAt DateTime @updatedAt
+
+  // 物理表名:threads(默认会用 PascalCase Thread,这里手动改成 snake_case)。
+  // SQL 惯例是 snake_case + 复数,Prisma 客户端那边仍用 Thread。
+  @@map("threads")
+}

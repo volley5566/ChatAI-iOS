@@ -35,7 +35,11 @@ import Foundation
 ///
 /// iOS 不会把 ThreadSummary 编码回 JSON 发给后端(后端只接收 thread_id 字符串),
 /// 所以加 Encodable 是没必要的"未来主义"。
-struct ThreadSummary: Identifiable, Decodable, Equatable {
+/// Hashable:Phase 5.6 起需要把 ThreadSummary 推到 NavigationStack 的 path 上,
+/// SwiftUI 的 `NavigationLink(value:)` 要求 value 是 Hashable。
+/// 所有字段都已经 Hashable(String / Date / String?),Swift 编译器自动合成,
+/// 不用手写 hash(into:)。
+struct ThreadSummary: Identifiable, Decodable, Equatable, Hashable {
     /// 对话 id。也是 SwiftUI ForEach 用来识别"这是哪一行"的稳定标识。
     ///
     /// 注意类型是 String,不是 UUID——

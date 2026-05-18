@@ -7,163 +7,62 @@
 
 import SwiftUI
 
+/// Phase 5.6 — App 根视图。
+///
+/// ─────────────────────────────────────────────────────────────────────
+/// 5.5 之前,ContentView 既是入口又是聊天 UI——单页 App 很正常。
+/// 5.6 引入对话列表后,ContentView 退化成"纯导航容器":
+///
+///   - 根视图:ThreadListView(对话列表)
+///   - .navigationDestination(for: ThreadSummary.self):
+///       列表里点击某行,推一个 ChatView 显示那段对话
+///
+/// 聊天 UI 本身搬到了 Views/ChatView.swift。
+///
+/// "+ 新建对话" 按钮(5.6.5 加)会通过另一个 navigationDestination 推一个
+/// 新对话用的 ChatView(threadID: nil)。
+/// ─────────────────────────────────────────────────────────────────────
 struct ContentView: View {
-    /// @StateObject 表示：
-    /// 这个页面创建并持有 ChatViewModel。
-    ///
-    /// SwiftUI 页面会因为状态变化反复刷新 body，
-    /// 但 @StateObject 可以保证 ViewModel 不会被重复创建。
-    @StateObject private var viewModel = ChatViewModel()
-
     var body: some View {
-        // 提供页面导航能力。
+        // NavigationStack 是 iOS 16+ 的现代导航容器,
+        // 配合 .navigationDestination(for:) 实现"基于值的导航"——
+        // 列表行不需要在编译期就知道目标 View 长啥样,只要 NavigationLink(value:) 推一个值,
+        // navigationDestination 集中处理"值 → View"的映射。
+        //
+        // 这种模式的好处:
+        //   - 导航逻辑集中在一处,而不是散落在每个列表行
+        //   - 可以用 NavigationPath(@State 持有)做编程式导航 / deep link
         NavigationStack {
-            // 垂直排列。
-            VStack(spacing: 0) {
-                // 聊天列表。
-                messageList
-
-                // 错误提示，可有可无。
-                // 如果 viewModel.errorMessage 有值，就取出来叫 errorMessage，
-                // 然后显示错误条。
-                if let errorMessage = viewModel.errorMessage {
-                    errorBanner(errorMessage)
+            ThreadListView()
+                // 列表点击 → 推 ChatView 显示那段对话。
+                // ThreadSummary 已经在 Models/ThreadSummary.swift 标了 Hashable,
+                // 满足 NavigationLink(value:) 的类型要求。
+                .navigationDestination(for: ThreadSummary.self) { thread in
+                    ChatView(threadID: thread.id)
                 }
-
-                // 底部输入框。
-                ChatInputBar(
-                    // inputText：当前输入的文字。
-                    // 重点：这里的 $ 表示双向绑定 Binding，会直接更新 viewModel.inputText。
-                    inputText: $viewModel.inputText,
-                    // isSending：是否正在发送。
-                    isSending: viewModel.isSending,
-                    // canSend：是否允许点击发送。
-                    canSend: viewModel.canSendMessage,
-                    // onSend：点击发送时执行什么逻辑。
-                    onSend: sendMessage
-                )
-            }
-            // 提供标题栏。
-            .navigationTitle("AI Chat")
-            .toolbar {
-                ToolbarItem(placement: .topBarTrailing) {
-                    Button("清空") {
-                        viewModel.resetConversation()
-                    }
-                    .disabled(viewModel.isSending)
+                // toolbar "+" 按钮 → 推一个空的 ChatView 开始新对话。
+                //
+                // 为什么用 sentinel 类型(NewConversation)而不是 String/Optional?
+                //   - navigationDestination 按 Swift 类型分发,String 已经被其他模式占用,
+                //     Optional<String> 又不能直接 Hashable
+                //   - 专门定义一个零字段 struct,语义清晰("我要推一个新对话页"),
+                //     未来扩展(比如带初始 prompt)也只用扩这个 struct
+                .navigationDestination(for: NewConversation.self) { _ in
+                    ChatView(threadID: nil)
                 }
-            }
-        }
-    }
-
-    /// 聊天消息列表。
-    ///
-    /// ScrollViewReader 可以让我们拿到滚动控制器 proxy。
-    /// 每次 messages 数组变化时，自动滚动到最后一条消息。
-    private var messageList: some View {
-        // ScrollViewReader：让我可以控制滚动位置。
-        ScrollViewReader { proxy in
-            // 可以上下滚动。
-            ScrollView {
-                // LazyVStack 懒加载垂直列表。
-                LazyVStack(spacing: 12) {
-                    // 遍历 messages 数组。
-                    // viewModel.messages 是真正的数据源。
-                    ForEach(viewModel.messages) { message in
-                        // MessageBubbleView 每条消息显示成一个气泡。
-                        MessageBubbleView(message: message)
-                            .id(message.id)
-                    }
-
-                    // isSending 时显示“AI 正在回复...”。
-                    if viewModel.isSending {
-                        HStack {
-                            // iOS 自带的 loading 圈。
-                            ProgressView()
-                            Text("AI 正在回复...")
-                                .font(.footnote)
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                        }
-                        .padding(.horizontal)
-                    }
-                }
-                .padding()
-            }
-            .background(Color(.systemBackground))
-            // 自动滚动到底部：
-            // 用户发了一条消息
-            //   ↓
-            // messages 增加一条
-            //   ↓
-            // 触发 onChange
-            //   ↓
-            // 自动滚动到底部。
-            .onChange(of: viewModel.messages) { _, messages in
-                // 这个函数负责真正滚动。
-                scrollToBottom(messages: messages, proxy: proxy)
-            }
-        }
-    }
-
-    /// 错误提示条。
-    /// 比如后端没启动、网络断开、接口返回 500 时会显示。
-    private func errorBanner(_ message: String) -> some View {
-        HStack(spacing: 8) {
-            Image(systemName: "exclamationmark.triangle.fill")
-                .foregroundStyle(.red)
-
-            Text(message)
-                .font(.footnote)
-                .foregroundStyle(.primary)
-                .frame(maxWidth: .infinity, alignment: .leading)
-        }
-        .padding(.horizontal)
-        .padding(.vertical, 8)
-        .background(Color.red.opacity(0.12))
-    }
-
-    /// 把“发送消息”包成一个小函数，方便按钮和键盘 return 共用。
-    private func sendMessage() {
-        // 创建一个异步 Task。
-        Task {
-            // ViewModel 去处理真正的发送逻辑。
-            await viewModel.sendMessage()
-        }
-    }
-
-    /// 滚动到最后一条消息。
-    private func scrollToBottom(
-        messages: [ChatMessage],
-        proxy: ScrollViewProxy
-    ) {
-        // 先拿到最后一条消息。如果没有消息，直接 return。
-        //
-        // guard 可以理解成 Swift 里的提前检查，不满足条件就直接退出。
-        // 尝试从 messages 数组里取最后一条消息。
-        //
-        // 如果能取到：
-        //     把它命名为 lastMessage，然后继续往下执行。
-        //
-        // 如果取不到：
-        //     说明 messages 是空数组，直接 return，函数结束。
-        //
-        // Kotlin 类似：
-        // val lastMessage = messages.lastOrNull() ?: return
-        guard let lastMessage = messages.last else {
-            return
-        }
-
-        // 如果有消息，就带动画滚动到最后一条。
-        withAnimation(.easeOut(duration: 0.2)) {
-            // ScrollViewReader：包住 ScrollView，让它变成“可被代码控制滚动”的 ScrollView。
-            // ScrollViewProxy：ScrollView 的控制器，负责执行 scrollTo。
-            // .id(...)：给要滚动到的目标 View 打标签。
-            // proxy.scrollTo(...)：根据标签找到对应 View，然后滚过去。
-            proxy.scrollTo(lastMessage.id, anchor: .bottom)
         }
     }
 }
+
+/// 用于"新建对话"导航的 sentinel 类型。
+///
+/// 它本身不携带任何数据,作用只是给 NavigationLink(value:) 一个"独特类型"
+/// 来匹配上面那条 .navigationDestination(for: NewConversation.self)。
+///
+/// Hashable 是 NavigationLink(value:) 的硬性要求(StackPath 内部用 hash 去重)。
+/// 零字段 struct 的 Hashable 由 Swift 自动合成,所有实例 hash 都一样,
+/// 这正是我们想要的——"新对话"这个意图不需要区分实例。
+struct NewConversation: Hashable {}
 
 #if DEBUG
 struct ContentView_Previews: PreviewProvider {

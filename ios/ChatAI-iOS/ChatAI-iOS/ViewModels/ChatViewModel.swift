@@ -40,12 +40,12 @@ final class ChatViewModel: ObservableObject {
 
     /// 聊天消息列表。页面会根据它自动刷新。
     /// @Published：这个变量一变化，就通知 SwiftUI 页面刷新。
-    @Published var messages: [ChatMessage] = [
-        ChatMessage(
-            role: .assistant,
-            content: "你好，我是你的 AI 助手。你可以问我 SwiftUI、iOS 或 AI 应用开发相关的问题。"
-        )
-    ]
+    ///
+    /// Phase 5.6:不再在属性初始化时就放欢迎语——因为这个 ViewModel
+    /// 既可能给"新对话"用(此时该有欢迎语),也可能给"加载已有对话"用
+    /// (此时不该有欢迎语,直接展示后端拉回来的历史)。
+    /// 欢迎语放到 init 里**按场景**决定塞不塞。
+    @Published var messages: [ChatMessage] = []
 
     /// 输入框当前文字。
     /// @Published：这个变量一变化，就通知 SwiftUI 页面刷新。
@@ -66,6 +66,14 @@ final class ChatViewModel: ObservableObject {
     /// @Published：这个变量一变化，就通知 SwiftUI 页面刷新。
     @Published var isSending = false
 
+    /// Phase 5.6 — 是否正在从后端拉历史消息。
+    ///
+    /// 和 isSending 分开,因为这是两种不同的"忙":
+    ///   - isLoadingHistory:打开已有对话时,从 GET /api/threads/:id/messages 拉历史
+    ///   - isSending:已经在对话里,POST /api/agent/stream 等 AI 回答
+    /// UI 可以分别给出不同的 loading 视觉(整页 spinner vs 输入条 disabled)。
+    @Published var isLoadingHistory = false
+
     /// 当前错误提示。
     /// 有值时，页面会显示一条红色提示。
     /// @Published：这个变量一变化，就通知 SwiftUI 页面刷新。
@@ -84,14 +92,40 @@ final class ChatViewModel: ObservableObject {
     // Node.js 后端 / AI 接口
     private let chatAPI: ChatAPI
 
+    /// Phase 5.6 — 初始化。
+    ///
+    /// 两个场景:
+    ///   - 新对话:`ChatViewModel()` → threadID = nil → 放欢迎语,等用户发第一条消息时 createThread
+    ///   - 加载已有对话:`ChatViewModel(threadID: "xxx")` → 不放欢迎语,等 View 在 .task 里调 loadThread() 填回历史
+    ///
+    /// 关键设计:**init 里收到 threadID 也不直接写 currentThreadID**——
+    /// 那个字段只在 loadThread() 加载成功后才被设上。理由:
+    ///   如果 loadThread 网络失败、但 currentThreadID 已被设,sendMessage 会
+    ///   把新消息追加到一个"我们并不知道历史长啥样的 thread"上,后端 checkpointer
+    ///   会接上,但 iOS 端用户看不到前情,体验是错乱的。
+    /// 让 currentThreadID 的写入和"历史成功加载"绑在一起,保证 invariant。
+    ///
     /// 如果外部传了 chatAPI，就用外部传进来的。
     /// 如果外部没传，就默认用 ChatAPIClient()。
-    init(chatAPI: ChatAPI? = nil) {
+    init(threadID: String? = nil, chatAPI: ChatAPI? = nil) {
         // 这里不直接把 ChatAPIClient() 写在参数默认值里，
         // 是为了避开 Swift 并发隔离下的一个默认参数警告。
         // 简单理解：默认参数会在 init 外面先计算；
         // 写在 init 里面更符合这个 ViewModel 的主线程上下文。
         self.chatAPI = chatAPI ?? ChatAPIClient()
+
+        if threadID == nil {
+            // 新对话场景:放一条欢迎语作为开场白。
+            messages = [
+                ChatMessage(
+                    role: .assistant,
+                    content: "你好，我是你的 AI 助手。你可以问我 SwiftUI、iOS 或 AI 应用开发相关的问题。"
+                )
+            ]
+        }
+        // 有 threadID 时 messages 保持空,等 ChatView 在 .task 里调
+        // loadThread() 填回历史。期间 isLoadingHistory = true,UI 显示 loading
+        // 而不是闪一下欢迎语再被替换掉。
     }
 
     /// 发送按钮是否可以点击。
@@ -313,6 +347,54 @@ final class ChatViewModel: ObservableObject {
             }
 
             // 出错时不崩溃，而是把错误显示在页面上。
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    /// Phase 5.6 — 从后端加载已有对话的历史消息并显示。
+    ///
+    /// 调用时机:ChatView 在 `.task` 里调,带着对话列表页传进来的 threadID。
+    ///
+    /// 完整流程:
+    ///   1. isLoadingHistory = true,errorMessage 清空
+    ///   2. GET /api/threads/:id/messages
+    ///   3. ThreadMessage[] → ChatMessage[](过滤掉未知 role,只保留 user / assistant)
+    ///   4. 替换 messages 数组(覆盖,不追加)
+    ///   5. 加载成功才把 currentThreadID 设上——保证 invariant:
+    ///      "currentThreadID 非 nil ⇒ iOS 端有完整历史"
+    ///   6. defer 兜底设 isLoadingHistory = false
+    ///
+    /// 失败处理:errorMessage 显示后端/网络错误,currentThreadID 保持 nil,
+    /// messages 保持空(由 UI 自己决定要不要显示"加载失败,点这里重试")。
+    /// 这种状态下用户**不能继续发消息**——sendMessage 会以为是新对话,createThread
+    /// 创建一个新的——这是合理的兜底,虽然用户会觉得"我点的是 A 对话怎么变成新对话了",
+    /// 但比"继续追加到一个不知道历史的 thread"要好。
+    func loadThread(threadID: String) async {
+        isLoadingHistory = true
+        errorMessage = nil
+
+        // defer 保证不管成功/失败/抛错,都会把 loading 状态恢复。
+        // 不用每个分支手动 set,避免"漏掉某个 return 路径"的低级 bug。
+        defer { isLoadingHistory = false }
+
+        do {
+            let threadMessages = try await chatAPI.getThreadMessages(threadID: threadID)
+
+            // compactMap:过滤 + 转换二合一。
+            // ThreadMessage.role 是 String("user" / "assistant"),
+            // 用 ChatMessageRole(rawValue:) 解析——后端理论上只发这两个值,
+            // 但万一未来后端扩展了 role(system / tool),iOS 老版本拿到不认识的 role
+            // 应该静默丢弃,而不是崩溃或显示乱码。
+            messages = threadMessages.compactMap { threadMessage in
+                guard let role = ChatMessageRole(rawValue: threadMessage.role) else {
+                    return nil
+                }
+                return ChatMessage(role: role, content: threadMessage.content)
+            }
+
+            // 只有加载成功才设 currentThreadID。见 init 注释里说的 invariant。
+            currentThreadID = threadID
+        } catch {
             errorMessage = error.localizedDescription
         }
     }

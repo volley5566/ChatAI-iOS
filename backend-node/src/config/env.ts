@@ -132,9 +132,20 @@ export const chatModelHttpMaxRetries = readIntegerEnv(
   2,
   0
 );
+/**
+ * 单个工具最长执行时间。
+ *
+ * Phase 1-6 时 8 秒足够——所有工具都是本地纯计算(向量检索 / 模板拼接)。
+ * Phase 7 引入 "LLM-as-tool" 模式后,evaluateAnswer / recommendNextTopic /
+ * generateQuiz 都会在工具内部再发一次 DeepSeek 请求,单次 API 延迟在
+ * 2-10 秒波动,8 秒会偶发超时。
+ *
+ * 现在默认改成 20 秒——既能容忍 DeepSeek 偶尔慢响应,又不会让卡死的工具
+ * 拖死整个 Agent 请求。
+ */
 export const toolExecutionTimeoutMs = readIntegerEnv(
   "TOOL_EXECUTION_TIMEOUT_MS",
-  8000,
+  20000,
   1000
 );
 

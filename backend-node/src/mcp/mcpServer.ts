@@ -2,7 +2,9 @@ import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import * as z from "zod/v4";
 import {
+  runEvaluateAnswerTool,
   runGenerateQuizTool,
+  runRecommendNextTopicTool,
   runSearchKnowledgeTool,
 } from "./mcpToolHandlers";
 
@@ -111,7 +113,7 @@ mcpServer.registerTool(
   {
     title: "生成练习题",
     description:
-      "Generate beginner-friendly practice questions for a learning topic. Use this for exercises, quizzes, review, or testing understanding.",
+      "Generate practice questions for a learning topic. Each question comes with expectedConcepts (used internally by evaluateAnswer for accurate grading) and a difficulty label. Use this for exercises, quizzes, review, or testing understanding.",
     inputSchema: {
       topic: z
         .string()
@@ -129,11 +131,15 @@ mcpServer.registerTool(
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
-      idempotentHint: true,
+      /**
+       * Phase 7.3 升级后 generateQuiz 也内部调 LLM,所以从 idempotent 改成 false。
+       * 同样的 topic 两次调用,模型出题会略有不同,这是预期行为。
+       */
+      idempotentHint: false,
     },
   },
   async ({ topic, count }) => {
-    const toolResult = runGenerateQuizTool({ topic, count });
+    const toolResult = await runGenerateQuizTool({ topic, count });
 
     return {
       content: [
@@ -146,6 +152,166 @@ mcpServer.registerTool(
         toolName: toolResult.toolName,
         ok: toolResult.ok,
         result: toolResult.result,
+      },
+    };
+  }
+);
+
+/**
+ * evaluateAnswer — Phase 7.1 新增的批改工具。
+ *
+ * 它和 searchKnowledge / generateQuiz 都是只读工具(不改任何持久状态),
+ * 但有一个本质区别:**工具内部会再发一次 LLM 请求**。
+ *
+ * 这就是 "LLM-as-judge" 模式——把"主观评判"封装成工具,
+ * 让 Agent 调用,而不是让 Agent 自己用 chat 的方式做评判。
+ *
+ * 好处:
+ * - 评分语境隔离:Agent 的对话语气不会污染评分逻辑
+ * - 输出结构稳定:工具内部用严格 rubric prompt 强制 JSON
+ * - iOS 可以专门做"批改卡片"UI,而不是混在对话气泡里
+ */
+mcpServer.registerTool(
+  "evaluateAnswer",
+  {
+    title: "批改答题",
+    description:
+      "Grade a student's answer to a learning question. Use this after the student provides an answer to a quiz question or any question that requires evaluation. Returns score (0-3), strengths, weaknesses, and a suggested answer.",
+    inputSchema: {
+      question: z
+        .string()
+        .trim()
+        .min(1)
+        .describe("The original question being answered."),
+      userAnswer: z
+        .string()
+        .trim()
+        .min(1)
+        .describe("The student's answer to evaluate."),
+      topic: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe(
+          "Optional topic context, for example 'SwiftUI @State'. Helps the grader stay on-topic."
+        ),
+      expectedConcepts: z
+        .array(z.string().trim().min(1))
+        .max(6)
+        .optional()
+        .describe(
+          "Optional list of key concepts the answer should cover. If provided (typically from generateQuiz output), grading will check these explicitly."
+        ),
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      /**
+       * 注意:这里 idempotentHint = false。
+       * 因为内部调用 LLM,同样输入两次,模型回答可能略有差异(温度 > 0)。
+       * 这个标记是给 MCP 客户端的"语义提示",对 Agent 行为没影响,
+       * 但写对它是 MCP 协议素养的一部分。
+       */
+      idempotentHint: false,
+    },
+  },
+  async ({ question, userAnswer, topic, expectedConcepts }) => {
+    const toolResult = await runEvaluateAnswerTool({
+      question,
+      userAnswer,
+      topic,
+      expectedConcepts,
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(toolResult.result ?? { error: toolResult.error }, null, 2),
+        },
+      ],
+      structuredContent: {
+        toolName: toolResult.toolName,
+        ok: toolResult.ok,
+        result: toolResult.result,
+        error: toolResult.error,
+      },
+    };
+  }
+);
+
+/**
+ * recommendNextTopic — Phase 7.2 新增的学习规划工具。
+ *
+ * 它和 evaluateAnswer 都是"工具内部调 LLM"的模式,
+ * 但用途完全不同——一个是"做裁判",一个是"做规划"。
+ *
+ * 关键设计:
+ * - 这个工具会自己读知识库目录(loadKnowledgeDocuments),
+ *   作为推荐范围。模型不能瞎编"建议学习 X",X 必须在知识库里存在,
+ *   或者明确标记为"超出知识库的下一步"。
+ * - Agent 必须从对话历史里提取 recentTopics 传进来。
+ *   这种"工具不去窥探外部状态,只接受显式参数"的设计,
+ *   能让工具被测试、被复用,也避免和 LangGraph thread state 强耦合。
+ */
+mcpServer.registerTool(
+  "recommendNextTopic",
+  {
+    title: "推荐下一个学习方向",
+    description:
+      "Recommend the next topics for the student to learn based on what they have already covered. Use this when the user asks 'what should I learn next', '下一步学什么', '推荐一下', or after they've successfully understood a topic and is ready to move on. The agent must extract recentTopics from conversation history.",
+    inputSchema: {
+      recentTopics: z
+        .array(z.string().trim().min(1))
+        .max(20)
+        .describe(
+          "Topics the student has already learned or discussed. Extract these from recent conversation. Can be an empty array if the user is just starting."
+        ),
+      focusArea: z
+        .string()
+        .trim()
+        .min(1)
+        .optional()
+        .describe(
+          "Optional focus area like 'SwiftUI', 'LangGraph', 'RAG'. Helps narrow the recommendation. If not provided, the tool will infer from recentTopics."
+        ),
+      count: z
+        .number()
+        .int()
+        .min(1)
+        .max(5)
+        .optional()
+        .describe("How many recommendations to return. Defaults to 3."),
+    },
+    annotations: {
+      readOnlyHint: true,
+      destructiveHint: false,
+      /**
+       * 同样标 idempotentHint=false——内部 LLM 调用,温度 > 0 时输出会有微抖动。
+       */
+      idempotentHint: false,
+    },
+  },
+  async ({ recentTopics, focusArea, count }) => {
+    const toolResult = await runRecommendNextTopicTool({
+      recentTopics,
+      focusArea,
+      count: count ?? 3,
+    });
+
+    return {
+      content: [
+        {
+          type: "text",
+          text: JSON.stringify(toolResult.result ?? { error: toolResult.error }, null, 2),
+        },
+      ],
+      structuredContent: {
+        toolName: toolResult.toolName,
+        ok: toolResult.ok,
+        result: toolResult.result,
+        error: toolResult.error,
       },
     };
   }

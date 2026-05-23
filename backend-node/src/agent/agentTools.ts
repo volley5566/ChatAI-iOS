@@ -26,6 +26,10 @@ function getAgentToolDisplayName(toolName: string): string {
       return "查询知识库";
     case "generateQuiz":
       return "生成练习题";
+    case "evaluateAnswer":
+      return "批改答题";
+    case "recommendNextTopic":
+      return "推荐学习方向";
     default:
       return "执行工具";
   }
@@ -53,6 +57,7 @@ function getToolResultCount(result: AgentToolExecutionResult): number | undefine
 
   const matches = result.result.matches;
   const questions = result.result.questions;
+  const recommendations = result.result.recommendations;
 
   if (Array.isArray(matches)) {
     return matches.length;
@@ -60,6 +65,10 @@ function getToolResultCount(result: AgentToolExecutionResult): number | undefine
 
   if (Array.isArray(questions)) {
     return questions.length;
+  }
+
+  if (Array.isArray(recommendations)) {
+    return recommendations.length;
   }
 
   return undefined;
@@ -90,6 +99,28 @@ function buildToolDoneMessage(result: AgentToolExecutionResult): string {
     return typeof resultCount === "number"
       ? `已生成 ${resultCount} 道练习题`
       : "已生成练习题";
+  }
+
+  if (result.toolName === "recommendNextTopic") {
+    return typeof resultCount === "number"
+      ? `已生成 ${resultCount} 个学习建议`
+      : "已生成学习建议";
+  }
+
+  if (result.toolName === "evaluateAnswer") {
+    /**
+     * 批改完直接把评分 + label 显示出来。
+     * iOS 端拿到 tool_done.message 就能在卡片标题里直接展示 "良好 (2/3)"。
+     */
+    if (isObjectRecord(result.result)) {
+      const score = result.result.score;
+      const scoreLabel = result.result.scoreLabel;
+
+      if (typeof score === "number" && typeof scoreLabel === "string") {
+        return `已批改:${scoreLabel} (${score}/3)`;
+      }
+    }
+    return "已批改答题";
   }
 
   return `${displayName}完成`;

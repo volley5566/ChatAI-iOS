@@ -1,3 +1,4 @@
+import path from "path";
 import { Document } from "@langchain/core/documents";
 import { MemoryVectorStore } from "@langchain/classic/vectorstores/memory";
 import { RecursiveCharacterTextSplitter } from "@langchain/textsplitters";
@@ -8,11 +9,28 @@ import {
   ragTopK,
 } from "../config/env";
 import type { KnowledgeChunk, ScoredKnowledgeChunk } from "../shared/types";
-import { createLangChainEmbeddings } from "./embeddings";
+import {
+  createLangChainEmbeddings,
+  getEmbeddingsIdentity,
+} from "./embeddings";
 import {
   loadKnowledgeDocuments,
   type KnowledgeDocumentMetadata,
 } from "./documentLoader";
+import {
+  computeFingerprint,
+  loadCache,
+  saveCache,
+  type CacheEntry,
+} from "./ragCache";
+
+/**
+ * Phase 6.4 — 向量缓存文件路径。
+ *
+ * 放在 backend-node/.rag-cache/ 下,和 prisma/ 同级。
+ * 已在 .gitignore 排除。
+ */
+const ragCachePath = path.resolve(__dirname, "../../.rag-cache/vectors.json");
 
 type IndexedKnowledgeMetadata = KnowledgeDocumentMetadata & {
   chunkId: string;
@@ -108,7 +126,7 @@ async function buildLangChainRagIndex(): Promise<LangChainRagIndex> {
    * - 段落
    * - 最后才按字符兜底
    *
-   * 这比“每 N 个字符切一刀”更适合学习文档。
+   * 这比"每 N 个字符切一刀"更适合学习文档。
    */
   const splitter = RecursiveCharacterTextSplitter.fromLanguage("markdown", {
     chunkSize: ragChunkSize,
@@ -118,12 +136,111 @@ async function buildLangChainRagIndex(): Promise<LangChainRagIndex> {
   const splitDocuments = await splitter.splitDocuments(documents);
   const indexedDocuments = addChunkMetadata(splitDocuments);
   const embeddings = createLangChainEmbeddings();
-  const vectorStore = await MemoryVectorStore.fromDocuments(indexedDocuments, embeddings);
+  const embeddingIdentity = getEmbeddingsIdentity();
+
+  /**
+   * Phase 6.4 — 先算指纹试缓存。
+   *
+   * 指纹覆盖:
+   *   - embedding 标识(切模型必须重建)
+   *   - chunk 切分参数(切得不一样,向量对不上)
+   *   - 每个 chunk 的 fileName + 实际文本内容
+   *
+   * 注意用的是切完后的 indexedDocuments,不是原始文档。
+   * 因为 splitter 自己也可能升级算法,直接对最终 chunk 内容做 hash
+   * 才能完整描述"这些向量代表什么"。
+   */
+  const fingerprint = computeFingerprint({
+    embeddingIdentity,
+    chunkSize: ragChunkSize,
+    chunkOverlap: ragChunkOverlap,
+    documents: indexedDocuments.map((document) => ({
+      fileName: document.metadata.fileName,
+      content: document.pageContent,
+    })),
+  });
+
+  const cachedEntries = await loadCache(ragCachePath, fingerprint);
+
+  let vectorStore: MemoryVectorStore;
+  let buildSource: "cache" | "fresh";
+
+  if (cachedEntries) {
+    /**
+     * 缓存命中:跳过 embedding,直接把(向量, 文档)塞给空 store。
+     *
+     * MemoryVectorStore 的 addVectors API 就是干这个的——
+     * 接受预计算的向量数组,不会回头去 embed 一遍。
+     * 查询时的 embedQuery 还是会照常调 Ollama(这部分必须实时算)。
+     */
+    vectorStore = new MemoryVectorStore(embeddings);
+    await vectorStore.addVectors(
+      cachedEntries.map((entry) => entry.vector),
+      cachedEntries.map(
+        (entry) =>
+          new Document({
+            pageContent: entry.pageContent,
+            metadata: entry.metadata,
+          })
+      )
+    );
+    buildSource = "cache";
+  } else {
+    /**
+     * 缓存未命中:正常构建,再把(向量, 文档)写回磁盘。
+     *
+     * MemoryVectorStore.fromDocuments 内部会调 embeddings.embedDocuments,
+     * 30-50 个 chunk × Ollama ~50ms ≈ 2-5 秒。这就是我们要缓存掉的开销。
+     */
+    vectorStore = await MemoryVectorStore.fromDocuments(
+      indexedDocuments,
+      embeddings
+    );
+    buildSource = "fresh";
+
+    /**
+     * 从 vectorStore 内部把"已嵌入向量"挖出来写缓存。
+     *
+     * memoryVectors 是 LangChain 暴露的实现细节。这里直接读取,
+     * 是因为它是当前最稳定的"拿到 chunk 对应向量"的途径——
+     * 也可以分两步(先 embedDocuments 再 addVectors),但那样要重复管理一份。
+     */
+    const entriesToCache: CacheEntry[] = vectorStore.memoryVectors.map(
+      (vector) => ({
+        vector: vector.embedding,
+        pageContent: vector.content,
+        metadata: vector.metadata,
+      })
+    );
+
+    const dimensions = entriesToCache[0]?.vector.length ?? 0;
+
+    /**
+     * 写缓存放在 try 外面是故意的——
+     * 即便写盘失败(权限/磁盘满),内存里 vectorStore 已经构建好了,
+     * 业务请求仍能正常服务,下次重启再试着写就行。
+     */
+    try {
+      await saveCache(ragCachePath, {
+        fingerprint,
+        createdAt: new Date().toISOString(),
+        embeddingIdentity,
+        dimensions,
+        entryCount: entriesToCache.length,
+        chunkSize: ragChunkSize,
+        chunkOverlap: ragChunkOverlap,
+        entries: entriesToCache,
+      });
+    } catch (error) {
+      console.error("[RAG cache] save failed (non-fatal):", error);
+    }
+  }
 
   console.error(
-    `[LangChain RAG] Loaded ${documents.length} documents, ` +
+    `[LangChain RAG] (${buildSource}) Loaded ${documents.length} documents, ` +
       `${indexedDocuments.length} chunks, topK=${ragTopK}, ` +
-      `chunkSize=${ragChunkSize}, chunkOverlap=${ragChunkOverlap}.`
+      `chunkSize=${ragChunkSize}, chunkOverlap=${ragChunkOverlap}, ` +
+      `embedding=${embeddingIdentity}.`
   );
 
   return {

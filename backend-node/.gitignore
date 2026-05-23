@@ -19,3 +19,7 @@ prisma/*.db
 prisma/*.db-journal
 prisma/*.db-wal
 prisma/*.db-shm
+
+# Phase 6.4: RAG 向量缓存目录(根据知识库 + embedding 模型自动重建)
+# 不进 git——内容由源文件确定,跟踪反而冗余,而且会让任何机器都拖个几百 KB 二进制 JSON
+.rag-cache/

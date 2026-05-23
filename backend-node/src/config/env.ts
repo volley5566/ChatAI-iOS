@@ -20,8 +20,48 @@ export const deepseekApiKey = process.env.DEEPSEEK_API_KEY;
 export const deepseekBaseURL =
   process.env.DEEPSEEK_BASE_URL || "https://api.deepseek.com";
 export const model = process.env.DEEPSEEK_MODEL || "deepseek-v4-flash";
+/**
+ * Phase 6 — Embedding 提供方切换。
+ *
+ * 支持的值:
+ * - "local-keyword" / "local": 老的 hash 伪向量(Phase 1-5 的兜底),不需要任何外部依赖
+ * - "ollama": Phase 6 默认,走本地 Ollama 服务跑真正的语义 embedding 模型
+ *
+ * 工厂函数(embeddings.ts)根据这个值选择具体实现,
+ * 上层 retriever / agent / iOS 完全感知不到底层切换。
+ *
+ * 默认设成 "ollama" 是因为 Phase 6 之后这是主推路径——
+ * 没装 Ollama 的人会立刻看到明确报错,而不是"为什么 RAG 这么蠢"。
+ */
 export const embeddingsProvider =
-  process.env.EMBEDDINGS_PROVIDER || "local-keyword";
+  process.env.EMBEDDINGS_PROVIDER || "ollama";
+
+/**
+ * Ollama 本地服务的地址。
+ *
+ * Ollama 默认监听 127.0.0.1:11434。
+ * 这里做成 env 配置,是为了:
+ * - 将来你想把 Ollama 跑在另一台机器上(比如远程 GPU 服务器)只改 .env
+ * - 测试环境可以指向不同端口
+ */
+export const ollamaBaseUrl =
+  process.env.OLLAMA_BASE_URL || "http://localhost:11434";
+
+/**
+ * Ollama 用于 embedding 的模型名。
+ *
+ * 默认 "nomic-embed-text":
+ * - 768 维真实语义向量
+ * - 中英文都支持(知识库里中英文混排)
+ * - 274 MB 模型大小,M 系列 Mac 跑起来很轻
+ *
+ * 想试其他模型:
+ *   ollama pull mxbai-embed-large    (1024 维,质量更高,体积也大)
+ *   ollama pull bge-m3               (1024 维,多语言更强,体积更大)
+ * 然后在 .env 改 OLLAMA_EMBEDDING_MODEL 即可。
+ */
+export const ollamaEmbeddingModel =
+  process.env.OLLAMA_EMBEDDING_MODEL || "nomic-embed-text";
 
 /**
  * LangChain RAG 配置。

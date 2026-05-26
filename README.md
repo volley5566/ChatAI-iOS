@@ -1,55 +1,117 @@
 # AI iOS Chat Demo
+
 <img width="200" height="400" alt="Simulator Screenshot - iPhone 17 Pro - 2026-05-13 at 19 03 58" src="https://github.com/user-attachments/assets/fb134342-727b-42dc-aaa7-428864719177" />
 <img width="200" height="400" alt="Simulator Screenshot - iPhone 17 Pro - 2026-05-13 at 19 03 52" src="https://github.com/user-attachments/assets/095d8ead-6e9e-4186-ae92-8bc76dcc5e51" />
 
+一个用于学习的 AI 聊天 Demo，从最朴素的"模型直答"一路演进到"带工具、带 RAG、带持久化、带 LangGraph 状态机"的完整 Agent 系统。
 
+- `ios/ChatAI-iOS`：SwiftUI iOS App（带对话列表、流式气泡、工具进度展示）
+- `backend-node`：Node.js + Express + LangChain + LangGraph + MCP 后端
 
-一个用于学习的 AI 聊天 Demo，包含：
-
-- `ios/ChatAI-iOS`：SwiftUI iOS App
-- `backend-node`：Node.js + Express 后端
-
-调用流程：
+当前默认调用流程：
 
 ```text
-iOS SwiftUI
-  -> Node.js /api/agent/stream
-  -> LangChain createAgent
-  -> LangChain Tools
-  -> MCP Client
-  -> MCP Server / Tools
-  -> ChatDeepSeek / DeepSeek API
-  -> Node.js 通过 SSE 返回最终文本片段
+iOS SwiftUI（对话列表 + 聊天页）
+  -> POST /api/agent/stream (带 thread_id)
+  -> Node.js Express 路由
+  -> Phase 4 LangGraph StateGraph（或 Phase 3 createAgent，灰度切换）
+  -> agentNode → toolNode → agentNode（ReAct 循环）
+  -> LangChain Tools（从 MCP 动态加载）
+  -> MCP Client → MCP Server 子进程（stdio JSON-RPC）
+  -> 真实工具（searchKnowledge / generateQuiz / evaluateAnswer / recommendNextTopic）
+  -> ChatDeepSeek
+  -> SqliteCheckpointer 自动存档 state
+  -> Node.js 通过 SSE 返回工具事件 + 最终文本片段
   -> iOS 实时更新同一条 AI 消息气泡
 ```
 
-项目里也保留了普通流式接口 `/api/chat/stream`
-和非流式结构化接口 `/api/chat`，
-方便后续继续做接口对比测试或“最终结构化卡片”升级。
+项目里也保留了：
+
+- `/api/chat/stream`：普通流式接口（固定 RAG，无工具，对比用）
+- `/api/chat`：非流式结构化 JSON 接口（最早期版本）
+
+方便对比不同阶段的实现差异。
+
+---
+
+## Phase 演进历史
+
+这个项目是按 Phase 渐进推进的，每个 Phase 都是一个完整的学习阶段：
+
+| Phase | 主要内容 | 关键文件 |
+|-------|---------|---------|
+| Phase 1 | 最基础的 OpenAI 兼容直答 | `chat/*` |
+| Phase 2 | 接入 LangChain + RAG 知识库 | `langchain/ragRetriever.ts` |
+| Phase 3 | LangChain `createAgent` + MCP 工具 | `langchain/agentRunner.ts` |
+| Phase 4 | 手写 LangGraph StateGraph（替代 createAgent） | `langchain/agentGraph*.ts` |
+| Phase 5 | Prisma + SqliteCheckpointer 持久化对话 | `db/*` |
+| Phase 5.6 | iOS 对话列表 UI | `Views/ThreadListView.swift` |
+| Phase 6 | Ollama 真实 Embedding + 向量缓存 | `langchain/embeddings.ts` `langchain/ragCache.ts` |
+| Phase 7 | 工具集扩展到 4 个（LLM-as-judge + 学习规划） | `mcp/mcpToolHandlers.ts` |
+
+Phase 3 和 Phase 4 通过 `USE_LANGGRAPH` 环境变量灰度切换，行为完全等价。
+
+---
 
 ## 1. 启动后端
 
-先进入后端目录：
+### 1.1 基础步骤
 
 ```bash
 cd backend-node
-```
-
-复制环境变量示例文件：
-
-```bash
 cp .env.example .env
 ```
 
-然后在 `.env` 里填入你的真实 `DEEPSEEK_API_KEY`。
-
-安装依赖：
+在 `.env` 里至少填入真实的 `DEEPSEEK_API_KEY`。
 
 ```bash
 npm install
 ```
 
-启动开发服务：
+### 1.2 初始化数据库（Phase 5 新增）
+
+Phase 5 引入了 Prisma + SQLite 持久化对话。首次启动前必须跑 migration：
+
+```bash
+npx prisma migrate dev
+```
+
+这一步会做三件事：
+
+```text
+1. 在 backend-node/prisma/ 下创建 dev.db SQLite 文件
+2. 应用 migrations/ 里的所有 SQL（建 threads 表）
+3. 生成 @prisma/client TypeScript 客户端
+```
+
+LangGraph 的 `SqliteCheckpointer` 会使用同一个 `dev.db` 文件，
+但 `checkpoints` / `writes` / `checkpoint_blobs` 这些表是它运行时自动建的，
+Prisma 不管它们。
+
+### 1.3（可选）安装 Ollama 跑真实 embedding
+
+Phase 6 后默认的 embedding provider 是 `local-keyword`（不需要任何外部依赖，
+适合零配置跑通）。如果想体验真实语义向量检索，安装本地 Ollama：
+
+```bash
+# macOS
+brew install ollama
+ollama serve &
+ollama pull bge-m3
+```
+
+然后在 `.env` 里把 embedding provider 切到 ollama：
+
+```text
+EMBEDDINGS_PROVIDER=ollama
+OLLAMA_BASE_URL=http://127.0.0.1:11434
+OLLAMA_EMBEDDING_MODEL=bge-m3
+```
+
+切换后第一次 Agent 请求会触发向量构建（约 30-50 个 chunk × 几十毫秒），
+之后会被 `.rag-cache/vectors.json` 缓存下来，重启进程后秒级加载。
+
+### 1.4 启动开发服务
 
 ```bash
 npm run dev
@@ -66,6 +128,16 @@ http://127.0.0.1:8000
 ```bash
 curl http://127.0.0.1:8000/health
 ```
+
+启动后控制台会打印一行 LangSmith 状态：
+
+```text
+[LangSmith] tracing disabled (set LANGSMITH_TRACING=true to enable)
+```
+
+接入 LangSmith 是 Phase 10 的事，详见 `.env.example` 里的注释。
+
+---
 
 ## 2. 运行 iOS App
 
@@ -95,12 +167,34 @@ http://127.0.0.1:8000
 http://192.168.1.23:8000
 ```
 
+### Phase 5.6 后的 iOS 主要界面
+
+```text
+ThreadListView（对话列表）
+  -> 显示所有历史对话（按最近活跃倒序）
+  -> 滑动可删除
+  -> 点击进入 ChatView
+  -> 顶部"新建"按钮可开始新对话
+
+ChatView（聊天页）
+  -> 流式气泡
+  -> 工具进度（"正在查询知识库..." → "已查询知识库，找到 N 条相关资料"）
+  -> 切换对话后自动从后端拉历史
+```
+
+---
+
 ## 3. 注意事项
 
 - 不要提交 `backend-node/.env`
 - 不要提交 `backend-node/node_modules`
+- 不要提交 `backend-node/prisma/dev.db`（已在 `.gitignore`）
+- 不要提交 `backend-node/.rag-cache/`（已在 `.gitignore`）
 - 不要提交 Xcode 的 `xcuserdata`
-- 可以提交 `backend-node/.env.example`，它只保存变量名，不保存真实密钥
+- 可以提交 `backend-node/.env.example`
+- 必须提交 `backend-node/prisma/migrations/`（别人 clone 后才能重建数据库）
+
+---
 
 ## 4. RAG 知识库
 
@@ -110,22 +204,22 @@ http://192.168.1.23:8000
 backend-node/knowledge/
 ```
 
-当前第二版 RAG 已经接入 LangChain：
+当前 RAG 已经接入 LangChain：
 
 ```text
 用户提问
   -> LangChain DirectoryLoader / TextLoader 读取 Markdown
-  -> RecursiveCharacterTextSplitter 切 chunk
-  -> LocalKeywordEmbeddings 生成本地学习版向量
+  -> RecursiveCharacterTextSplitter（markdown 模式）切 chunk
+  -> Embeddings 生成向量（local-keyword 或 Ollama）
   -> MemoryVectorStore 做相似度检索
-  -> ChatPromptTemplate 组装 RAG prompt
-  -> ChatDeepSeek 生成回答
-  -> Node.js 通过 JSON 或 SSE 返回给 iOS
+  -> 命中的 chunk 作为工具结果交回 Agent
+  -> ChatDeepSeek 基于结果生成回答
+  -> Node.js 通过 SSE 返回给 iOS
 ```
 
-新增知识时，可以继续往 `backend-node/knowledge/` 里添加 `.md` 文件。
+新增知识时，往 `backend-node/knowledge/` 里添加 `.md` 文件即可。
 
-本地调试检索结果：
+### 4.1 本地调试检索结果
 
 ```bash
 cd backend-node
@@ -134,106 +228,121 @@ npm run rag:debug -- "SwiftUI @State 和 @Binding 有什么区别"
 
 这条命令不会调用 DeepSeek，只检查 LangChain 的 loader、splitter、embedding、vector store 和 retriever 是否命中正确资料。
 
-当前默认 embedding provider 是 `local-keyword`。它不需要额外 API key，适合学习完整 RAG 链路。
-后续如果要升级成真正语义 embedding，可以替换 `backend-node/src/langchain/embeddings.ts` 里的工厂函数。
-
-RAG 相关环境变量：
+### 4.2 Embedding Provider 切换
 
 ```text
-EMBEDDINGS_PROVIDER=local-keyword
-RAG_TOP_K=5
-RAG_CHUNK_SIZE=1200
-RAG_CHUNK_OVERLAP=160
-RAG_MIN_SIMILARITY=0.08
+EMBEDDINGS_PROVIDER=local-keyword     # 默认，零依赖，关键词 hash 成伪向量
+EMBEDDINGS_PROVIDER=ollama            # 真实语义向量，需要本地 Ollama
 ```
 
-学习时可以先重点观察两个参数：
+切换 provider 后，向量缓存会自动失效重建（缓存指纹包含 embedding 标识）。
+详见 `backend-node/src/langchain/ragCache.ts`。
+
+### 4.3 RAG 调参
 
 ```text
-RAG_TOP_K
-  控制每次给模型多少段资料。太少可能漏资料，太多会增加 prompt 噪音。
-
-RAG_CHUNK_SIZE / RAG_CHUNK_OVERLAP
-  控制文档切分大小和相邻 chunk 的重叠范围。chunk 太大容易混入无关内容，太小容易丢上下文。
+RAG_TOP_K=5            每次给模型多少段资料
+RAG_CHUNK_SIZE=1200    切分大小
+RAG_CHUNK_OVERLAP=160  相邻 chunk 的重叠范围
+RAG_MIN_SIMILARITY=0.08  分数下限，太低的不送进模型
 ```
+
+---
 
 ## 5. 后端代码结构
 
-后端已经按职责拆成多个目录，`server.ts` 只保留 Express 路由和 HTTP/SSE 生命周期。
-
 ```text
 backend-node/src/server.ts
-  Express 路由、SSE 连接、服务启动
+  Express 路由、SSE 连接、服务启动、对话 CRUD 接口
 
 backend-node/src/config/env.ts
   读取和校验 .env 配置
 
+# Chat 模块（普通聊天）
 backend-node/src/chat/chatCompletion.ts
-  普通聊天接口的 LangChain RAG 上下文和 BaseMessage[] 组装
-
+  普通聊天接口的 LangChain RAG 上下文组装
 backend-node/src/chat/chatHistory.ts
-  清洗 history，限制历史长度，组装检索 query
-
+  清洗 history，限制历史长度
 backend-node/src/chat/prompts.ts
-  结构化输出、普通流式输出、Agent 的 prompt 规则
-
+  结构化输出、普通流式输出、Agent 的 prompt 规则（Phase 7 重构）
 backend-node/src/chat/structuredAnswer.ts
-  解析 /api/chat 的结构化 JSON 回答，并提供兜底解析
+  解析 /api/chat 的结构化 JSON 回答
 
+# Knowledge / RAG 模块
 backend-node/src/knowledge/knowledge.ts
-  知识库外观层，向上保留 retrieveRelevantKnowledge，底层调用 LangChain retriever
-
+  知识库外观层
 backend-node/src/langchain/documentLoader.ts
-  使用 LangChain DirectoryLoader / TextLoader 读取 Markdown 知识库
-
-backend-node/src/langchain/localEmbeddings.ts
-  本地学习版 Embeddings，把中英文关键词 hash 成向量，方便无额外 key 跑通 RAG
-
+  使用 DirectoryLoader / TextLoader 读取 Markdown
 backend-node/src/langchain/embeddings.ts
-  Embeddings 工厂，后续替换真实 embedding provider 时优先改这里
-
+  Embeddings 工厂（local-keyword / Ollama 切换）
+backend-node/src/langchain/localEmbeddings.ts
+  本地学习版关键词向量
 backend-node/src/langchain/ragRetriever.ts
-  LangChain TextSplitter + MemoryVectorStore + similarity search 主链路
-
-backend-node/src/langchain/chatPrompt.ts
-  使用 ChatPromptTemplate 组装普通 RAG 聊天 prompt
-
-backend-node/src/langchain/chatModel.ts
-  创建 LangChain ChatDeepSeek，并封装普通 invoke / stream 调用
-
+  TextSplitter + MemoryVectorStore + similarity search 主链路
+backend-node/src/langchain/ragCache.ts
+  Phase 6.4 向量缓存（指纹 + JSON 持久化）
 backend-node/src/langchain/ragDebug.ts
-  RAG 检索调试脚本，不启动后端也能查看命中的 chunk
+  RAG 调试脚本
 
-backend-node/src/langchain/agentTools.ts
-  把 MCP listTools() 返回的工具定义动态包装成 LangChain tools
+# Chat Model 封装
+backend-node/src/langchain/chatModel.ts
+  创建 LangChain ChatDeepSeek，封装 invoke / stream
+backend-node/src/langchain/chatPrompt.ts
+  ChatPromptTemplate 工具函数
 
-backend-node/src/langchain/agentRunner.ts
-  LangChain createAgent 主链路，负责工具决策、工具执行编排和最终流式输出
-
-backend-node/src/langchain/agentDebug.ts
-  Agent 本地调试脚本，不启动 iOS 也能观察 tool_start / tool_done / delta
-
+# Agent 路由层（Phase 4 灰度入口）
 backend-node/src/agent/agentRunner.ts
-  兼容入口，向上 re-export LangChain Agent Runner，避免 server.ts 路径大改
-
+  根据 USE_LANGGRAPH 切换 Phase 3 / Phase 4 实现
 backend-node/src/agent/agentTools.ts
-  Agent SSE 工具事件辅助，把工具执行过程整理成 iOS 可展示的 tool_start / tool_done
-
+  Agent SSE 工具事件辅助（tool_start / tool_done 文案）
 backend-node/src/agent/agentToolTypes.ts
-  Agent 内部工具结果类型和基础校验函数
+  Agent 工具结果类型 + 校验函数
+backend-node/src/agent/agentObservability.ts
+  结构化日志（按 requestId trace 整条链路）
 
+# Phase 3 路径（LangChain createAgent）
+backend-node/src/langchain/agentRunner.ts
+  createAgent + middleware（retry / callLimit / toolCallLimit）
+backend-node/src/langchain/agentTools.ts
+  MCP tools → LangChain tools 桥接
+backend-node/src/langchain/agentDebug.ts
+  Agent 本地调试脚本
+
+# Phase 4 路径（手写 LangGraph StateGraph）
+backend-node/src/langchain/agentGraphState.ts
+  State schema（messages + modelCallCount + toolCallCount）
+backend-node/src/langchain/agentGraphNodes.ts
+  agentNode、toolNode、shouldContinue 条件边
+backend-node/src/langchain/agentGraph.ts
+  组装 StateGraph、挂 checkpointer、streamEvents
+
+# MCP（工具协议层）
 backend-node/src/mcp/mcpServer.ts
-  本地 MCP server，通过 stdio 暴露 searchKnowledge / generateQuiz 工具
-
+  本地 MCP server，通过 stdio 暴露 4 个工具
 backend-node/src/mcp/mcpClient.ts
-  本地 MCP client，负责连接 MCP server、列工具、执行工具调用
-
+  本地 MCP client，启动子进程 + listTools + callTool
 backend-node/src/mcp/mcpToolHandlers.ts
-  MCP 工具的真实业务实现
+  4 个工具的真实业务实现
+backend-node/src/mcp/generateQuizDebug.ts
+backend-node/src/mcp/evaluateAnswerDebug.ts
+backend-node/src/mcp/recommendNextTopicDebug.ts
+  工具独立调试脚本
 
+# Phase 5 持久化
+backend-node/prisma/schema.prisma
+  Prisma 数据库设计图（threads 表）
+backend-node/src/db/prisma.ts
+  Prisma client 单例
+backend-node/src/db/sqliteCheckpointer.ts
+  LangGraph SqliteSaver 单例工厂
+backend-node/src/db/threadsRepository.ts
+  对话 CRUD 业务封装（跨 Prisma + checkpointer 两层）
+backend-node/src/db/prismaDebug.ts
+  Prisma 调试脚本
+
+# 通用
 backend-node/src/http/sse.ts
   统一写 SSE event
-
 backend-node/src/shared/types.ts
   后端共享类型
 ```
@@ -243,434 +352,342 @@ backend-node/src/shared/types.ts
 ```text
 server.ts
   -> 普通聊天：chat/* -> knowledge/* -> langchain/* -> http/*
-  -> Agent 聊天：agent/* -> langchain/* -> mcp/* -> knowledge/*
+  -> Agent 聊天：agent/agentRunner（灰度）
+                  ├── Phase 3: langchain/agentRunner（createAgent）
+                  └── Phase 4: langchain/agentGraph*（手写 StateGraph）
+                                  └── db/sqliteCheckpointer（持久化）
+  -> 工具：agent/* -> mcp/* -> 真实工具实现
+  -> 对话管理：db/threadsRepository -> prisma + checkpointer 双源
   -> 共用：config/* + shared/*
 ```
 
-这样后续新增工具时，主要改 `src/mcp/mcpServer.ts` 和 `src/mcp/mcpToolHandlers.ts`；
-调整 Agent 循环时，主要改 `src/langchain/agentRunner.ts`；
-调整知识库检索时，优先改 `src/langchain/ragRetriever.ts`；
-如果只是替换 embedding provider，优先改 `src/langchain/embeddings.ts`。
+---
 
-## 6. 多轮上下文
+## 6. 多轮上下文与持久化（Phase 5）
 
-iOS 每次发送消息时，会把最近 6 条历史消息一起发送给后端：
+### 6.1 持久化模式（当前默认）
 
 ```text
-当前问题
-  + 最近几条 user / assistant 历史
-  -> Node.js
-  -> AI API
+iOS 第一次发消息时：
+  POST /api/threads → 后端建一行 threads 记录 → 返回 thread.id
+
+iOS 后续每次发消息：
+  POST /api/agent/stream { message, thread_id }
+  history 字段固定传空数组
+
+后端拿到 thread_id：
+  touchThread(threadId)            ← upsert + 刷新 updatedAt
+  graph.streamEvents(...,
+    { configurable: { thread_id }})
+  ↑ 关键：LangGraph 用 SqliteSaver 自动从 checkpoint 加载历史 state，
+    跑完图后又把新 state 写回 checkpoint
 ```
 
-这样用户继续追问：
+iOS 端 history 不再带，整段对话历史**完全由后端 checkpointer 管理**。这样：
+
+- 用户切换设备能接上（id 在云端）
+- 关闭 App 重开能接上
+- 单条请求的 payload 永远很小
+
+### 6.2 无持久化模式（兼容老接口）
+
+如果不传 `thread_id`，后端走 Phase 4 老行为：
 
 ```text
-请更详细回答
-继续
-举个例子
+state 是临时的（每次请求白板从空开始）
+iOS 必须自己带 history
+图跑完 state 立刻丢弃
 ```
 
-AI 就能知道这些话是在接着上一轮问题说。
+主要给：
+- 老版本 iOS 兼容
+- 不需要"对话连续性"的一次性问答
+- 自动化测试
 
-为了避免请求内容无限增长，当前只保留最近 6 条历史消息。
+### 6.3 对话 CRUD 接口
+
+```text
+POST   /api/threads               新建对话（body 可选 title）
+GET    /api/threads               列出所有对话（按 updatedAt 倒序）
+GET    /api/threads/:id/messages  拉某对话的可展示消息（过滤内部消息）
+DELETE /api/threads/:id           删除对话（同时清掉 checkpointer state）
+```
+
+返回 `messages` 时已经过滤掉了 Agent 内部消息（tool_calls 中间消息、ToolMessage），
+iOS 只看到 user / assistant 的真实对话。
+
+详见 `backend-node/src/db/threadsRepository.ts`。
+
+---
 
 ## 7. 流式输出
 
-项目保留了普通流式输出接口：
-
-```text
-POST /api/chat/stream
-```
-
-它的目标是让用户不用等完整回答结束，而是可以看到 AI 一边生成、一边显示：
-
-```text
-iOS 发送 message + history
-  -> Node.js 做 RAG 检索
-  -> Node.js 请求 DeepSeek stream: true
-  -> DeepSeek 返回一小段文本
-  -> Node.js 通过 SSE 转发给 iOS
-  -> iOS 追加到同一条 AI 气泡
-```
-
-### 为什么保留 /api/chat
-
-项目里仍然保留原来的结构化接口：
+### 7.1 三个接口对比
 
 ```text
 POST /api/chat
-```
-
-两个接口的区别是：
-
-```text
-/api/chat
   -> 等 AI 完整返回
-  -> 后端解析结构化 JSON
-  -> iOS 展示 title / summary / points / next_question 卡片
+  -> 后端解析结构化 JSON（title/summary/points/next_question）
+  -> iOS 展示卡片
 
-/api/chat/stream
+POST /api/chat/stream
+  -> 固定 RAG（不走 Agent）
   -> AI 边生成边返回
   -> 后端通过 SSE 推送 delta
   -> iOS 实时更新普通文本气泡
+
+POST /api/agent/stream     ★ 当前 iOS 默认入口
+  -> Agent 决定是否调工具（最多 N 轮 ReAct 循环）
+  -> SSE 推送 tool_start / tool_done / delta / done
+  -> iOS 显示工具进度 + 流式回答
+  -> 带 thread_id 时自动持久化
 ```
 
-第一版流式输出先返回普通文本，不强制 JSON。
+### 7.2 SSE 事件格式
 
-原因是结构化 JSON 不适合直接流式展示。否则用户会先看到类似下面的半截内容：
+每行 `data:` 后面跟 JSON：
 
 ```text
-{"title":"SwiftUI @State","summary":"...
+data: {"type":"tool_start","tool_call_id":"call_xxx","tool_name":"searchKnowledge","display_name":"查询知识库","message":"正在查询知识库","request_id":"req_xxx","phase":"tool_execution"}
+
+data: {"type":"tool_done","tool_call_id":"call_xxx","tool_name":"searchKnowledge","display_name":"查询知识库","ok":true,"message":"已查询知识库，找到 2 条相关资料","duration_ms":213,"request_id":"req_xxx","phase":"tool_execution"}
+
+data: {"type":"delta","delta":"SwiftUI ","request_id":"req_xxx","phase":"final_stream"}
+
+data: {"type":"delta","delta":"里的 @State ","request_id":"req_xxx","phase":"final_stream"}
+
+data: {"type":"done","request_id":"req_xxx","phase":"request_completed","duration_ms":3421}
 ```
 
-这不是自然的聊天体验。
-
-后续可以升级成：
+iOS 解析：
 
 ```text
-流式阶段：显示普通文本
-结束阶段：再返回最终 structured answer
-iOS：把普通文本气泡替换成结构化卡片
-```
-
-### SSE 返回格式
-
-后端使用 Server-Sent Events，也就是：
-
-```text
-Content-Type: text/event-stream
-```
-
-每个事件都是一行 `data:`，后面跟 JSON：
-
-```text
-data: {"type":"tool_start","tool_call_id":"call_xxx","tool_name":"searchKnowledge","display_name":"查询知识库","message":"正在查询知识库"}
-
-data: {"type":"tool_done","tool_call_id":"call_xxx","tool_name":"searchKnowledge","display_name":"查询知识库","ok":true,"message":"已查询知识库，找到 2 条相关资料"}
-
-data: {"type":"delta","delta":"SwiftUI "}
-
-data: {"type":"delta","delta":"里的 @State "}
-
-data: {"type":"delta","delta":"用于保存当前 View 的状态。"}
-
-data: {"type":"done"}
-```
-
-如果流式过程中出错，后端会发送：
-
-```text
-data: {"type":"error","error":"Failed to stream AI response."}
-```
-
-iOS 只需要解析这几种事件：
-
-```text
-tool_start：显示 Agent 正在调用哪个工具
-tool_done：显示工具执行结果摘要
-delta：追加文本
+tool_start：在当前 AI 气泡里显示"正在 xxx"
+tool_done：更新成"已 xxx，结果摘要"
+delta：追加到同一条 AI 气泡的 content
 done：结束本次回答
 error：显示错误提示
 ```
 
-### iOS 更新方式
+### 7.3 iOS 流式更新模式
 
-流式输出时，iOS 不会等完整答案回来再追加 AI 消息。
+ViewModel 先 append 一条空 assistant 消息，记下它的 id，
+每收到 delta 就根据 id 替换它的 content。这样列表始终保持
+"用户一条 / AI 一条"的清晰结构，而不是变成"AI 片段 1、AI 片段 2..."。
 
-它会先创建一条空的 assistant 消息：
-
-```text
-用户消息
-AI 空消息
-```
-
-然后每收到一个 `delta`，就更新同一条 AI 消息的 `content`：
-
-```text
-AI 空消息
-AI: SwiftUI
-AI: SwiftUI 里的 @State
-AI: SwiftUI 里的 @State 用于保存当前 View 的状态。
-```
-
-关键点是：这条 AI 消息的 `id` 必须保持不变。
-
-如果每个 delta 都创建一个新 id，SwiftUI 会认为它们是很多条不同消息，列表滚动和动画都会不稳定。
-
-### 和上下文记忆的关系
-
-流式输出后，AI 回复是普通文本，不一定有 `structuredAnswer`。
-
-所以整理 history 时不能只保存结构化回答，也要保存普通 assistant 文本。
-
-当前逻辑会：
-
-```text
-排除第一条欢迎语
-保留后续真实 user / assistant 消息
-只取最近 6 条
-发送给后端
-```
-
-这样用户继续追问：
-
-```text
-继续
-举个例子
-好，讲这个
-```
-
-AI 仍然能看到上一轮流式生成的回答内容。
-
-### 手动测试流式接口
-
-启动后端后，可以用 curl 测试：
+### 7.4 手动测试
 
 ```bash
-curl -N \
-  -X POST http://127.0.0.1:8000/api/chat/stream \
+# 普通流式（无 Agent）
+curl -N -X POST http://127.0.0.1:8000/api/chat/stream \
   -H "Content-Type: application/json" \
-  -d '{
-    "message": "SwiftUI 的 @State 是什么？",
-    "system_prompt": "You are a friendly iOS tutor.",
-    "history": []
-  }'
+  -d '{"message":"SwiftUI 的 @State 是什么？","system_prompt":"","history":[]}'
+
+# Agent 流式（无持久化）
+curl -N -X POST http://127.0.0.1:8000/api/agent/stream \
+  -H "Content-Type: application/json" \
+  -d '{"message":"SwiftUI 的 @State 是什么？请先查知识库再回答","system_prompt":"","history":[]}'
+
+# Agent 流式 + 持久化（先建 thread 再用 thread_id 发消息）
+THREAD_ID=$(curl -s -X POST http://127.0.0.1:8000/api/threads \
+  -H "Content-Type: application/json" -d '{}' | jq -r .id)
+curl -N -X POST http://127.0.0.1:8000/api/agent/stream \
+  -H "Content-Type: application/json" \
+  -d "{\"message\":\"你好\",\"system_prompt\":\"\",\"history\":[],\"thread_id\":\"$THREAD_ID\"}"
+
+# 拉历史看是否被存进 checkpointer
+curl http://127.0.0.1:8000/api/threads/$THREAD_ID/messages
 ```
 
-`-N` 的作用是关闭 curl 的输出缓冲。
+`-N` 是关闭 curl 输出缓冲，否则看不到实时流式效果。
 
-如果不加 `-N`，curl 可能会等攒够一批内容后再显示，看起来就不像实时流式输出。
+---
 
-## 8. LangChain Tool / Agent / MCP
+## 8. Agent / Tool / MCP
 
-当前 App 默认使用第二阶段 LangChain Agent 流式接口：
+### 8.1 整体调用链
 
 ```text
-POST /api/agent/stream
+iOS 发送 message + thread_id
+  -> Node.js touchThread + 启动 Agent
+  -> 从 MCP server 拉工具列表（缓存）
+  -> 把 MCP tools 包装成 LangChain tools
+  -> agent/agentRunner 根据 USE_LANGGRAPH 选实现：
+       Phase 3：LangChain createAgent（带 middleware）
+       Phase 4：手写 StateGraph（agent ↔ tools ↔ shouldContinue）
+  -> 模型在 ReAct 循环里决定是否调工具
+  -> Tool wrapper 发 SSE tool_start → 调 MCP → 发 tool_done
+  -> 工具结果作为 ToolMessage 加入 state
+  -> 模型基于工具结果继续推理
+  -> 最终回答 token 通过 SSE delta 推回 iOS
+  -> Phase 4 路径：自动写回 SqliteCheckpointer
 ```
 
-它把工具决策、工具执行编排和最终回答流式输出交给 LangChain createAgent：
-
-```text
-iOS 发送 message + history
-  -> Node.js 通过 MCP client 从 MCP server 获取可用工具
-  -> langchain/agentTools.ts 把 MCP tools 包装成 LangChain tools
-  -> langchain/agentRunner.ts 创建 LangChain Agent
-  -> Agent 判断是否需要调用工具
-  -> Tool wrapper 通过 SSE 发送 tool_start
-  -> Tool wrapper 通过 MCP client 调用 MCP server
-  -> MCP server 校验参数并执行真正的工具
-  -> Tool wrapper 通过 SSE 发送 tool_done
-  -> LangChain 把工具结果作为 ToolMessage 交回 Agent
-  -> Agent 基于工具结果生成最终回答
-  -> Node.js 通过 SSE 流式返回给 iOS
-```
-
-整体调用链路可以看成下面这张图：
+完整图：
 
 ```mermaid
 flowchart TD
-    U["用户输入问题"] --> V["iOS SwiftUI View"]
+    U["用户输入"] --> V["iOS SwiftUI View"]
     V --> VM["ChatViewModel"]
     VM --> API["ChatAPIClient"]
-    API -->|POST /api/agent/stream| EXP["Node.js Express server.ts"]
+    API -->|POST /api/agent/stream<br/>+ thread_id| EXP["Express server.ts"]
 
-    EXP --> AR["langchain/agentRunner.ts<br/>createAgent"]
-    AR --> AT["langchain/agentTools.ts<br/>MCP -> LangChain tools"]
-    AT --> MC["mcp/mcpClient.ts"]
-    MC -->|stdio JSON-RPC| MS["mcp/mcpServer.ts"]
-    MS --> MH["mcp/mcpToolHandlers.ts"]
-    MH --> KB["knowledge/*.md<br/>本地知识库"]
+    EXP --> TT["touchThread (Prisma upsert)"]
+    TT --> AR["agent/agentRunner<br/>USE_LANGGRAPH ?"]
+    AR -->|true| LG["langchain/agentGraph<br/>手写 StateGraph"]
+    AR -->|false| LC["langchain/agentRunner<br/>createAgent"]
 
-    AR -->|model + tools + messages| LC["LangChain Agent"]
-    LC -->|ChatDeepSeek| LLM["DeepSeek API"]
-    LC -->|tool call| AT
-    AT -->|tool result JSON| LC
-    LC -->|delta chunks| EXP
-    EXP -->|SSE: tool_start/tool_done/delta/done| API
+    LG --> TOOLS["createLangChainAgentTools<br/>从 MCP 拉工具"]
+    TOOLS --> MC["mcp/mcpClient"]
+    MC -->|stdio JSON-RPC| MS["mcp/mcpServer 子进程"]
+    MS --> MH["mcpToolHandlers<br/>(search / quiz / evaluate / recommend)"]
+    MH --> KB["knowledge/*.md<br/>+ Ollama embedding"]
+
+    LG --> CKPT[("SQLite<br/>checkpoints 表")]
+
+    LG -->|streamEvents| EXP
+    EXP -->|SSE| API
     API --> VM
     VM --> V
 ```
 
-### Tool Calling 是什么
+### 8.2 Tool Calling 是什么
 
-Tool Calling 不是模型真的执行代码。
-
-模型只会返回类似下面的结构化请求：
+模型并不真的执行代码，它只会返回类似下面的结构化请求：
 
 ```json
 {
   "name": "searchKnowledge",
-  "arguments": {
-    "query": "SwiftUI @State"
-  }
+  "arguments": { "query": "SwiftUI @State" }
 }
 ```
 
-真正执行工具的是 Node.js 后端里的 MCP server。
-
-这样做的好处是：
-
-```text
-模型负责理解用户意图、选择工具、组织回答
-MCP server 负责校验参数、执行工具、控制权限和安全边界
-```
-
-### MCP 是什么
-
-MCP 可以理解成 AI Agent 调用外部能力的标准协议。
-
-它把 AI 应用拆成两侧：
+真正执行工具的是后端的 LangChain Tool wrapper → MCP Server。
+这样的好处是：
 
 ```text
-MCP Client
-  发起 listTools / callTool / readResource 等标准请求
-
-MCP Server
-  暴露 tools / resources / prompts，并执行真实能力
+模型负责：理解意图、选工具、组织回答
+MCP server 负责：参数校验、安全边界、真实执行
 ```
 
-在这个项目里：
+### 8.3 MCP 是什么
+
+MCP（Model Context Protocol）是 AI Agent 调用外部能力的标准协议：
 
 ```text
-langchain/agentRunner
-  -> langchain/agentTools
-  -> mcpClient
-  -> mcpServer
-  -> mcpToolHandlers
+MCP Client：发起 listTools / callTool / readResource 请求
+MCP Server：暴露 tools / resources / prompts，并执行真实能力
 ```
 
-也就是说，LangChain Agent 负责“怎么决定和编排工具”，
-MCP server 负责“工具定义、参数校验和真实执行”。
-
-### 当前支持的工具
-
-当前 Agent 开放两个低风险学习工具：
+在本项目里：
 
 ```text
-searchKnowledge(query)
-  搜索 backend-node/knowledge/ 里的 Markdown 知识库
-
-generateQuiz(topic, count)
-  根据学习主题生成 1 到 5 道练习题
+agent/agentRunner
+  -> langchain/agentTools（把 MCP 工具包装成 LangChain Tool）
+  -> mcp/mcpClient（单例，启动 mcpServer 子进程）
+  -> mcp/mcpServer（stdio transport）
+  -> mcp/mcpToolHandlers（真实业务逻辑）
 ```
 
-这两个工具现在由 `backend-node/src/mcp/mcpServer.ts` 通过 MCP 暴露。
-它们都不会修改数据，也不会调用外部业务系统，适合先把 Tool Calling + MCP 主流程跑通。
+### 8.4 当前支持的 4 个工具（Phase 7）
 
-### LangChain Agent 循环
+| 工具 | 类型 | 内部实现 |
+|------|------|---------|
+| `searchKnowledge(query)` | 只读 RAG | LangChain MemoryVectorStore 相似度检索 |
+| `generateQuiz(topic, count?)` | LLM 生成 | DeepSeek 出题（含 expectedConcepts 给批改用），失败回退模板 |
+| `evaluateAnswer(question, userAnswer, topic?, expectedConcepts?)` | LLM-as-judge | DeepSeek 作为评委，严格 rubric，输出 0-3 分 + 优缺点 + 参考答案 |
+| `recommendNextTopic(recentTopics, focusArea?, count?)` | LLM 规划 | 读知识库目录 + 历史话题 → 推荐下一步学习方向 |
 
-后端现在使用 LangChain createAgent 管理循环。
-
-它的工作方式是：
+这 4 个工具构成一个完整的"学习闭环"：
 
 ```text
-最多执行 2 次工具调用
-
-Agent 收到用户问题
-  -> 模型判断是否需要工具
-  -> 如果需要：LangChain 调用对应 tool wrapper
-  -> tool wrapper 通过 MCP 执行真实工具
-  -> LangChain 把工具结果放回 Agent 上下文
-  -> Agent 继续判断或生成最终回答
-
-如果不需要工具：
-  -> Agent 直接生成最终回答
+讲解 (searchKnowledge)
+  → 出题 (generateQuiz)
+  → 答题 (evaluateAnswer)
+  → 推荐下一步 (recommendNextTopic)
+  → 回到讲解
 ```
 
-为什么还要限制工具次数？
+详细 prompt 规则见 `backend-node/src/chat/prompts.ts` 的 `agentOutputGuide`。
 
-因为模型有可能反复调用工具。比如一直搜索知识库、一直换 query。
-`toolCallLimitMiddleware` 可以避免一次请求无限执行工具。
-
-### 为什么最终回答仍然流式返回
-
-LangChain Agent 支持把最终回答作为 message text stream 读出来。
-后端把这些文本片段转成现有 iOS 能识别的 SSE delta：
+### 8.5 Phase 3 vs Phase 4：两种 Agent 实现
 
 ```text
-LangChain message.text
-  -> server.ts onDelta
-  -> SSE delta
-  -> iOS 追加到当前 AI 气泡
+USE_LANGGRAPH=false（默认）
+  -> langchain/agentRunner.ts
+  -> LangChain createAgent
+  -> 用 middleware 管循环：
+       modelRetryMiddleware（重试）
+       modelCallLimitMiddleware（成本上限）
+       toolCallLimitMiddleware（防工具滥用）
+  -> 内部仍然是 ReAct 循环，但你看不见图
+
+USE_LANGGRAPH=true
+  -> langchain/agentGraph.ts
+  -> 手写 StateGraph
+  -> 你能看见完整的图结构：
+       START → agent → shouldContinue → tools → agent → ... → END
+  -> 状态对象 AgentState（messages / modelCallCount / toolCallCount）
+  -> SqliteCheckpointer 自动持久化 state
 ```
 
-### iOS 如何展示 Agent 执行过程
+两者函数签名完全一致，server.ts 不感知差异，可以随时灰度切换或回退。
+推荐的学习路径：**先 USE_LANGGRAPH=false 跑通基线 → 切 true 对比 → 看懂图结构后再做扩展**。
 
-Agent 接口会在工具开始和结束时发送额外 SSE 事件：
+### 8.6 Agent 行为安全边界
 
 ```text
-tool_start
-  -> iOS 在当前 AI 气泡里显示“正在查询知识库”
-
-tool_done
-  -> iOS 把同一步更新成“已查询知识库，找到 2 条相关资料”
-
-delta
-  -> iOS 继续把最终回答追加到同一条 AI 气泡
+AGENT_RECURSION_LIMIT=20           图最多迭代多少步
+AGENT_MODEL_CALL_LIMIT=6           整次请求最多调几次模型
+AGENT_MODEL_RETRY_MAX_ATTEMPTS=2   单次 model 节点失败的重试次数
+CHAT_MODEL_HTTP_MAX_RETRIES=2      底层 HTTP 重试次数
+TOOL_EXECUTION_TIMEOUT_MS=8000     单个工具最长执行时间
 ```
 
-这样聊天列表仍然保持：
+Phase 3 用 middleware 实施，Phase 4 在 agentNode 里手写检查。
+任何一层超限都会"软退出"而不是抛错，保证用户至少能收到一条回答。
 
-```text
-用户一条消息
-AI 一条消息
-```
+### 8.7 本地调试脚本
 
-但 AI 消息内部能看到 Agent 调用了哪个工具。
-
-### 手动测试 Agent 接口
-
-不启动后端时，可以直接跑本地 Agent 调试脚本：
+不启动后端就能跑：
 
 ```bash
-cd backend-node
+# Agent 完整链路（含工具调用）
 npm run agent:debug -- "SwiftUI @State 和 @Binding 有什么区别？请先查知识库再回答。"
-```
 
-如果终端里看到 `tool_start` / `tool_done`，说明 LangChain Agent 已经成功调用 MCP 工具。
+# 单独 RAG 检索
+npm run rag:debug -- "SwiftUI @State"
 
-也可以单独启动 MCP server 做协议调试：
+# 单独工具
+npm run quiz:debug -- "SwiftUI @State" 3
+npm run evaluate:debug -- "SwiftUI @State 是什么" "用来声明状态的属性包装器"
+npm run recommend:debug -- "@State,@Binding" SwiftUI 3
 
-```bash
+# 数据库 / checkpointer 状态
+npm run prisma:debug
+
+# 单独启动 MCP server（一般不用，agent 会自动拉起）
 npm run mcp:dev
 ```
 
-正常后端开发不需要手动启动它。
-`/api/agent/stream` 会通过 `src/mcp/mcpClient.ts` 自动拉起本地 stdio MCP server。
-
-启动后端后，可以测试知识库工具：
-
-```bash
-curl -N \
-  -X POST http://127.0.0.1:8000/api/agent/stream \
-  -H "Content-Type: application/json" \
-  -d '{
-    "message": "SwiftUI 的 @State 是什么？请先查知识库再回答。",
-    "system_prompt": "You are a friendly iOS tutor.",
-    "history": []
-  }'
-```
-
-也可以测试练习题工具：
-
-```bash
-curl -N \
-  -X POST http://127.0.0.1:8000/api/agent/stream \
-  -H "Content-Type: application/json" \
-  -d '{
-    "message": "基于 SwiftUI @Binding 给我出 3 道练习题。",
-    "system_prompt": "You are a friendly iOS tutor.",
-    "history": []
-  }'
-```
-
-如果后端日志里看到类似：
+后端日志格式（按 requestId 可 grep 整条链路）：
 
 ```text
-[Agent] {"phase":"tool_setup","event":"langchain_tools_loaded",...}
-[Agent] {"phase":"langchain_agent","event":"completed",...}
+[Agent] {"requestId":"req_xxx","phase":"tool_setup","event":"langchain_tools_loaded",...}
+[Agent] {"requestId":"req_xxx","phase":"model_call","event":"started",...}
+[Agent] {"requestId":"req_xxx","phase":"tool_execution","event":"started","toolName":"searchKnowledge"}
+[Agent] {"requestId":"req_xxx","phase":"langchain_agent","event":"completed",...}
+[Agent] {"requestId":"req_xxx","phase":"request","event":"completed",...}
 ```
 
-说明模型已经触发 Tool Calling，后端也通过 MCP 执行了对应工具。
+---
+
+## 9. 后续规划
+
+```text
+Phase 8   Multi-Agent 协作（Router + 子 Agent）
+Phase 9   高级 LangGraph（HITL 人工审核 + Subgraph 子图 + Time-travel 时光机）
+Phase 10  生产化 + LangSmith Eval（trace / 数据集评测 / CI/CD）
+```
+
+推荐推进顺序：**先做 Phase 10 的 LangSmith trace + 最小 eval 数据集**（建立观测和评测 baseline），再做 Phase 9 的 HITL（给后续多 Agent 加安全带），最后做 Phase 8 多 Agent。

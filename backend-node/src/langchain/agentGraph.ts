@@ -264,12 +264,38 @@ export async function runLangGraphAgentStream({
    * 注意 configurable 是 LangGraph 的"特殊配置入口",
    * thread_id 是其中**最常用的字段**——所有 checkpointer 都靠它隔离不同对话。
    */
+  /**
+   * Phase 10.1 — 给 LangSmith trace 加业务 metadata + tags。
+   *
+   * metadata 字段会出现在 LangSmith 网页 trace 详情的 "Metadata" 区,
+   * 可以在 Project 列表页用 metadata 过滤(比如只看某个 thread 的所有 trace)。
+   *
+   * tags 是逗号分隔的字符串数组,LangSmith 网页可以按 tag 快速筛选——
+   * 比如 ["agent", "phase-4"] 表示"这是 Phase 4 路径的 Agent 调用",
+   * 区分 Phase 3 createAgent trace 时一眼可见。
+   *
+   * 这两个字段不影响 Agent 行为,纯粹是给 trace 加"业务标签",
+   * 没接 LangSmith 也不会出错(LangChain 会静默忽略)。
+   */
   const eventStream = graph.streamEvents(
     { messages: initialMessages },
     {
       version: "v2",
       recursionLimit: agentRecursionLimit,
       configurable: threadId ? { thread_id: threadId } : undefined,
+      metadata: {
+        request_id: requestId,
+        thread_id: threadId ?? null,
+        route: "/api/agent/stream",
+        runner: "langgraph-stategraph",
+        use_langgraph: true,
+        history_count: history.length,
+      },
+      tags: [
+        "agent",
+        "phase-4",
+        threadId ? "persistent" : "stateless",
+      ],
     }
   );
 

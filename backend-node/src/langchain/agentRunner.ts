@@ -157,13 +157,43 @@ export async function runLangChainAgentStream({
    * recursionLimit 是 Agent 的最后安全网：
    * “无论模型怎么决策，总迭代步数的上限”。
    */
-  const eventStream = agent.streamEvents(
-    { messages },
-    {
-      version: "v2",
-      recursionLimit: agentRecursionLimit,
-    }
-  );
+  /**
+   * Phase 10.1 — 给 LangSmith trace 加业务 metadata + tags。
+   *
+   * 与 agentGraph.ts(Phase 4 路径)对齐,但 runner 字段不同,
+   * 这样 LangSmith 网页能直接区分两条路径的 trace。
+   *
+   * 注意:createAgent 的 streamEvents 类型签名比 LangGraph 严格,
+   * 不接受顶层 metadata/tags 字段。改用 withConfig 把 metadata/tags
+   * 挂在 agent runnable 上——这是 LangChain 标准的 Runnable 配置方式,
+   * LangSmith trace 同样能拿到。
+   *
+   * Phase 3 路径不接 checkpointer,所以 thread_id 在这里只是日志值,
+   * 不会影响 createAgent 的 state 行为。
+   */
+  const eventStream = agent
+    .withConfig({
+      metadata: {
+        request_id: requestId,
+        thread_id: _threadId ?? null,
+        route: "/api/agent/stream",
+        runner: "langchain-createagent",
+        use_langgraph: false,
+        history_count: history.length,
+      },
+      tags: [
+        "agent",
+        "phase-3",
+        _threadId ? "persistent-mode" : "stateless",
+      ],
+    })
+    .streamEvents(
+      { messages },
+      {
+        version: "v2",
+        recursionLimit: agentRecursionLimit,
+      }
+    );
 
   /**
    * 用 wallclock 计算每次模型调用耗时——多个模型调用并发不可能发生，

@@ -21,6 +21,8 @@ import type {
   ChatResponseBody,
   ChatStreamEvent,
   ErrorResponseBody,
+  FeedbackRequestBody,
+  FeedbackResponseBody,
 } from "./shared/types";
 import {
   createThread,
@@ -29,6 +31,10 @@ import {
   listThreads,
   touchThread,
 } from "./db/threadsRepository";
+import {
+  LangSmithFeedbackDisabledError,
+  submitUserFeedback,
+} from "./langchain/langsmithClient";
 
 /**
  * server.ts 现在只负责 Express 路由和 HTTP 生命周期。
@@ -600,6 +606,117 @@ app.delete("/api/threads/:id", async (req: Request, res: Response) => {
     res.status(500).json({ error: "Failed to delete thread." });
   }
 });
+
+// ════════════════════════════════════════════════════════════════════
+// Phase 10.1 #2 — 用户反馈接口(写回 LangSmith Feedback)
+// ════════════════════════════════════════════════════════════════════
+//
+// 这个接口的作用很纯粹:让 iOS 端把"用户点了 👍/👎"这件事
+// 写回到对应那条 LangSmith trace 上,变成 trace 详情页里的 Feedback。
+//
+// 为什么 trace 之外还要做 feedback:
+// - trace 告诉你"模型这次怎么思考、调了什么 tool、花了多少 token"——客观技术指标
+// - feedback 告诉你"用户觉得这次回答好不好"——主观业务指标
+// - 两者关联起来,才能回答"哪种 tool 链路用户满意度最高""哪个 prompt
+//   改动让满意度下降了"这类问题。这是 LangSmith Evaluation 体系的"人工监督环"。
+//
+// 实现上极简,因为重活都在 langsmithClient.ts 里:
+//   server.ts 只负责"HTTP 校验 + 错误码翻译",
+//   langsmithClient 负责"调 SDK + 单例管理"。
+
+/**
+ * POST /api/feedback
+ *
+ * 请求体:{ run_id, score, key?, comment? }
+ *   - run_id: 来自 SSE done 事件(#3 会加)
+ *   - score: 0..1 浮点;iOS 端 👍=1 / 👎=0
+ *   - key: 可选,默认 "user_thumb"
+ *   - comment: 可选用户备注
+ *
+ * 返回:201 + { feedback_id }
+ *
+ * 状态码约定:
+ * - 400  请求体非法(缺 run_id / score 不是 0..1 浮点)
+ * - 503  服务端没启用 LangSmith,无法记录(明确告诉前端"不是临时网络问题")
+ * - 500  其它(LangSmith API 鉴权失败 / runId 不存在 / 网络)
+ */
+app.post(
+  "/api/feedback",
+  async (
+    req: Request,
+    res: Response<FeedbackResponseBody | ErrorResponseBody>
+  ) => {
+    const body = (req.body ?? {}) as FeedbackRequestBody;
+
+    /**
+     * 校验 run_id。
+     *
+     * 不做 UUID 格式校验——LangSmith run id 是 UUID 格式没错,
+     * 但格式校验交给 LangSmith 服务端做更稳(版本升级也不用改这里)。
+     * 这里只挡"空 / 非字符串"这种明显错误。
+     */
+    const runId = typeof body.run_id === "string" ? body.run_id.trim() : "";
+    if (!runId) {
+      res.status(400).json({ error: "run_id is required." });
+      return;
+    }
+
+    /**
+     * 校验 score。
+     *
+     * Number.isFinite 同时过滤 NaN / Infinity / 非数字。
+     * 约束在 [0, 1] 是 LangSmith 标准评分范围——超出范围在 LangSmith UI
+     * 里会显示异常,不如这里直接拒掉给前端更清晰的错误。
+     */
+    const score = body.score;
+    if (typeof score !== "number" || !Number.isFinite(score) || score < 0 || score > 1) {
+      res.status(400).json({ error: "score must be a finite number between 0 and 1." });
+      return;
+    }
+
+    /**
+     * key / comment 都是可选,做最基本的"是字符串才用"清洗。
+     * comment 限长 1000 字,防止有人灌大文本——这是边界值,
+     * LangSmith 服务端也有上限,但提前在我们这里挡住更省 SDK 调用。
+     */
+    const key =
+      typeof body.key === "string" && body.key.trim() ? body.key.trim() : undefined;
+    const comment =
+      typeof body.comment === "string" && body.comment.trim()
+        ? body.comment.trim().slice(0, 1000)
+        : undefined;
+
+    try {
+      const { feedbackId } = await submitUserFeedback({
+        runId,
+        score,
+        key,
+        comment,
+      });
+
+      console.log(
+        `[Feedback] saved id=${feedbackId} runId=${runId} score=${score} key=${key ?? "user_thumb"}`
+      );
+
+      res.status(201).json({ feedback_id: feedbackId });
+    } catch (error) {
+      if (error instanceof LangSmithFeedbackDisabledError) {
+        /**
+         * 503 Service Unavailable 比 500 更合适:
+         * - 500 暗示"服务挂了,等会再试"
+         * - 503 暗示"这个能力当前不可用"(更准确)
+         * 前端拿到 503 应该提示用户"反馈功能未启用",而不是无脑重试。
+         */
+        console.warn("[Feedback] rejected:", error.message);
+        res.status(503).json({ error: error.message });
+        return;
+      }
+
+      console.error("[Feedback] submit failed:", error);
+      res.status(500).json({ error: "Failed to submit feedback." });
+    }
+  }
+);
 
 app.listen(port, () => {
   console.log(`AI backend is running at http://localhost:${port}`);

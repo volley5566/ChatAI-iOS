@@ -37,6 +37,29 @@ export type ErrorResponseBody = {
 };
 
 /**
+ * Phase 10.1 #2 — iOS 提交用户反馈(👍/👎)的请求体。
+ *
+ * 字段约定:
+ * - run_id: 对应某条 LangSmith trace 的根 run。iOS 从 SSE done 事件读到(#3 会加)
+ * - score: 0..1 浮点。当前 iOS 只发 1(👍)或 0(👎),
+ *   留浮点是给未来"星级 / LLM judge"扩展
+ * - key: LangSmith 里 feedback 列名,可选;不传走后端默认 "user_thumb"
+ * - comment: 可选用户备注,iOS 第一版不收集,留协议位置
+ *
+ * 命名同样用 snake_case,和现有 ChatRequestBody 风格对齐。
+ */
+export type FeedbackRequestBody = {
+  run_id?: string;
+  score?: number;
+  key?: string;
+  comment?: string;
+};
+
+export type FeedbackResponseBody = {
+  feedback_id: string;
+};
+
+/**
  * iOS 发来的原始历史消息。
  *
  * 字段保持可选，因为外部请求不能完全相信。

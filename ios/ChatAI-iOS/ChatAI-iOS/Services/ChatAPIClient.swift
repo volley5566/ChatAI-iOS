@@ -34,6 +34,16 @@ enum ChatStreamUpdate: Equatable {
     case delta(String)
     case toolStart(AgentToolUpdate)
     case toolDone(AgentToolUpdate)
+    /// Phase 10.1 #4 — 后端 SSE done 事件,带回 LangSmith 根 run id。
+    ///
+    /// 故意做成"流的最后一个事件",而不是把 run_id 挂在某个回调外参数上——
+    /// VM 处理它的方式和处理 delta / toolStart 一样,统一在 `for try await ... in stream` 循环里 switch,
+    /// 不引入"流外的副渠道"。
+    ///
+    /// runID 可选:LANGSMITH_TRACING 关掉时后端不会带这个字段(或带 null),
+    /// VM 拿到 nil 时就跳过"把 runId 写到消息上"那一步——结果是 MessageBubbleView
+    /// 自然不显示反馈按钮(它的判定就是 runId != nil)。
+    case done(runID: String?)
 }
 
 /// 一次 Agent 工具状态更新。
@@ -146,6 +156,19 @@ protocol ChatAPI {
     /// 对应后端 DELETE /api/threads/:id。
     /// 幂等——id 不存在也返回成功(后端 204)。
     func deleteThread(threadID: String) async throws
+
+    /// Phase 10.1 #4 — 用户对某条 AI 回答的反馈(👍 / 👎)。
+    ///
+    /// 对应后端 POST /api/feedback —— 后端会把分数写到 LangSmith
+    /// 对应那条 trace 的 Feedback 区。
+    ///
+    /// 参数:
+    ///   - runID:那条 AI 回答的根 run id(从 SSE done 事件存下来,Message.runId)
+    ///   - score:0..1 浮点;UI 当前只发 1(👍)或 0(👎),留浮点给未来星级扩展
+    ///
+    /// 失败会抛 ChatAPIError——ViewModel 应该把已乐观写入的 feedbackScore 还原回 nil,
+    /// 并显示 errorMessage 提示用户重试。
+    func submitFeedback(runID: String, score: Double) async throws
 }
 
 /// iOS 调用 Node.js 后端时可能遇到的错误。
@@ -564,6 +587,15 @@ final class ChatAPIClient: ChatAPI {
 
                         case "done":
                             // done 表示后端已经读完模型流，本次回答结束。
+                            //
+                            // Phase 10.1 #4 — 在 finish() 之前先 yield 一条 .done(runID:)。
+                            // 这样 VM 的 for-await 循环能在最后一轮拿到 run_id,
+                            // 把它存到对应那条 assistant 消息上,反馈按钮才能渲染出来。
+                            //
+                            // event.runID 可能为 nil(后端没开 LangSmith 或拿不到根 run id),
+                            // 那就传 nil,VM 会跳过赋值——MessageBubbleView 看到 runId == nil
+                            // 就不显示反馈按钮,行为自然降级。
+                            continuation.yield(.done(runID: event.runID))
                             continuation.finish()
                             return
 
@@ -668,6 +700,34 @@ final class ChatAPIClient: ChatAPI {
          * performJSONRequest 会拿到一个空 Data,这里直接丢掉就行。
          */
         _ = try await performJSONRequest(method: "DELETE", path: "api/threads/\(encodedID)", body: nil)
+    }
+
+    /// Phase 10.1 #4 — 提交用户反馈。POST /api/feedback
+    ///
+    /// 请求体协议(和后端 FeedbackRequestBody 对齐):
+    ///   { "run_id": "...", "score": 0..1 }
+    ///
+    /// 这里没用 ChatRequestBody / 也不专门建 struct——字段就两个,
+    /// 用 [String: Any] 编码 JSON 反而最直接;String 和 Double 都是 JSON 原生类型,
+    /// JSONSerialization 能正确处理。
+    ///
+    /// 后端成功返回 201 + { feedback_id },但 iOS 这一版**不关心** feedback_id
+    /// (用不到——不做撤销也不做去重)。所以这里只 await 不返回值,有错就 throw。
+    func submitFeedback(runID: String, score: Double) async throws {
+        /**
+         * 用 JSONSerialization 而不是 JSONEncoder + struct:
+         * - 字段简单(2 个),没必要建 struct
+         * - JSONSerialization 能处理 [String: Any],Double / String 都直接序列化为 JSON 数字/字符串
+         *
+         * 如果未来要加 key / comment 字段,再升级成专用 Encodable struct 不迟。
+         */
+        let bodyDict: [String: Any] = [
+            "run_id": runID,
+            "score": score
+        ]
+        let bodyData = try JSONSerialization.data(withJSONObject: bodyDict)
+
+        _ = try await performJSONRequest(method: "POST", path: "api/feedback", body: bodyData)
     }
 
     /// 4 个对话管理接口共用的 HTTP 底层。
@@ -825,6 +885,9 @@ private struct ChatStreamEvent: Decodable {
     let displayName: String?
     let message: String?
     let ok: Bool?
+    /// Phase 10.1 #4 — done 事件的 LangSmith 根 run id。
+    /// 其它事件类型(delta / tool_*)上不出现,所以是 Optional。
+    let runID: String?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -835,6 +898,7 @@ private struct ChatStreamEvent: Decodable {
         case displayName = "display_name"
         case message
         case ok
+        case runID = "run_id"
     }
 
     /// 把 SSE 原始字段整理成 ViewModel 更好消费的工具状态。

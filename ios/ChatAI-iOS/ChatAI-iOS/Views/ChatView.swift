@@ -109,8 +109,23 @@ struct ChatView: View {
             ScrollView {
                 LazyVStack(spacing: 12) {
                     ForEach(viewModel.messages) { message in
-                        MessageBubbleView(message: message)
-                            .id(message.id)
+                        MessageBubbleView(
+                            message: message,
+                            // Phase 10.1 #4 — 把反馈点击转给 VM。
+                            //
+                            // 闭包里起 Task 是因为 submitFeedback 是 async,
+                            // 而 SwiftUI 按钮回调是同步的。Task 默认继承
+                            // @MainActor(VM 是 MainActor),所以不需要手动跳线程。
+                            onSubmitFeedback: { score in
+                                Task {
+                                    await viewModel.submitFeedback(
+                                        messageID: message.id,
+                                        score: score
+                                    )
+                                }
+                            }
+                        )
+                        .id(message.id)
                     }
 
                     if viewModel.isSending {

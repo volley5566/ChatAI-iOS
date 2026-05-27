@@ -76,11 +76,37 @@ struct ChatMessage: Identifiable, Equatable {
     /// ViewModel 会把这些事件整理成步骤展示在 AI 气泡里。
     let agentToolSteps: [AgentToolStep]
 
+    /// Phase 10.1 #4 — LangSmith trace 的根 run id。
+    ///
+    /// 只 assistant 消息可能有这个值,且要等后端 SSE 发出 done 事件后才填上——
+    /// 在那之前(流式输出过程中)是 nil。
+    ///
+    /// MessageBubbleView 根据它判定要不要显示 👍/👎 反馈按钮:
+    ///   - nil  → 不显示(还在流式 / 用户消息 / 后端没启用 LangSmith)
+    ///   - 非 nil → 显示反馈按钮
+    let runId: String?
+
+    /// Phase 10.1 #4 — 用户已经给过的反馈分数。
+    ///
+    /// 约定 0..1 浮点:1 = 👍,0 = 👎。
+    /// nil 表示"还没反馈过"。
+    ///
+    /// MessageBubbleView 根据它决定按钮的可点状态:
+    ///   - nil  → 两个按钮都可点
+    ///   - 1.0  → 👍 高亮,两个按钮都禁用
+    ///   - 0.0  → 👎 高亮,两个按钮都禁用
+    ///
+    /// 用 Double? 不用 Bool 是为了和后端 score 接口对齐,也给未来星级/LLM judge
+    /// 共用同一个字段留扩展空间。
+    let feedbackScore: Double?
+
     init(
         role: ChatMessageRole,
         content: String,
         structuredAnswer: StructuredAnswer? = nil,
         agentToolSteps: [AgentToolStep] = [],
+        runId: String? = nil,
+        feedbackScore: Double? = nil,
         id: UUID = UUID()
     ) {
         self.id = id
@@ -88,6 +114,8 @@ struct ChatMessage: Identifiable, Equatable {
         self.content = content
         self.structuredAnswer = structuredAnswer
         self.agentToolSteps = agentToolSteps
+        self.runId = runId
+        self.feedbackScore = feedbackScore
     }
 
     /// 返回一条“正文已更新，但 id / role / structuredAnswer 保持不变”的消息。
@@ -106,6 +134,8 @@ struct ChatMessage: Identifiable, Equatable {
             content: newContent,
             structuredAnswer: structuredAnswer,
             agentToolSteps: agentToolSteps,
+            runId: runId,
+            feedbackScore: feedbackScore,
             id: id
         )
     }
@@ -120,6 +150,36 @@ struct ChatMessage: Identifiable, Equatable {
             content: content,
             structuredAnswer: structuredAnswer,
             agentToolSteps: newSteps,
+            runId: runId,
+            feedbackScore: feedbackScore,
+            id: id
+        )
+    }
+
+    /// Phase 10.1 #4 — 流式结束、SSE done 事件到达时,把 runId 写到这条消息上。
+    /// 其余字段保持不变,符合"updating* 系列保留 id + 不相关字段"的惯例。
+    func updatingRunId(_ newRunId: String?) -> ChatMessage {
+        ChatMessage(
+            role: role,
+            content: content,
+            structuredAnswer: structuredAnswer,
+            agentToolSteps: agentToolSteps,
+            runId: newRunId,
+            feedbackScore: feedbackScore,
+            id: id
+        )
+    }
+
+    /// Phase 10.1 #4 — 用户点击 👍/👎 / 反馈撤销时更新 feedbackScore。
+    /// 传 nil 表示"撤销反馈"(目前 UI 还不支持撤销,但 API 留着)。
+    func updatingFeedbackScore(_ newScore: Double?) -> ChatMessage {
+        ChatMessage(
+            role: role,
+            content: content,
+            structuredAnswer: structuredAnswer,
+            agentToolSteps: agentToolSteps,
+            runId: runId,
+            feedbackScore: newScore,
             id: id
         )
     }

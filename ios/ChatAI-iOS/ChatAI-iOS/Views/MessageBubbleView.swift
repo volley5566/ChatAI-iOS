@@ -15,6 +15,18 @@ struct MessageBubbleView: View {
     /// 给我一条 ChatMessage，我负责把它显示成聊天气泡。
     let message: ChatMessage
 
+    /// Phase 10.1 #4 — 用户点击 👍/👎 时的回调。
+    ///
+    /// 参数是 0..1 浮点分数:1 = 👍,0 = 👎。
+    ///
+    /// 默认是空闭包,这样 Previews 和不需要反馈的场景可以不传。
+    /// ChatView 调用时会传一个把 score 转给 ChatViewModel.submitFeedback 的闭包。
+    ///
+    /// 设计选择:用闭包,而不是直接持有 ChatViewModel。
+    /// 理由 = MessageBubbleView 应该是"纯展示组件",不知道 VM 存在;
+    /// 解耦后这个 View 也能在别的页面复用(比如未来的"历史回顾"页)。
+    var onSubmitFeedback: (Double) -> Void = { _ in }
+
     /// 这个值后面会决定三件事：
     /// 1. 气泡靠左还是靠右
     /// 2. 气泡背景颜色
@@ -32,27 +44,87 @@ struct MessageBubbleView: View {
                 Spacer(minLength: 48)
             }
 
-            // 气泡样式。
-            messageContent
-                // 给气泡内部加 padding，也就是文字不要紧贴边缘。
-                .padding(.horizontal, 14)
-                .padding(.vertical, 10)
-                // 设置气泡背景。
-                .background(bubbleBackground)
-                // 把背景裁成圆角矩形。
-                .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
-                // 允许用户长按/拖选复制文字。
-                // 这个对 AI Chat 很重要，因为用户经常要复制 AI 回复。
-                .textSelection(.enabled)
-                // 限制气泡最大宽度。
-                // 否则在 iPad 或横屏时，一条消息可能会拉得特别长，不好阅读。
-                .frame(maxWidth: 560, alignment: isUserMessage ? .trailing : .leading)
+            // Phase 10.1 #4 — 反馈按钮放在气泡**外面**(气泡下方),
+            // 不挤气泡内部布局;只 AI 消息且 runId 已就位时才显示。
+            VStack(alignment: .leading, spacing: 6) {
+                // 气泡样式。
+                messageContent
+                    // 给气泡内部加 padding，也就是文字不要紧贴边缘。
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 10)
+                    // 设置气泡背景。
+                    .background(bubbleBackground)
+                    // 把背景裁成圆角矩形。
+                    .clipShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+                    // 允许用户长按/拖选复制文字。
+                    // 这个对 AI Chat 很重要，因为用户经常要复制 AI 回复。
+                    .textSelection(.enabled)
+
+                feedbackBar
+            }
+            // 限制气泡最大宽度。
+            // 否则在 iPad 或横屏时，一条消息可能会拉得特别长，不好阅读。
+            .frame(maxWidth: 560, alignment: isUserMessage ? .trailing : .leading)
 
             // 右边放 Spacer，气泡就留在左边。
             if !isUserMessage {
                 Spacer(minLength: 48)
             }
         }
+    }
+
+    /// Phase 10.1 #4 — 反馈按钮条。
+    ///
+    /// 显示规则:
+    ///   - 用户消息 → 永远不显示
+    ///   - AI 消息但 runId == nil(流式中 / 后端没启 LangSmith) → 不显示
+    ///   - AI 消息且有 runId → 显示 👍/👎
+    ///       - 还没反馈过(feedbackScore == nil) → 两个按钮都可点
+    ///       - 已反馈过 → 对应按钮高亮,两个都禁用(防重复)
+    @ViewBuilder
+    private var feedbackBar: some View {
+        if !isUserMessage, message.runId != nil {
+            HStack(spacing: 12) {
+                feedbackButton(
+                    systemImage: message.feedbackScore == 1 ? "hand.thumbsup.fill" : "hand.thumbsup",
+                    isHighlighted: message.feedbackScore == 1,
+                    score: 1
+                )
+                feedbackButton(
+                    systemImage: message.feedbackScore == 0 ? "hand.thumbsdown.fill" : "hand.thumbsdown",
+                    isHighlighted: message.feedbackScore == 0,
+                    score: 0
+                )
+            }
+            .padding(.leading, 4)
+        }
+    }
+
+    /// 单个反馈按钮。
+    ///
+    /// disabled 的判定:已反馈过(feedbackScore != nil)就禁用。
+    /// 高亮态(实心图标 + accent 色)用来标示"用户选了哪个"。
+    @ViewBuilder
+    private func feedbackButton(
+        systemImage: String,
+        isHighlighted: Bool,
+        score: Double
+    ) -> some View {
+        Button {
+            onSubmitFeedback(score)
+        } label: {
+            Image(systemName: systemImage)
+                .font(.footnote)
+                .foregroundStyle(isHighlighted ? Color.accentColor : Color.secondary)
+        }
+        // 已经反馈过就禁用,防止重复提交。
+        // 注意:这是"已反馈任何分数后两个按钮都禁用",
+        // 不是"只有自己被点过才禁"——一次回答只允许一个分数,
+        // 想改就要先撤销(目前 UI 不支持撤销,留给后续迭代)。
+        .disabled(message.feedbackScore != nil)
+        // BorderlessButton 在 List/ScrollView 里能避免"整行被识别为点击"的问题,
+        // 让点击事件精准命中图标本身。
+        .buttonStyle(.borderless)
     }
 
     /// 根据消息来源切换气泡颜色。

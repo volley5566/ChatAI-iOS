@@ -325,6 +325,16 @@ final class ChatViewModel: ObservableObject {
                             status: toolUpdate.ok == false ? .failed : .completed
                         )
                     }
+
+                case .done(let runID):
+                    // Phase 10.1 #4 — 把 LangSmith 根 run id 写到这条 AI 消息上。
+                    //
+                    // runID 可能为 nil(后端没启用 LangSmith / 没拿到根 run id)——
+                    // 那就保持 message.runId = nil,MessageBubbleView 不显示反馈按钮,
+                    // 行为自然降级,不需要在这里做任何特殊处理。
+                    if let runID, let assistantMessageID {
+                        updateMessageRunId(id: assistantMessageID, runId: runID)
+                    }
                 }
             }
 
@@ -443,6 +453,63 @@ final class ChatViewModel: ObservableObject {
         }
 
         messages[index] = messages[index].updatingContent(content)
+    }
+
+    /// Phase 10.1 #4 — 流结束时把 LangSmith 根 run id 写到这条 AI 消息上。
+    /// 用 id 找位置 + 调 Message.updatingRunId,和 updateMessageContent 套路一致。
+    private func updateMessageRunId(id: UUID, runId: String) {
+        guard let index = messages.firstIndex(where: { $0.id == id }) else {
+            return
+        }
+        messages[index] = messages[index].updatingRunId(runId)
+    }
+
+    /// Phase 10.1 #4 — 提交一条 AI 消息的反馈到后端,后端会写到 LangSmith。
+    ///
+    /// 设计:**乐观更新 + 失败回滚**
+    ///   1. 立刻把 message.feedbackScore 设上(按钮立刻置灰,反应灵敏)
+    ///   2. 异步调 POST /api/feedback
+    ///   3. 失败时把 feedbackScore 还原成 nil,显示错误
+    ///
+    /// 为什么乐观:网络往返几百毫秒,用户点完按钮要等才置灰会觉得"按了没反应"。
+    /// 后端校验也很严格(score 必须 0..1, runId 必须存在),失败概率低,
+    /// 用"先动手再补救"的模式换更顺畅的交互。
+    ///
+    /// 校验:
+    ///   - 消息存在且有 runId 才提交。没 runId 不该走到这里(UI 也不会显示按钮),
+    ///     但加守卫防御 SwiftUI 状态时序问题。
+    ///   - feedbackScore 已有值就直接 return(防双击)
+    func submitFeedback(messageID: UUID, score: Double) async {
+        guard let index = messages.firstIndex(where: { $0.id == messageID }) else {
+            return
+        }
+        let message = messages[index]
+        guard let runID = message.runId else {
+            return
+        }
+        // 已经反馈过就忽略——前端按钮在 feedbackScore 非 nil 时已经 disabled,
+        // 这里再加一道防御,挡住意外重入。
+        guard message.feedbackScore == nil else {
+            return
+        }
+
+        // 乐观更新:先在 UI 上置成"已反馈"。
+        messages[index] = message.updatingFeedbackScore(score)
+
+        do {
+            try await chatAPI.submitFeedback(runID: runID, score: score)
+        } catch {
+            // 失败回滚:把 feedbackScore 改回 nil,按钮重新可点;
+            // 同时显示错误,让用户知道为什么"按了又退回去"。
+            //
+            // 注意:回滚时要重新找 index——异步等待期间 messages 可能已经被改过
+            // (用户新发了消息 / 切了对话)。如果找不到原消息,静默放弃回滚——
+            // 那条消息已经不在视图里了,回滚也没意义。
+            if let nowIndex = messages.firstIndex(where: { $0.id == messageID }) {
+                messages[nowIndex] = messages[nowIndex].updatingFeedbackScore(nil)
+            }
+            errorMessage = "反馈提交失败:\(error.localizedDescription)"
+        }
     }
 
     /// 更新某条 AI 消息里的 Agent 工具执行步骤。

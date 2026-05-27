@@ -441,11 +441,23 @@ app.post(
           outputCharCount,
         });
 
-        // 最后发送，表示本次回答结束。
+        /**
+         * 最后发送 done 事件,表示本次回答结束。
+         *
+         * Phase 10.1 #3 — 顺带把 LangSmith 根 run id 带回去。
+         *
+         * iOS 端拿到这个 id 后,会:
+         *   - 把它存到对应 message 模型的 runId 字段
+         *   - 用户点 👍/👎 时,POST /api/feedback { run_id, score }
+         *
+         * 这条字段做成可选,如果 runner 没拿到根 run id(理论上不会发生)
+         * 就不发,前端的"反馈按钮"应该自然降级隐藏。
+         */
         writeAgentSseEvent({
           type: "done",
           phase: "request_completed",
           duration_ms: totalDurationMs,
+          run_id: agentRun.rootRunId,
         });
       }
 

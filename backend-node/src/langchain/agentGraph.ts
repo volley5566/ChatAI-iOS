@@ -80,6 +80,18 @@ import { getSqliteCheckpointer } from "../db/sqliteCheckpointer";
 export type LangGraphAgentRunResult = {
   outputText: string;
   toolCallCount: number;
+  /**
+   * Phase 10.1 #3 — 本次 Agent 调用在 LangSmith 里的根 run UUID。
+   *
+   * 来源:streamEvents 循环里第一个 parent_ids 为空的 on_chain_start 事件
+   * 的 run_id 字段(就是编译后的 graph 自己启动的那条事件)。
+   *
+   * server.ts 会把这个 id 塞进 SSE done payload,iOS 再用它调 /api/feedback。
+   *
+   * 可能为 undefined 的极端场景:stream 还没产出任何事件就异常退出
+   * (基本不会发生,但类型上留容错)。
+   */
+  rootRunId: string | undefined;
 };
 
 type RunLangGraphAgentStreamOptions = {
@@ -125,6 +137,13 @@ export async function runLangGraphAgentStream({
   const startedAt = Date.now();
   let toolCallCount = 0;
   let outputText = "";
+  /**
+   * Phase 10.1 #3 — 用一个变量捕获根 run id。
+   *
+   * 在 for-await 循环里,第一个"没有 parent"的 on_chain_start 事件
+   * 就是根 run(也就是整张图本身的启动事件)。一旦捕到就不再覆盖。
+   */
+  let rootRunId: string | undefined;
 
   /**
    * 第一步:加载工具(和 Phase 3 一样,从 MCP 拉)。
@@ -309,6 +328,23 @@ export async function runLangGraphAgentStream({
         break;
       }
 
+      /**
+       * Phase 10.1 #3 — 捕根 run id。
+       *
+       * streamEvents 在事件层面保证"父 chain 的 on_chain_start 一定先于子 chain
+       * 的任何事件"——所以循环里**第一个** on_chain_start 必然是整张图本身的
+       * 启动事件,它的 run_id 就是这条 LangSmith trace 的根 run。
+       *
+       * (理论上 StreamEvent 运行时还带一个 parent_ids 字段可以更精确判定根,
+       * 但 @langchain/core 的 TS 类型没暴露这个字段,用了编译不过。
+       * "第一个 on_chain_start"在实际行为上同样可靠且足够清晰。)
+       *
+       * 这段放在 switch 外面,因为只关心捕一次;捕到后 if 守卫不再覆盖。
+       */
+      if (!rootRunId && event.event === "on_chain_start") {
+        rootRunId = event.run_id;
+      }
+
       switch (event.event) {
         case "on_chat_model_stream": {
           /**
@@ -366,11 +402,13 @@ export async function runLangGraphAgentStream({
     durationMs: getDurationMs(startedAt),
     toolCallCount,
     outputCharCount: outputText.length,
+    rootRunId: rootRunId ?? "(missing)",
   });
 
   return {
     outputText,
     toolCallCount,
+    rootRunId,
   };
 }
 

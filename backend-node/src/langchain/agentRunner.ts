@@ -33,6 +33,11 @@ import { messageContentToString } from "./chatPrompt";
 export type LangChainAgentRunResult = {
   outputText: string;
   toolCallCount: number;
+  /**
+   * Phase 10.1 #3 — 本次 Agent 调用在 LangSmith 里的根 run UUID。
+   * 详细说明见 agentGraph.ts 的同名字段;两条路径的产出口径保持一致。
+   */
+  rootRunId: string | undefined;
 };
 
 type RunLangChainAgentStreamOptions = {
@@ -88,6 +93,11 @@ export async function runLangChainAgentStream({
   const startedAt = Date.now();
   let toolCallCount = 0;
   let outputText = "";
+  /**
+   * Phase 10.1 #3 — 用一个变量捕获根 run id。
+   * 细节同 agentGraph.ts:第一个 parent_ids 为空的 on_chain_start 即根 run。
+   */
+  let rootRunId: string | undefined;
   //Agent Runner 加载工具(LangChain Phase 2 入口)
   const tools = await loadLangChainTools(requestId, {
     onToolEvent,
@@ -224,6 +234,13 @@ export async function runLangChainAgentStream({
         break;
       }
 
+      /**
+       * Phase 10.1 #3 — 捕根 run id(见 agentGraph.ts 同名注释)。
+       */
+      if (!rootRunId && event.event === "on_chain_start") {
+        rootRunId = event.run_id;
+      }
+
       switch (event.event) {
         case "on_chat_model_start": {
           modelCallStarts.set(event.run_id, Date.now());
@@ -313,11 +330,13 @@ export async function runLangChainAgentStream({
     durationMs: getDurationMs(startedAt),
     toolCallCount,
     outputCharCount: outputText.length,
+    rootRunId: rootRunId ?? "(missing)",
   });
 
   return {
     outputText,
     toolCallCount,
+    rootRunId,
   };
 }
 

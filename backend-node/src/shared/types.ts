@@ -135,7 +135,21 @@ type ChatStreamEventMetadata = {
 export type ChatStreamEvent = ChatStreamEventMetadata &
   (
     | { type: "delta"; delta: string }
-    | { type: "done" }
+    /**
+     * Phase 10.1 #3 — done 事件多带一个 run_id。
+     *
+     * 这是本次 Agent 调用在 LangSmith 里的根 run UUID(由 LangChain
+     * 自己生成,通过 streamEvents 的第一个 on_chain_start 事件暴露)。
+     *
+     * iOS 拿到它后,用户点 👍/👎 时就能把这个 id 回传给 POST /api/feedback,
+     * LangSmith 就能把反馈挂到对应的 trace 上(参见 #2)。
+     *
+     * 字段做成可选:
+     * - LANGSMITH_TRACING 关掉时 LangChain 仍生成 run_id,但写不到 LangSmith
+     *   ——前端拿到 id 也只能得到 503,所以行为上等价于"没 id"
+     * - 极端情况下(stream 还没出 on_chain_start 就异常)也能优雅缺省
+     */
+    | { type: "done"; run_id?: string }
     | { type: "error"; error: string }
     | {
         type: "tool_start";

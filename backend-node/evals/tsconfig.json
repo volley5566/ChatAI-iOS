@@ -1,0 +1,18 @@
+{
+  "//": "Phase 10.2 #5 — eval 体系专用 tsconfig。",
+  "//1": "放在 evals/ 下而不是项目根,是为了让 VS Code 打开 evals 任何文件时,",
+  "//2": "TS server 自动向上找到这个 config(找到最近的就停),避免落到根",
+  "//3": "tsconfig.json(那个 rootDir 是 src,evals 文件不在范围,会报错)。",
+  "//4": "extends 主 config 复用 strict / target / module 等设置。",
+  "//5": "include 把 src + evals 都纳入——evals 里的脚本会 import src 里的代码,",
+  "//6": "(比如 #7 的 runAgent.ts 要用 src/langchain/agentGraph.ts)。",
+  "//7": "rootDir 改成上一级目录,这样两边都在 rootDir 内,不会报越界。",
+  "//8": "noEmit:这个 config 只做类型检查,不输出任何 .js(产物只来自主 config)。",
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "rootDir": "..",
+    "noEmit": true
+  },
+  "include": ["**/*", "../src/**/*"],
+  "exclude": ["../node_modules", "../dist"]
+}

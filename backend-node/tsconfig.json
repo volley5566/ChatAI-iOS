@@ -7,5 +7,7 @@
     "esModuleInterop": true,
     "strict": true,
     "skipLibCheck": true
-  }
+  },
+  "//exclude-reason": "Phase 10.2 #5 — evals/ 走自己的 tsconfig(evals/tsconfig.json),不能让主 config 把它当成 src 文件(rootDir 是 src)。dist 是产物。node_modules 是默认就 exclude 的,这里写明只是为了让列表完整可读。",
+  "exclude": ["evals", "dist", "node_modules"]
 }

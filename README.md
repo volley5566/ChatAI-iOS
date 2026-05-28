@@ -699,11 +699,49 @@ npm run mcp:dev
 
 Phase 10 引入了一套自动评测系统，用来量化 Agent 的表现——改完 prompt / 工具逻辑后跑一遍，看分数是升了还是降了。
 
-**核心思路**：给 Agent 出 21 道"考题"，让它答完后由 4 位"阅卷老师"分别打分，汇总成一份成绩单。
+### Eval 和主流程是什么关系？
+
+**Eval 不在主请求流程里。** 线上的请求链路（iOS → Express → Agent → SSE 回答）完全不涉及 Eval。
+
+Eval 是一个**独立的离线工具**，就像"卫生局来检查餐厅"——餐厅正常营业时没有检查，检查是另外的时间、另外的入口触发的，但检查的对象就是这个餐厅本身。
+
+```text
+┌──────────────────────────────────────────────────────────────────┐
+│  主流程（线上）                                                   │
+│  用户 → iOS → POST /api/agent/stream → Express → Agent → SSE   │
+│  （24 小时跑着，每个用户请求走一次，Eval 不参与）                  │
+└───────────────────────────┬──────────────────────────────────────┘
+                            │
+                            │ 共用同一个 Agent 代码
+                            │ （agentGraph.ts / agentRunner.ts）
+                            │
+┌───────────────────────────┴──────────────────────────────────────┐
+│  Eval 流程（离线）                                                │
+│  开发者终端 → npm run eval → 读题 → 直接调 Agent → 评分 → 报告  │
+│  （只在开发者手动跑时才执行，不影响线上用户）                      │
+└──────────────────────────────────────────────────────────────────┘
+```
+
+**关键**：`runAgent()` 调用的是和线上**完全相同**的 Agent 代码，不是模拟也不是简化版，只是跳过了 HTTP/SSE 包装直接拿结果。就像 Android Instrumented Test 跑真实 ViewModel 但不启动 Activity。
+
+### 什么时候该跑 Eval？
+
+| 场景 | 命令 | 目的 |
+|---|---|---|
+| 改了 prompt | `npm run eval` | 看分数升了还是降了 |
+| 改了工具逻辑 | `npm run eval` | 确认工具行为没被改坏 |
+| 升级了模型 | `npm run eval` | 新模型是否依然表现好 |
+| 提交 PR 前 | `npm run eval -- --quick` | 跑前 5 条，30 秒出结果 |
+| CI 自动化 | GitHub Actions 里跑 | PR 自动检查，分数低了不让合并 |
+| 改 UI / 改数据库 | **不用跑** | 没改 Agent 就不需要 |
+
+### 核心思路
+
+给 Agent 出 21 道"考题"，让它答完后由 4 位"阅卷老师"分别打分，汇总成一份成绩单。
 
 ```text
 qa.jsonl（21 道题）
-  → runAgent()（Agent 答题）
+  → runAgent()（Agent 答题，绕过 HTTP 直接调核心逻辑）
   → 4 个 evaluator 分别打分
   → 成绩单（按场景 / 按维度汇总）
 ```
@@ -730,7 +768,7 @@ qa.jsonl（21 道题）
 ### 运行
 
 ```bash
-npm run eval                           # 跑全量
+npm run eval                           # 跑全量 21 条
 npm run eval -- --quick                # 只跑前 5 条（省 token）
 npm run eval -- --fail-below 0.7       # 总分 < 0.7 时 CI 红灯
 ```
@@ -745,7 +783,7 @@ npm run eval -- --fail-below 0.7       # 总分 < 0.7 时 CI 红灯
 ```text
 Phase 8   Multi-Agent 协作（Router + 子 Agent）
 Phase 9   高级 LangGraph（HITL 人工审核 + Subgraph 子图 + Time-travel 时光机）
-Phase 10  生产化 + LangSmith Eval ← 进行中（10.1 trace/feedback 已完成，10.2 eval 体系进行中）
+Phase 10  生产化 + LangSmith Eval ← 进行中（10.1 trace/feedback 完成，10.2 eval 体系完成，10.3 CI 待做）
 ```
 
 推荐推进顺序：**先做 Phase 10 的 LangSmith trace + 最小 eval 数据集**（建立观测和评测 baseline），再做 Phase 9 的 HITL（给后续多 Agent 加安全带），最后做 Phase 8 多 Agent。

@@ -14,7 +14,8 @@
     "prisma:debug": "node -r ts-node/register/transpile-only src/db/prismaDebug.ts",
     "mcp:dev": "node -r ts-node/register/transpile-only src/mcp/mcpServer.ts",
     "mcp:start": "node dist/mcp/mcpServer.js",
-    "start": "node dist/server.js"
+    "start": "node dist/server.js",
+    "eval": "node -r ts-node/register/transpile-only evals/runEval.ts"
   },
   "keywords": [],
   "author": "",

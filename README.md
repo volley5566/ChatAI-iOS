@@ -48,6 +48,7 @@ iOS SwiftUI（对话列表 + 聊天页）
 | Phase 5.6 | iOS 对话列表 UI | `Views/ThreadListView.swift` |
 | Phase 6 | Ollama 真实 Embedding + 向量缓存 | `langchain/embeddings.ts` `langchain/ragCache.ts` |
 | Phase 7 | 工具集扩展到 4 个（LLM-as-judge + 学习规划） | `mcp/mcpToolHandlers.ts` |
+| Phase 10 | 生产化：LangSmith trace + Eval 评测体系 + 用户反馈 | `langsmithClient.ts` `evals/` |
 
 Phase 3 和 Phase 4 通过 `USE_LANGGRAPH` 环境变量灰度切换，行为完全等价。
 
@@ -339,6 +340,18 @@ backend-node/src/db/threadsRepository.ts
   对话 CRUD 业务封装（跨 Prisma + checkpointer 两层）
 backend-node/src/db/prismaDebug.ts
   Prisma 调试脚本
+
+# Phase 10 LangSmith + Eval
+backend-node/src/langchain/langsmithClient.ts
+  LangSmith Client 单例 + submitUserFeedback()
+backend-node/evals/
+  自动评测体系（详见 evals/README.md）
+  evals/datasets/qa.jsonl        21 条评测用例（7 场景 × 3 条）
+  evals/lib/types.ts             核心类型（EvalCase / EvalResult / Evaluator）
+  evals/lib/dataset.ts           数据集加载器（jsonl → EvalCase[]）
+  evals/lib/runAgent.ts          Agent 纯函数包装（绕过 HTTP 直接调）
+  evals/evaluators/              4 个评分器（toolChoice / keyword / toolChain / llmJudge）
+  evals/runEval.ts               主入口（读数据集 → 跑 Agent → 评分 → 出报告）
 
 # 通用
 backend-node/src/http/sse.ts
@@ -682,12 +695,57 @@ npm run mcp:dev
 
 ---
 
-## 9. 后续规划
+## 9. Eval 自动评测体系（Phase 10.2）
+
+Phase 10 引入了一套自动评测系统，用来量化 Agent 的表现——改完 prompt / 工具逻辑后跑一遍，看分数是升了还是降了。
+
+**核心思路**：给 Agent 出 21 道"考题"，让它答完后由 4 位"阅卷老师"分别打分，汇总成一份成绩单。
+
+```text
+qa.jsonl（21 道题）
+  → runAgent()（Agent 答题）
+  → 4 个 evaluator 分别打分
+  → 成绩单（按场景 / 按维度汇总）
+```
+
+### 7 类场景 × 4 个评分维度
+
+| 场景 | 含义 | 期望调的 tool |
+|---|---|---|
+| `rag` | 纯 RAG 检索 | `searchKnowledge` |
+| `evaluate` | 评估用户答案 | `evaluateAnswer` |
+| `recommend` | 推荐下一步 | `recommendNextTopic` |
+| `quiz` | 出题 | `generateQuiz` |
+| `explain` | 解释概念 | 可能调也可能不调 |
+| `multiturn` | 多轮上下文 | 取决于内容 |
+| `chat` | 闲聊 | **不调任何 tool** |
+
+| 评分器 | 评什么 |
+|---|---|
+| `toolChoice` | Agent 是否调了期望的 tool |
+| `keyword` | 回答是否包含关键词 |
+| `toolChain` | tool 调用顺序是否匹配 |
+| `llmJudge` | 用 LLM 比较回答 vs 参考答案 |
+
+### 运行
+
+```bash
+npm run eval                           # 跑全量
+npm run eval -- --quick                # 只跑前 5 条（省 token）
+npm run eval -- --fail-below 0.7       # 总分 < 0.7 时 CI 红灯
+```
+
+> 📖 **完整文档**（调用流程图、运行机制详解、类型设计说明、扩展指南）：
+> 👉 [`backend-node/evals/README.md`](backend-node/evals/README.md)
+
+---
+
+## 10. 后续规划
 
 ```text
 Phase 8   Multi-Agent 协作（Router + 子 Agent）
 Phase 9   高级 LangGraph（HITL 人工审核 + Subgraph 子图 + Time-travel 时光机）
-Phase 10  生产化 + LangSmith Eval（trace / 数据集评测 / CI/CD）
+Phase 10  生产化 + LangSmith Eval ← 进行中（10.1 trace/feedback 已完成，10.2 eval 体系进行中）
 ```
 
 推荐推进顺序：**先做 Phase 10 的 LangSmith trace + 最小 eval 数据集**（建立观测和评测 baseline），再做 Phase 9 的 HITL（给后续多 Agent 加安全带），最后做 Phase 8 多 Agent。

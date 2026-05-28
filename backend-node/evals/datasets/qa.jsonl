@@ -1,3 +1,63 @@
-// Phase 10.2 数据集占位文件。
-// #5 task 只建骨架,真实 case 由 #6 task 填(3 条/场景 × 7 场景 = 21 条)。
-// 加载器会跳过 // 和 # 开头的注释行,所以这个文件目前是合法但空的数据集。
+// Phase 10.2 #6 — 21 条评测用例(3 条/场景 × 7 场景)
+// 格式:每行一个 JSON 对象,// 或 # 开头的行是注释(加载器自动跳过)
+
+// ═══════════════════════════════════════════════════════════════
+// rag 场景(3 条)—— 纯 RAG 检索,期望调 searchKnowledge
+// ═══════════════════════════════════════════════════════════════
+
+{"id":"rag-001","scenario":"rag","input":"什么是 SwiftUI 的 @State？","expected":{"tools":["searchKnowledge"],"keywords":["@State","状态"]}}
+{"id":"rag-002","scenario":"rag","input":"Swift 的 Optional 是什么？怎么解包？","expected":{"tools":["searchKnowledge"],"keywords":["Optional","nil"]}}
+{"id":"rag-003","scenario":"rag","input":"SwiftUI 里 VStack 和 HStack 有什么区别？","expected":{"tools":["searchKnowledge"],"keywords":["VStack","HStack"]}}
+
+// ═══════════════════════════════════════════════════════════════
+// evaluate 场景(3 条)—— 评估用户答案,期望调 evaluateAnswer
+// ═══════════════════════════════════════════════════════════════
+
+{"id":"eval-001","scenario":"evaluate","input":"帮我评估一下我的答案：@State 是用来管理视图状态的属性包装器，当值改变时视图会自动刷新。","expected":{"tools":["evaluateAnswer"]}}
+{"id":"eval-002","scenario":"evaluate","input":"我认为 Optional 就是可以为空的变量，对吗？请帮我评估。","expected":{"tools":["evaluateAnswer"],"keywords":["Optional"]}}
+{"id":"eval-003","scenario":"evaluate","input":"判断我的回答对不对：Swift 的 protocol 就是 Java 的 interface，完全一样。","expected":{"tools":["evaluateAnswer"]}}
+
+// ═══════════════════════════════════════════════════════════════
+// recommend 场景(3 条)—— 推荐下一步学习内容,期望调 recommendNextTopic
+// ═══════════════════════════════════════════════════════════════
+
+{"id":"rec-001","scenario":"recommend","input":"我刚学完 @State，下一步该学什么？","expected":{"tools":["recommendNextTopic"]}}
+{"id":"rec-002","scenario":"recommend","input":"推荐我接下来学习什么 Swift 知识点","expected":{"tools":["recommendNextTopic"]}}
+{"id":"rec-003","scenario":"recommend","input":"学完 Optional 后，建议我继续学什么？","expected":{"tools":["recommendNextTopic"]}}
+
+// ═══════════════════════════════════════════════════════════════
+// explain 场景(3 条)—— 解释概念,可能调 searchKnowledge 也可能不调
+// 这类 case 不强制验证 tool,只验证关键词(Agent 自主决定是否需要检索)
+// ═══════════════════════════════════════════════════════════════
+
+{"id":"exp-001","scenario":"explain","input":"用通俗语言解释 MVC 和 MVVM 的区别","expected":{"keywords":["MVC","MVVM"]}}
+{"id":"exp-002","scenario":"explain","input":"给我讲讲闭包是什么，像 Android 的 lambda 一样吗？","expected":{"keywords":["闭包"]}}
+{"id":"exp-003","scenario":"explain","input":"什么是 SwiftUI 的 @Binding，和 @State 有什么关系？","expected":{"keywords":["@Binding","@State"]}}
+
+// ═══════════════════════════════════════════════════════════════
+// quiz 场景(3 条)—— 出题,期望调 generateQuiz
+// ═══════════════════════════════════════════════════════════════
+
+{"id":"quiz-001","scenario":"quiz","input":"给我出一道关于 Swift Optional 的题","expected":{"tools":["generateQuiz"]}}
+{"id":"quiz-002","scenario":"quiz","input":"来一道 SwiftUI @State 的选择题","expected":{"tools":["generateQuiz"],"keywords":["@State"]}}
+{"id":"quiz-003","scenario":"quiz","input":"测试我对 protocol 的理解，出道题吧","expected":{"tools":["generateQuiz"]}}
+
+// ═══════════════════════════════════════════════════════════════
+// multiturn 场景(3 条)—— 多轮上下文
+// 这类 case 没有 history 传入(runAgent 目前是单轮),所以 Agent 应该
+// 意识到缺少上下文并给出合理回应。主要验证 Agent 不会瞎编前文内容。
+// ═══════════════════════════════════════════════════════════════
+
+{"id":"mt-001","scenario":"multiturn","input":"继续刚才的话题，再深入讲讲","expected":{"keywords":["上下文","之前","上一次","历史","记录","对话","聊天"]}}
+{"id":"mt-002","scenario":"multiturn","input":"你刚才说的那个概念，能再详细解释一下吗？","expected":{"keywords":["上下文","之前","上一次","历史","记录","对话","聊天"]}}
+{"id":"mt-003","scenario":"multiturn","input":"基于前面的讨论，帮我总结一下要点","expected":{"keywords":["上下文","之前","上一次","历史","记录","对话","聊天"]}}
+
+// ═══════════════════════════════════════════════════════════════
+// chat 场景(3 条)—— 闲聊,期望不调任何 tool
+// tools: [] 表示"期望 tool 调用列表为空",toolChoice evaluator 会检查
+// 实际 toolCalls 是否也为空(空 = 满分,调了任何 tool = 扣分)
+// ═══════════════════════════════════════════════════════════════
+
+{"id":"chat-001","scenario":"chat","input":"你好","expected":{"tools":[]}}
+{"id":"chat-002","scenario":"chat","input":"你是谁？你能帮我做什么？","expected":{"tools":[]}}
+{"id":"chat-003","scenario":"chat","input":"今天天气真不错啊","expected":{"tools":[]}}

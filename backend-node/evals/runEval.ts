@@ -22,6 +22,8 @@
  * ──────────────────────────────────────────────────────────────────
  */
 
+import { writeFile } from "node:fs/promises";
+
 import { loadDataset, DEFAULT_DATASET_PATH } from "./lib/dataset";
 import { runAgent } from "./lib/runAgent";
 import type { EvalCase, EvalResult, Evaluator, EvaluatorOutcome } from "./lib/types";
@@ -57,6 +59,12 @@ type CliArgs = {
   datasetPath: string;
   quick: boolean;
   failBelow: number | null;
+  /**
+   * Phase 10.3 #11 新增 —— 把 markdown 格式的报告写到文件。
+   * CI 里用这个文件内容发 PR 评论。
+   * 不指定就不写文件(只在终端打印)。
+   */
+  reportFile: string | null;
 };
 
 /**
@@ -67,12 +75,14 @@ type CliArgs = {
  *   --quick
  *   --fail-below 0.7
  *   --dataset evals/datasets/custom.jsonl
+ *   --report-file eval-report.md
  */
 function parseCliArgs(): CliArgs {
   const args = process.argv.slice(2);
   let datasetPath = DEFAULT_DATASET_PATH;
   let quick = false;
   let failBelow: number | null = null;
+  let reportFile: string | null = null;
 
   for (let i = 0; i < args.length; i++) {
     switch (args[i]) {
@@ -98,13 +108,21 @@ function parseCliArgs(): CliArgs {
         }
         break;
 
+      case "--report-file":
+        reportFile = args[++i];
+        if (!reportFile) {
+          console.error("❌ --report-file requires a file path");
+          process.exit(1);
+        }
+        break;
+
       default:
         console.error(`❌ Unknown argument: ${args[i]}`);
         process.exit(1);
     }
   }
 
-  return { datasetPath, quick, failBelow };
+  return { datasetPath, quick, failBelow, reportFile };
 }
 
 // ─────────────────────────────────────────────────────────────────
@@ -259,17 +277,109 @@ function printReport(reports: CaseReport[]): number {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// Markdown 报告（给 PR 评论用）
+// ─────────────────────────────────────────────────────────────────
+
+/**
+ * Phase 10.3 #11 — 生成 markdown 格式的报告。
+ *
+ * 这段 markdown 会被 CI 的 github-script action 读取,
+ * 然后作为评论贴到 PR 页面上。
+ *
+ * 格式设计:
+ *   - 顶部用 emoji 一眼看出 pass/fail
+ *   - 明细表用 markdown table(GitHub 原生渲染)
+ *   - 按 scenario 和 evaluator 分组汇总
+ *   - 底部带总分和总耗时
+ */
+function generateMarkdownReport(
+  reports: CaseReport[],
+  overall: number,
+  totalMs: number,
+  failBelow: number | null
+): string {
+  const evalNames = EVALUATORS.map((e) => e.name);
+  const passed = failBelow === null || overall >= failBelow;
+  const lines: string[] = [];
+
+  // ── 标题 ──
+  lines.push(passed ? "## ✅ Eval Passed" : "## ❌ Eval Failed");
+  lines.push("");
+  lines.push(`**Overall Score: ${overall.toFixed(3)}**` +
+    (failBelow !== null ? ` (threshold: ${failBelow})` : "") +
+    ` | ${reports.length} cases | ${(totalMs / 1000).toFixed(1)}s`);
+  lines.push("");
+
+  // ── 明细表 ──
+  lines.push("### Details");
+  lines.push("");
+  lines.push("| case | scenario | " + evalNames.join(" | ") + " | ms |");
+  lines.push("|------|----------|" + evalNames.map(() => "---").join("|") + "|---:|");
+
+  for (const report of reports) {
+    const cells = [
+      report.evalCase.id,
+      report.evalCase.scenario,
+      ...report.outcomes.map((o) => o.score === null ? "—" : o.score.toFixed(2)),
+      String(report.result.durationMs),
+    ];
+    const suffix = report.result.error ? " ⚠️" : "";
+    lines.push("| " + cells.join(" | ") + " |" + suffix);
+  }
+  lines.push("");
+
+  // ── 按 scenario 汇总 ──
+  const byScenario = new Map<string, number[]>();
+  const byEvaluator = new Map<string, number[]>();
+  for (const name of evalNames) byEvaluator.set(name, []);
+
+  for (const report of reports) {
+    for (let i = 0; i < report.outcomes.length; i++) {
+      const s = report.outcomes[i].score;
+      if (s !== null) {
+        const scenarioScores = byScenario.get(report.evalCase.scenario) ?? [];
+        scenarioScores.push(s);
+        byScenario.set(report.evalCase.scenario, scenarioScores);
+        byEvaluator.get(evalNames[i])!.push(s);
+      }
+    }
+  }
+
+  lines.push("### By Scenario");
+  lines.push("");
+  lines.push("| scenario | avg | scores |");
+  lines.push("|----------|----:|-------:|");
+  for (const [scenario, scores] of byScenario) {
+    const avg = scores.reduce((a, b) => a + b, 0) / scores.length;
+    lines.push(`| ${scenario} | ${avg.toFixed(3)} | ${scores.length} |`);
+  }
+  lines.push("");
+
+  lines.push("### By Evaluator");
+  lines.push("");
+  lines.push("| evaluator | avg | scores |");
+  lines.push("|-----------|----:|-------:|");
+  for (const [name, scores] of byEvaluator) {
+    const avg = scores.length > 0 ? scores.reduce((a, b) => a + b, 0) / scores.length : 0;
+    lines.push(`| ${name} | ${avg.toFixed(3)} | ${scores.length} |`);
+  }
+
+  return lines.join("\n");
+}
+
+// ─────────────────────────────────────────────────────────────────
 // 主函数
 // ─────────────────────────────────────────────────────────────────
 
 async function main() {
   const startedAt = Date.now();
-  const { datasetPath, quick, failBelow } = parseCliArgs();
+  const { datasetPath, quick, failBelow, reportFile } = parseCliArgs();
 
   console.log("🚀 Eval started");
   console.log(`   Dataset:    ${datasetPath}`);
   console.log(`   Mode:       ${quick ? `quick (first ${QUICK_LIMIT} cases)` : "full"}`);
   console.log(`   Fail below: ${failBelow !== null ? failBelow : "(none)"}`);
+  console.log(`   Report file:${reportFile ?? "(none, terminal only)"}`);
   console.log(`   Evaluators: ${EVALUATORS.map((e) => e.name).join(", ")}`);
 
   // 1. 读数据集
@@ -289,13 +399,20 @@ async function main() {
     reports.push(report);
   }
 
-  // 3. 打印报告
+  // 3. 打印终端报告
   const overall = printReport(reports);
 
   const totalMs = Date.now() - startedAt;
   console.log(`\n⏱️  Total time: ${(totalMs / 1000).toFixed(1)}s`);
 
-  // 4. CI gating:总分低于阈值 → 退出码 1
+  // 4. 写 markdown 报告文件(给 CI PR 评论用)
+  if (reportFile) {
+    const md = generateMarkdownReport(reports, overall, totalMs, failBelow);
+    await writeFile(reportFile, md, "utf-8");
+    console.log(`📝 Report written to ${reportFile}`);
+  }
+
+  // 5. CI gating:总分低于阈值 → 退出码 1
   if (failBelow !== null && overall < failBelow) {
     console.log(`\n🔴 FAIL: overall ${overall.toFixed(3)} < threshold ${failBelow}`);
     process.exit(1);

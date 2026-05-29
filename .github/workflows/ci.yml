@@ -1,0 +1,165 @@
+# Phase 10.3 #10 — GitHub Actions CI
+#
+# 这个文件告诉 GitHub："每次有人 push 或提 PR 时，帮我自动跑这些检查。"
+#
+# 触发时机：
+#   - push 到 main 分支（合并后验证）
+#   - 任何 PR 对 main 的提交（合并前拦截）
+#
+# 做了什么：
+#   1. TypeScript 编译检查（有没有类型错误）
+#   2. Eval 快速检查（跑前 5 条 case，确认 Agent 没被改坏）
+#
+# Android 类比：
+#   就像在 GitHub 上配了 ./gradlew build + ./gradlew test，
+#   每次 push 自动跑，不通过就标红。
+#
+# 费用：
+#   GitHub 公开仓库免费无限用；私有仓库每月 2000 分钟免费额度。
+#   --quick 模式 5 条 case 大约跑 1-2 分钟，不会烧额度。
+
+name: CI
+
+# ─── 权限 ───
+# 让 CI 有权限在 PR 上发评论（#11 PR 自动评论需要）
+permissions:
+  contents: read
+  pull-requests: write
+
+# ─── 什么时候触发 ───
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# ─── 跑什么 ───
+jobs:
+  check:
+    # 用 GitHub 提供的免费 Ubuntu 虚拟机
+    runs-on: ubuntu-latest
+
+    # 超时保护：万一 eval 卡住（比如 API 无响应），最多跑 10 分钟就杀掉
+    timeout-minutes: 10
+
+    steps:
+      # 第一步：把代码拉下来
+      # 相当于 git clone，但用 GitHub 官方 action 更快（有缓存优化）
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      # 第二步：装 Node.js
+      # 指定版本确保本地和 CI 环境一致，避免"我本地能跑 CI 跑不了"
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: backend-node/package-lock.json
+
+      # 第三步：安装依赖
+      # ci 比 install 更严格：严格按 package-lock.json 装，不会偷偷升级版本
+      - name: Install dependencies
+        working-directory: backend-node
+        run: npm ci
+
+      # 第四步：Prisma 生成客户端
+      # Prisma 需要 generate 才能产出 @prisma/client 的类型定义，
+      # 不跑这步的话后面 tsc 编译会报"找不到 @prisma/client"
+      - name: Generate Prisma client
+        working-directory: backend-node
+        run: npx prisma generate
+
+      # 第五步：TypeScript 编译检查
+      # 只检查类型，不输出 .js 文件（--noEmit）
+      # 相当于 Android 的 ./gradlew compileDebugKotlin —— 只编译不打包
+      - name: TypeScript check
+        working-directory: backend-node
+        run: npx tsc --noEmit
+
+      # 第六步：Eval 快速检查
+      # --quick 只跑前 5 条 case（省 API token + 省 CI 时间）
+      # --fail-below 0.6 总分低于 0.6 就报错（CI 标红）
+      #
+      # 阈值为什么设 0.6 不是 0.7：
+      #   LLM 输出有随机性，同一条 case 跑两次分数可能不同。
+      #   设太高会导致 CI 偶尔红（flaky），设太低等于没守。
+      #   0.6 是一个"明显变差才报警"的安全线。
+      #
+      # 需要 DEEPSEEK_API_KEY：
+      #   从 GitHub Secrets 里读（你在仓库 Settings > Secrets 里配）。
+      #   CI 日志里不会打印这个值，GitHub 会自动脱敏。
+      # 第六步：Eval 快速检查 + 生成报告文件
+      # --report-file 把 markdown 报告写到文件，后面的 step 读它发 PR 评论
+      # 注意 `if: always()` 不在这里——eval 失败时后面的评论 step 仍然要跑，
+      # 所以用 `continue-on-error` 让 eval 失败不阻塞后续 step。
+      - name: Eval (quick)
+        id: eval
+        working-directory: backend-node
+        continue-on-error: true
+        env:
+          DEEPSEEK_API_KEY: ${{ secrets.DEEPSEEK_API_KEY }}
+        run: npm run eval -- --quick --fail-below 0.6 --report-file eval-report.md
+
+      # ─── Phase 10.3 #11：PR 自动评论 ───
+      #
+      # 只在 PR 时才发评论（push 到 main 时不发，没有 PR 页面可贴）。
+      # 读取上一步生成的 eval-report.md，用 GitHub API 贴到 PR 评论区。
+      #
+      # permissions 需要 pull-requests: write（在顶层已配）。
+      #
+      # 如果找到之前的评论（通过标记 <!-- eval-report --> 识别），
+      # 就更新它而不是每次新建——避免 PR 评论区堆满重复报告。
+      - name: Post eval report to PR
+        if: github.event_name == 'pull_request' && always()
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reportPath = 'backend-node/eval-report.md';
+
+            // 读报告文件（eval 可能失败没生成，要容错）
+            let body;
+            try {
+              body = fs.readFileSync(reportPath, 'utf-8');
+            } catch {
+              body = '## ⚠️ Eval Report Unavailable\n\nEval did not produce a report file. Check the CI logs for details.';
+            }
+
+            // 加一个隐藏标记，用于下次找到这条评论并更新它
+            const marker = '<!-- eval-report -->';
+            body = marker + '\n' + body;
+
+            // 找已有的评论
+            const { data: comments } = await github.rest.issues.listComments({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number: context.issue.number,
+            });
+            const existing = comments.find(c => c.body?.includes(marker));
+
+            if (existing) {
+              // 更新已有评论（不堆新的）
+              await github.rest.issues.updateComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                comment_id: existing.id,
+                body,
+              });
+            } else {
+              // 第一次，创建新评论
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body,
+              });
+            }
+
+      # 最后：如果 eval 失败了，把整个 job 标红
+      # 前面用了 continue-on-error 让评论 step 能跑，这里补回失败状态
+      - name: Check eval result
+        if: steps.eval.outcome == 'failure'
+        run: |
+          echo "❌ Eval failed (see report above)"
+          exit 1

@@ -8,6 +8,7 @@
 
 # Node.js backend
 backend-node/node_modules/
+backend-node/eval-report.md
 backend-node/dist/
 backend-node/npm-debug.log*
 backend-node/yarn-debug.log*

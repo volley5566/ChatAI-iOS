@@ -149,7 +149,27 @@ export type ChatStreamEvent = ChatStreamEventMetadata &
      *   ——前端拿到 id 也只能得到 503,所以行为上等价于"没 id"
      * - 极端情况下(stream 还没出 on_chain_start 就异常)也能优雅缺省
      */
-    | { type: "done"; run_id?: string }
+    | {
+        type: "done";
+        run_id?: string;
+        /**
+         * Phase 10.4 #13 — 本次 Agent 调用消耗的 token 用量。
+         *
+         * 包含三个字段:
+         *   prompt_tokens:所有模型调用的 input token 总和
+         *   completion_tokens：所有模型调用的 output token 总和
+         *   total_tokens：prompt + completion
+         *
+         * 命名用 snake_case 是因为这是 SSE → iOS 的协议层,
+         * 和 run_id / system_prompt 等现有字段风格一致。
+         *
+         * iOS 端可以用这些数据展示"本次回答消耗了多少 token",
+         * 也可以做客户端侧的成本统计。
+         */
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        total_tokens?: number;
+      }
     | { type: "error"; error: string }
     | {
         type: "tool_start";

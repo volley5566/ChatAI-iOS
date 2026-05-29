@@ -1,5 +1,7 @@
 import express, { Request, Response } from "express";
 import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
 import { runLangChainAgentStream } from "./agent/agentRunner";
 import {
   createAgentRequestId,
@@ -52,8 +54,57 @@ import {
 // 创建后端服务。
 const app = express();
 
+/**
+ * Phase 10.4 #12 — Helmet 安全头。
+ *
+ * 一行代码给每个 HTTP 响应自动加一堆安全相关的 header:
+ *   X-Content-Type-Options: nosniff     ← 防止浏览器猜测 MIME 类型(XSS 防护)
+ *   X-Frame-Options: SAMEORIGIN         ← 防止页面被嵌入 iframe(点击劫持防护)
+ *   X-XSS-Protection: 0                 ← 关掉老浏览器的 XSS 过滤(现代浏览器有 CSP)
+ *   Strict-Transport-Security           ← 强制 HTTPS
+ *   ...还有十几个
+ *
+ * 不影响 API 行为,纯安全加固。没有它,安全扫描工具会报一堆"缺少安全头"的 warning。
+ *
+ * Android 类比: 就像 AndroidManifest 里的 android:usesCleartextTraffic="false",
+ * 一个配置项提升整体安全基线。
+ */
+app.use(helmet());
+
 // 允许 iOS / 浏览器跨域访问。
 app.use(cors());
+
+/**
+ * Phase 10.4 #12 — Rate Limiting(限流)。
+ *
+ * 防止有人疯狂调接口(恶意攻击 / 爬虫 / 写了个死循环的客户端):
+ *   - 同一个 IP,15 分钟内最多 100 次请求
+ *   - 超了就返回 429 "Too Many Requests"
+ *
+ * 为什么限流很重要:
+ *   每次 /api/agent/stream 调用都会消耗 DeepSeek API token(花钱),
+ *   没有限流的话,一个恶意脚本就能把你的 API 余额烧光。
+ *
+ * 为什么是 100 次 / 15 分钟:
+ *   正常用户 15 分钟内不太可能发超过 100 条消息。
+ *   这个值偏宽松——生产环境可以按实际用量收紧。
+ *
+ * standardHeaders: true → 在响应头里带 RateLimit-* 标准字段,
+ *   iOS 端可以读这些头来提前显示"请稍后再试"。
+ *
+ * Android 类比: 就像 OkHttp Interceptor 里检查请求频率,
+ * 超限就直接返回 429 不往下游发。
+ */
+const apiLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,  // 15 分钟
+  limit: 100,                 // 每个 IP 最多 100 次
+  standardHeaders: true,      // 返回标准 RateLimit-* 头
+  legacyHeaders: false,       // 不返回老式 X-RateLimit-* 头
+  message: { error: "Too many requests, please try again later." },
+});
+
+// 只给 /api 路径加限流(健康检查 /health 不限)
+app.use("/api", apiLimiter);
 
 // express.json() 让后端能读取 JSON 请求体。
 // limit: "1mb" 是限制请求体大小，避免用户传超大内容。
@@ -407,6 +458,11 @@ app.post(
         toolCallCount: agentRun.toolCallCount,
         deltaCount,
         outputCharCount,
+        /**
+         * Phase 10.4 #13 — 在请求完成日志里记录 token 用量。
+         * 方便用 grep 或日志平台做成本统计。
+         */
+        usage: agentRun.usage,
       });
 
       if (clientClosed) {
@@ -453,11 +509,26 @@ app.post(
          * 这条字段做成可选,如果 runner 没拿到根 run id(理论上不会发生)
          * 就不发,前端的"反馈按钮"应该自然降级隐藏。
          */
+        /**
+         * Phase 10.4 #13 — done 事件带上 token 用量。
+         *
+         * agentRun.usage 来自 runner(无论 Phase 3 还是 Phase 4 路径),
+         * 是所有 ReAct 循环中模型调用的 token 累加值。
+         *
+         * SSE 协议层字段名用 snake_case(prompt_tokens / completion_tokens / total_tokens),
+         * 和 run_id / duration_ms 保持一致。
+         *
+         * iOS 拿到后可以在"消息详情"里展示 token 消耗,
+         * 或者做客户端侧的每日/每月成本统计。
+         */
         writeAgentSseEvent({
           type: "done",
           phase: "request_completed",
           duration_ms: totalDurationMs,
           run_id: agentRun.rootRunId,
+          prompt_tokens: agentRun.usage.promptTokens,
+          completion_tokens: agentRun.usage.completionTokens,
+          total_tokens: agentRun.usage.totalTokens,
         });
       }
 

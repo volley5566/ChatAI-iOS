@@ -4,6 +4,7 @@ import {
   BaseMessage,
   HumanMessage,
 } from "@langchain/core/messages";
+import type { TokenUsage } from "./agentGraph";
 import {
   createAgent,
   modelCallLimitMiddleware,
@@ -38,6 +39,12 @@ export type LangChainAgentRunResult = {
    * 详细说明见 agentGraph.ts 的同名字段;两条路径的产出口径保持一致。
    */
   rootRunId: string | undefined;
+  /**
+   * Phase 10.4 #13 — 本次 Agent 调用消耗的 token 总量。
+   * 与 agentGraph.ts(Phase 4 路径)的同名字段对齐,
+   * 两条路径的返回值结构保持一致,gateway 层不用分别处理。
+   */
+  usage: TokenUsage;
 };
 
 type RunLangChainAgentStreamOptions = {
@@ -98,6 +105,21 @@ export async function runLangChainAgentStream({
    * 细节同 agentGraph.ts:第一个 parent_ids 为空的 on_chain_start 即根 run。
    */
   let rootRunId: string | undefined;
+
+  /**
+   * Phase 10.4 #13 — 累加 token 用量。
+   *
+   * 和 agentGraph.ts(Phase 4 路径)完全相同的做法:
+   * 每次模型调用结束(on_chat_model_end)时从 AIMessage.usage_metadata 读取,
+   * 累加到这两个变量。最后组装成 TokenUsage 返回。
+   *
+   * createAgent 的 ReAct 循环可能包含多次模型调用:
+   *   第 1 次:模型决定调工具 → 第 2 次:基于工具结果生成回答
+   * 所以 token 要累加,不是只取最后一次。
+   */
+  let promptTokens = 0;
+  let completionTokens = 0;
+
   //Agent Runner 加载工具(LangChain Phase 2 入口)
   const tools = await loadLangChainTools(requestId, {
     onToolEvent,
@@ -282,10 +304,31 @@ export async function runLangChainAgentStream({
           const modelStartedAt = modelCallStarts.get(event.run_id);
           modelCallStarts.delete(event.run_id);
 
+          /**
+           * Phase 10.4 #13 — 模型调用结束,收集 token 用量。
+           *
+           * 和 agentGraph.ts 完全相同的逻辑:
+           * LangChain 把 DeepSeek API 返回的 usage 字段
+           * 转存到 AIMessage.usage_metadata 上:
+           *   { input_tokens: 1200, output_tokens: 350, total_tokens: 1550 }
+           *
+           * 一次 Agent 请求里可能有多次模型调用(ReAct 循环),
+           * 每次 on_chat_model_end 都累加,最终得到总用量。
+           */
+          const output = (event.data as { output?: AIMessageChunk } | undefined)?.output;
+          const usageMeta = output?.usage_metadata;
+          if (usageMeta) {
+            promptTokens += usageMeta.input_tokens ?? 0;
+            completionTokens += usageMeta.output_tokens ?? 0;
+          }
+
           logAgentInfo(requestId, "model_call", "completed", {
             runId: event.run_id,
             modelName: event.name,
             durationMs: modelStartedAt ? Date.now() - modelStartedAt : undefined,
+            usage: usageMeta
+              ? { input: usageMeta.input_tokens, output: usageMeta.output_tokens }
+              : undefined,
           });
           break;
         }
@@ -326,17 +369,25 @@ export async function runLangChainAgentStream({
     throw error;
   }
 
+  const usage: TokenUsage = {
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+  };
+
   logAgentInfo(requestId, "langchain_agent", "completed", {
     durationMs: getDurationMs(startedAt),
     toolCallCount,
     outputCharCount: outputText.length,
     rootRunId: rootRunId ?? "(missing)",
+    usage,
   });
 
   return {
     outputText,
     toolCallCount,
     rootRunId,
+    usage,
   };
 }
 

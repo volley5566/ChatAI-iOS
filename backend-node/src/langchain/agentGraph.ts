@@ -77,6 +77,24 @@ import { getSqliteCheckpointer } from "../db/sqliteCheckpointer";
  * createAgent 帮你预设好了,Phase 4 我们自己用 StateGraph 拼。
  */
 
+/**
+ * Phase 10.4 #13 — Token 用量统计。
+ *
+ * DeepSeek API 每次返回结果时会带 usage 字段,LangChain 在 on_chat_model_end
+ * 事件的 AIMessage.usage_metadata 里暴露出来。
+ *
+ * 一次 Agent 调用可能有多次模型调用(ReAct 循环:模型 → 工具 → 模型 → ...),
+ * 所以我们需要把所有模型调用的 token 加起来。
+ */
+export type TokenUsage = {
+  /** 所有模型调用的 input token 总和 */
+  promptTokens: number;
+  /** 所有模型调用的 output token 总和 */
+  completionTokens: number;
+  /** promptTokens + completionTokens */
+  totalTokens: number;
+};
+
 export type LangGraphAgentRunResult = {
   outputText: string;
   toolCallCount: number;
@@ -92,6 +110,11 @@ export type LangGraphAgentRunResult = {
    * (基本不会发生,但类型上留容错)。
    */
   rootRunId: string | undefined;
+  /**
+   * Phase 10.4 #13 — 本次 Agent 调用消耗的 token 总量。
+   * 累加了所有 ReAct 循环中的模型调用。
+   */
+  usage: TokenUsage;
 };
 
 type RunLangGraphAgentStreamOptions = {
@@ -144,6 +167,18 @@ export async function runLangGraphAgentStream({
    * 就是根 run(也就是整张图本身的启动事件)。一旦捕到就不再覆盖。
    */
   let rootRunId: string | undefined;
+
+  /**
+   * Phase 10.4 #13 — 累加 token 用量。
+   *
+   * 每次模型调用结束(on_chat_model_end)时,从 AIMessage.usage_metadata 里
+   * 读取本次调用的 token 数量,累加到这里。
+   *
+   * 一次 Agent 请求里可能有 2-6 次模型调用(ReAct 循环),
+   * 所以最终的 usage 是所有模型调用的总和。
+   */
+  let promptTokens = 0;
+  let completionTokens = 0;
 
   /**
    * 第一步:加载工具(和 Phase 3 一样,从 MCP 拉)。
@@ -366,6 +401,29 @@ export async function runLangGraphAgentStream({
           break;
         }
 
+        case "on_chat_model_end": {
+          /**
+           * Phase 10.4 #13 — 模型调用结束,收集 token 用量。
+           *
+           * LangChain 在 on_chat_model_end 事件的 output(AIMessage)里
+           * 挂了一个 usage_metadata 字段:
+           *   { input_tokens: 1200, output_tokens: 350, total_tokens: 1550 }
+           *
+           * 这个数据来自 DeepSeek API 返回的 usage 字段,
+           * LangChain 只是把它转存到了 AIMessage 上。
+           *
+           * 注意:一次 Agent 请求里可能有多次模型调用(ReAct 循环),
+           * 每次 on_chat_model_end 都累加,最终得到总用量。
+           */
+          const output = (event.data as { output?: AIMessageChunk } | undefined)?.output;
+          const usageMeta = output?.usage_metadata;
+          if (usageMeta) {
+            promptTokens += usageMeta.input_tokens ?? 0;
+            completionTokens += usageMeta.output_tokens ?? 0;
+          }
+          break;
+        }
+
         case "on_tool_start": {
           /**
            * SSE tool_start 已经在 agentTools.ts wrapper 里发了,
@@ -398,17 +456,25 @@ export async function runLangGraphAgentStream({
     throw error;
   }
 
+  const usage: TokenUsage = {
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+  };
+
   logAgentInfo(requestId, "langgraph_agent", "completed", {
     durationMs: getDurationMs(startedAt),
     toolCallCount,
     outputCharCount: outputText.length,
     rootRunId: rootRunId ?? "(missing)",
+    usage,
   });
 
   return {
     outputText,
     toolCallCount,
     rootRunId,
+    usage,
   };
 }
 

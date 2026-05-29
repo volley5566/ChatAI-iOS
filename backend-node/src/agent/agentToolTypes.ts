@@ -1,25 +1,26 @@
 /**
- * Agent 工具共享类型。
+ * ═══════════════════════════════════════════════════════════════════
+ * agent/agentToolTypes.ts — Agent 工具共享类型(项目内部统一结果格式)
+ * ═══════════════════════════════════════════════════════════════════
  *
- * 放在 agent 目录里，是因为这是“Agent 内部统一结果格式”，
- * 不是 MCP 协议类型，也不是 OpenAI SDK 类型。
+ * 在整体流程中的位置:
+ *   mcpClient.ts 把 MCP result 转成 AgentToolExecutionResult
+ *   agentTools.ts 用它生成 tool_done 事件
+ *   LangChain Tool wrapper 把它 JSON.stringify 后交回模型
  *
- * 好处：
- * - mcpClient.ts 可以把 MCP result 转成这个格式
- * - agentTools.ts 可以用这个格式生成 tool_done 事件
- * - agentRunner.ts 可以把这个格式 JSON.stringify 后交回模型
+ * 放在 agent/ 目录:这是"Agent 内部统一结果格式",
+ * 不是 MCP 协议类型,也不是 OpenAI SDK 类型——是项目自己的边界类型。
  */
+
 /**
- * Agent 当前支持的工具名。
+ * Agent 当前支持的工具名(4 个工具组成学习闭环):
+ *   searchKnowledge       → 讲解(配合模型自由作答)
+ *   generateQuiz          → 出题
+ *   evaluateAnswer        → 批改
+ *   recommendNextTopic    → 规划下一步
  *
- * Phase 7 起从 2 个工具扩展到 4 个,形成完整的"学习闭环":
- *   searchKnowledge       -> 讲解(配合模型自由作答)
- *   generateQuiz          -> 出题
- *   evaluateAnswer        -> 批改  (Phase 7.1 新增)
- *   recommendNextTopic    -> 规划下一步  (Phase 7.2 新增)
- *
- * 这个 union 主要用于类型提示。运行时工具列表是由 MCP server 动态注册的,
- * 加新工具时这里要同步更新——否则 TS 编译能通过,但 IDE 提示会过时。
+ * 这个 union 主要用于类型提示。运行时工具列表由 MCP server 动态注册——
+ * 加新工具时这里要同步更新,否则 TS 编译能通过但 IDE 提示会过时。
  */
 export type AgentToolName =
   | "searchKnowledge"

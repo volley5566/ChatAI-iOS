@@ -2,13 +2,14 @@ import path from "path";
 import { SqliteSaver } from "@langchain/langgraph-checkpoint-sqlite";
 
 /**
- * Phase 5.2 — LangGraph SqliteSaver 单例工厂。
+ * ═══════════════════════════════════════════════════════════════════
+ * db/sqliteCheckpointer.ts — LangGraph SqliteSaver 单例工厂
+ * ═══════════════════════════════════════════════════════════════════
  *
- * ─────────────────────────────────────────────────────────────────────
- * 这个文件干两件事:
- *   1. 创建一个共享的 SqliteSaver 实例(整个进程只有一个)
- *   2. 让 agentGraph.ts 编译图时挂上它
- * ─────────────────────────────────────────────────────────────────────
+ * 在整体流程中的位置:
+ *   agentGraph.ts 编译图时调 getSqliteCheckpointer():
+ *     const graph = builder.compile({ checkpointer: getSqliteCheckpointer() });
+ *   有了它,thread_id 跨请求的对话历史就能自动持久化。
  *
  * # 什么是 SqliteSaver?
  *

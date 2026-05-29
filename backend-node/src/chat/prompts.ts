@@ -1,8 +1,27 @@
 /**
- * 它把角色说明、RAG context、输出格式规则拼起来
+ * ═══════════════════════════════════════════════════════════════════
+ * chat/prompts.ts — 所有 system prompt 在这里集中拼装
+ * ═══════════════════════════════════════════════════════════════════
  *
- * 结构化接口使用的输出规则。
+ * 在整体流程中的位置:
+ *   chatCompletion.ts(普通 RAG)/ agentRunner.ts(Agent 路径)
+ *   都调这里的 buildXxxInstructions(systemPrompt, knowledgeContext)。
+ *
+ * # 三种 instruction 拼装方式
+ *   buildInstructions          → /api/chat 结构化 JSON 输出
+ *   buildStreamingInstructions → /api/chat/stream 普通对话
+ *   buildAgentInstructions     → /api/agent/stream(不预塞 RAG context,
+ *                                 让 Agent 自己决定要不要调 searchKnowledge)
+ *
+ * # 各部分:
+ *   - rolePrompt              → 角色身份(用户可覆盖)
+ *   - ragGuide                → 如何使用知识库 context
+ *   - structuredOutputGuide   → JSON 格式约束
+ *   - streamingOutputGuide    → 自然对话约束
+ *   - agentOutputGuide        → Agent 的工具使用规则(下面那一大段)
  */
+
+/** /api/chat 结构化接口使用的 JSON 输出规则 */
 export const structuredOutputGuide = `
 You must return only valid JSON.
 Do not return Markdown.
@@ -44,15 +63,13 @@ Use the same language as the user's question.
 `;
 
 /**
- * Phase 7.4 — Agent 系统提示重构。
+ * Agent 的系统提示词。
  *
- * 之前的 prompt 是"每加一个工具就追加一段规则",变成长长的扁平列表。
- * 这次重写后结构更清晰:
- *
+ * 结构按"功能分块":
  *   1. 身份 + 目标
  *   2. 工具盘点(4 个工具一句话能说清)
  *   3. 学习闭环(workflow):告诉模型工具之间是怎么串起来的
- *   4. 每个工具的详细调用规则(去重合并)
+ *   4. 每个工具的详细调用规则
  *   5. 常见组合链(具体场景)
  *   6. Anti-pattern(明确不能做的事)
  *   7. 输出格式
@@ -60,11 +77,10 @@ Use the same language as the user's question.
  * 这种结构有 3 个好处:
  *   - 模型先看到"系统全貌"再看细节,工具选择会更稳
  *   - 维护时容易定位(改"批改规则"就去 evaluateAnswer 那段)
- *   - 把"workflow"做成单独一节,让模型理解工具是协同的而非孤立的
+ *   - workflow 单独成节,让模型理解工具是协同而非孤立的
  *
- * 注:把规则按"功能分块"放,而不是"do/don't 平铺",
- * 是 production prompt engineering 的常见模式——
- * 模型从这种结构里更容易抽出"心智模型"而非死记。
+ * 这是 production prompt engineering 的常见模式——
+ * 模型从结构化的 prompt 里更容易抽出"心智模型"而非死记 do/don't。
  */
 export const agentOutputGuide = `
 You are an iOS / Swift / AI app development learning assistant. Your job is to help the user understand concepts, practice them, get feedback, and plan what to learn next.

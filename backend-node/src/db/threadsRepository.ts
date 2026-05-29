@@ -10,17 +10,21 @@ import { getSqliteCheckpointer } from "./sqliteCheckpointer";
 import { messageContentToString } from "../langchain/chatPrompt";
 
 /**
- * Phase 5.4 — 对话(Thread)业务封装。
+ * ═══════════════════════════════════════════════════════════════════
+ * db/threadsRepository.ts — 对话(Thread)业务封装层
+ * ═══════════════════════════════════════════════════════════════════
  *
- * ─────────────────────────────────────────────────────────────────────
- * 这一层把"对话相关的数据操作"集中起来,屏蔽两层细节:
- *   - Prisma 操作 threads 表(元信息)
- *   - LangGraph checkpointer 操作 checkpoints / writes 表(状态快照)
+ * 在整体流程中的位置:
+ *   server.ts(thread CRUD 路由) → 这个文件 →
+ *   Prisma(threads 表元信息) + checkpointer(checkpoints/writes 状态快照)
  *
- * server.ts 只调这一层,不用关心数据从哪儿来。
- * 后续如果要换数据库(SQLite → Postgres)或者换 checkpointer 实现,
- * 改这一层就行,业务路由不动。
- * ─────────────────────────────────────────────────────────────────────
+ * # 为什么单独封装一层
+ *   把"对话相关的数据操作"集中起来,屏蔽两层细节:
+ *     - Prisma   → 操作 threads 表(id / title / createdAt / updatedAt)
+ *     - 检查点    → 操作 checkpoints / writes 表(state 快照)
+ *
+ *   server.ts 只调这一层,不关心数据从哪儿来。后续换数据库(SQLite → Postgres)
+ *   或换 checkpointer 实现,改这一层就行,业务路由不动。
  */
 
 /**

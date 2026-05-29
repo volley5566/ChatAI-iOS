@@ -15,21 +15,24 @@ type CreateLangChainAgentToolsOptions = {
 };
 
 /**
- * 从 MCP server 动态创建 LangChain tools。
+ * ═══════════════════════════════════════════════════════════════════
+ * langchain/agentTools.ts — MCP → LangChain Tool 桥接层
+ * ═══════════════════════════════════════════════════════════════════
  *
- * 这是第二阶段的关键桥接层：
+ * 在整体流程中的位置:
+ *   agentRunner.ts / agentGraph.ts → 这个文件 → mcp/mcpClient.ts
  *
- *   MCP Tool definition
- *      -> LangChain tool(...)
- *      -> LangChain createAgent(...)
+ * 把 MCP server 注册的工具批量包装成 LangChain ClientTool,
+ * 让 createAgent / StateGraph 能直接当工具用。
  *
- * 好处：
- * - MCP 仍然是工具协议边界，负责工具注册、参数 schema、安全注解
- * - LangChain Agent 负责工具选择和执行编排
- * - iOS 仍然收到熟悉的 tool_start /tool_done 事件
+ * # 这一层的价值
+ *   - MCP 仍然是工具协议边界(工具注册、参数 schema、安全注解)
+ *   - LangChain Agent 负责工具选择和执行编排
+ *   - iOS 仍然收到熟悉的 tool_start / tool_done SSE
  *
- * 后续新增 MCP 工具时，只要它出现在 listTools() 中，
- * 这里就能自动包装成 LangChain Tool。
+ * # 后续新增工具的方法
+ *   只要工具出现在 MCP listTools() 里,这里就会自动包装,
+ *   不需要改 LangChain 这一层。
  */
 export async function createLangChainAgentTools(
   options: CreateLangChainAgentToolsOptions = {}
@@ -59,13 +62,10 @@ function createLangChainToolFromMcpTool(
       const toolCallId = runtime?.toolCallId || createFallbackToolCallId(mcpTool.name);
 
       /**
-       * 第三阶段：工具进度更标准。
+       * 测一次 wall-clock,塞进 tool_done.duration_ms,
+       * iOS 端可以直接显示"查询知识库 完成 (213ms)"。
        *
-       * 之前 tool_start / tool_done 只带文案，看不出每个工具实际耗时。
-       * 现在 wrapper 内部测一次 wall-clock，最终塞进 tool_done.duration_ms，
-       * iOS 端可以直接显示“查询知识库 完成 (213ms)”。
-       *
-       * 注意 startedAt 必须放在外层 try 之前——异常分支也要能算耗时。
+       * startedAt 必须放在 try 之前——异常分支也要能算耗时。
        */
       const startedAt = Date.now();
 
@@ -81,13 +81,13 @@ function createLangChainToolFromMcpTool(
         );
       } catch (error) {
         /**
-         * 和旧 Runner 一样：工具失败不让整次 Agent 请求直接失败。
-         * 失败会变成一个标准工具结果交回模型，让模型自然降级回答。
+         * 工具失败不让整次 Agent 请求直接失败:
+         * 把失败包成标准工具结果交回模型,模型自然降级回答。
          *
-         * 第三阶段没有直接接入 toolRetryMiddleware，是因为：
-         * - MCP 工具一般要么参数错（重试也没用），要么超时（再来一次只会更慢）
-         * - 学习项目里更想强调“失败被结构化、可观测”，而不是“自动重试”
-         * 真要重试，可以在 buildAgentMiddleware() 里加 toolRetryMiddleware。
+         * 没接 toolRetryMiddleware 是因为:
+         *   - MCP 工具一般要么参数错(重试也没用),要么超时(再来一次只会更慢)
+         *   - 学习项目里更想强调"失败被结构化、可观测",而不是"自动重试"
+         * 真要重试,可以在 buildAgentMiddleware() 里加 toolRetryMiddleware。
          */
         result = buildToolErrorResult(
           mcpTool.name,

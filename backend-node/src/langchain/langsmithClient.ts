@@ -3,25 +3,26 @@ import { Client } from "langsmith";
 import { langSmithProject, langSmithTracingEnabled } from "../config/env";
 
 /**
- * Phase 10.1 #2 — LangSmith Client 单例。
+ * ═══════════════════════════════════════════════════════════════════
+ * langchain/langsmithClient.ts — LangSmith Client 单例 + 反馈写入接口
+ * ═══════════════════════════════════════════════════════════════════
  *
- * 为什么单独建一个文件、而不是在 server.ts 里就地 new Client():
+ * 在整体流程中的位置:
+ *   server.ts POST /api/feedback → submitUserFeedback() →
+ *   langsmith Client.createFeedback() → smith.langchain.com
+ *
+ * # 为什么单独建一个文件
  *
  * 1. **单例复用** —— LangSmith Client 内部维护 HTTP 连接池、批量上报队列,
- *    全进程只该有一份。如果每个请求 new 一次,会出现"上一份 Client 还没
- *    flush 完,新 Client 又起来了"的浪费。
+ *    全进程只该有一份。
  *
- * 2. **集中化判 LANGSMITH_TRACING** —— Phase 10 要被多个地方调用:
- *    - 现在(#2):POST /api/feedback 写回 👍/👎
- *    - 后面(10.2):runEval.ts 创建 Experiment / 写 Run
- *    - 后面(10.4):Token / cost 追踪也可能挂 feedback
- *    集中在一处判,免得每个调用点都要复制一遍开关逻辑。
+ * 2. **集中化判 LANGSMITH_TRACING** —— 多个地方调用(/api/feedback、eval 脚本等)
+ *    都需要先判断开关,集中在一处免得每个调用点复制一遍。
  *
  * 3. **类型边界清晰** —— server.ts 不直接依赖 langsmith SDK,
- *    只看到我们自己定义的 submitUserFeedback() 接口。
- *    将来想换 SDK 版本 / 加重试 / 加 mock,改这一个文件就行。
+ *    只看到 submitUserFeedback() 接口。换 SDK / 加重试 / 加 mock 都改这一个文件。
  *
- * 这是 Android 里"Repository pattern"的思路——
+ * 这是 Android 里 "Repository pattern" 的思路——
  * 业务代码不直接碰 Retrofit/OkHttp,中间隔一层 Repository。
  */
 
@@ -68,25 +69,17 @@ export type SubmitUserFeedbackInput = {
    */
   runId: string;
   /**
-   * 评分。约定 0..1 区间:
-   *   - 1 = 👍
-   *   - 0 = 👎
+   * 评分,约定 0..1 区间:1 = 👍,0 = 👎。
    * 留浮点是为了将来支持星级(0.25 / 0.5 / 0.75 / 1)或 LLM judge 分数。
-   * LangSmith 的 ScoreType 支持 number | boolean,这里坚持用 number 统一。
    */
   score: number;
   /**
    * 评分 key,LangSmith UI 里会按这个 key 聚合成一列。
-   *
    * 默认 "user_thumb" 表示"用户手动点的赞/踩"。
-   * 后续如果想加"用户标注答错了"这种维度,可以传不同 key,
-   * 它们会在 LangSmith Feedback 列里各自独立。
+   * 加新维度(比如"用户标注答错了")传不同 key 即可。
    */
   key?: string;
-  /**
-   * 可选评论(用户写的"为什么不好")。
-   * 暂时 iOS 不收集,留接口给 #4 以后扩展。
-   */
+  /** 可选评论(用户写的"为什么不好"),iOS 第一版不收集,留协议位置 */
   comment?: string;
 };
 

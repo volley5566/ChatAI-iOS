@@ -34,6 +34,190 @@ iOS SwiftUI（对话列表 + 聊天页）
 
 ---
 
+## 0. 体系总览（看这一节就懂整个系统）
+
+### 0.1 三层心智模型
+
+把整个项目折叠成三层来理解,后面所有细节都是这三层的展开:
+
+```text
+┌────────────────────────────────────────────────────────────┐
+│  L1  客户端 (iOS SwiftUI)                                  │
+│      负责:  UI / 流式气泡 / 对话列表 / 工具进度展示         │
+│      不负责: 对话历史(交给后端 thread_id 管)               │
+└──────────────────────────┬─────────────────────────────────┘
+                           │  HTTP + SSE
+┌──────────────────────────▼─────────────────────────────────┐
+│  L2  网关 (Node.js + Express)                              │
+│      负责:  路由 / 鉴权 / Rate Limit / SSE 协议 / 持久化   │
+│      入口:  /api/agent/stream (主)  /api/chat[/stream]     │
+└──────────────────────────┬─────────────────────────────────┘
+                           │  函数调用
+┌──────────────────────────▼─────────────────────────────────┐
+│  L3  Agent 内核 (LangChain + LangGraph + MCP)             │
+│      负责:  ReAct 循环 / 工具调用 / RAG / 状态持久化       │
+│      实现:  StateGraph(默认) 或 createAgent(灰度回退)      │
+└────────────────────────────────────────────────────────────┘
+```
+
+### 0.2 模块依赖全景图
+
+```mermaid
+flowchart TB
+    subgraph iOS["L1  iOS SwiftUI"]
+        UI["ChatView / ThreadListView"]
+        VM["ChatViewModel"]
+        APIC["ChatAPIClient (SSE)"]
+    end
+
+    subgraph Gateway["L2  Express 网关 (server.ts)"]
+        ROUTE["路由 + 中间件<br/>(helmet / rate-limit)"]
+        SSE["http/sse.ts"]
+        REPO["db/threadsRepository<br/>(对话 CRUD)"]
+    end
+
+    subgraph Agent["L3  Agent 内核"]
+        ARUNR["agent/agentRunner<br/>USE_LANGGRAPH ?"]
+        GRAPH["langchain/agentGraph<br/>(StateGraph)"]
+        CRAGT["langchain/agentRunner<br/>(createAgent)"]
+        TOOLS["langchain/agentTools<br/>(MCP→LangChain 桥)"]
+    end
+
+    subgraph MCP["MCP 子进程"]
+        MCLI["mcp/mcpClient"]
+        MSRV["mcp/mcpServer"]
+        MHND["mcpToolHandlers<br/>(4 个工具)"]
+    end
+
+    subgraph Data["数据层"]
+        PRIS[("Prisma<br/>threads 表")]
+        CKPT[("SqliteSaver<br/>checkpoints 表")]
+        KB[("knowledge/*.md<br/>+ Ollama 向量")]
+    end
+
+    subgraph LLM["外部 LLM"]
+        DS["DeepSeek API"]
+        OLM["Ollama (本地 embedding)"]
+        LS["LangSmith (可选)"]
+    end
+
+    UI --> VM --> APIC -->|HTTP+SSE| ROUTE
+    ROUTE --> REPO
+    ROUTE --> ARUNR
+    REPO --> PRIS
+    ARUNR -->|true 默认| GRAPH
+    ARUNR -->|false 灰度| CRAGT
+    GRAPH --> TOOLS
+    CRAGT --> TOOLS
+    GRAPH <--> CKPT
+    TOOLS --> MCLI
+    MCLI -.stdio JSON-RPC.-> MSRV --> MHND
+    MHND --> KB
+    MHND --> DS
+    GRAPH --> DS
+    CRAGT --> DS
+    KB --> OLM
+    GRAPH -.trace.-> LS
+    GRAPH -->|streamEvents| SSE --> ROUTE
+```
+
+读图技巧:实线 = 调用,虚线 = 协议/可选;桶状图 = 数据存储;每个 subgraph 对应一个目录或职责块。
+
+### 0.3 一次请求的完整时序
+
+这是用户在 iOS 输入"SwiftUI @State 是什么?请先查知识库"后,系统内部发生的事情:
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant U as 用户
+    participant iOS as iOS App
+    participant Exp as Express
+    participant Run as agentRunner
+    participant G as StateGraph
+    participant Ck as SqliteSaver
+    participant T as Tool wrapper
+    participant M as MCP server
+    participant DS as DeepSeek
+    participant KB as 向量库
+
+    U->>iOS: 输入消息
+    iOS->>Exp: POST /api/agent/stream<br/>{message, thread_id}
+    Exp->>Exp: touchThread (Prisma upsert)
+    Exp->>Run: runLangChainAgentStream(...)
+    Run->>G: streamEvents(initial msg)
+    G->>Ck: 加载历史 state
+    Ck-->>G: 上次对话的 messages
+
+    rect rgba(180,200,255,0.18)
+    note over G,DS: ReAct 第 1 轮
+    G->>DS: 调模型(带工具 schema)
+    DS-->>G: tool_calls: searchKnowledge
+    G->>T: invoke
+    T-->>Exp: SSE tool_start
+    Exp-->>iOS: SSE tool_start
+    T->>M: callTool(searchKnowledge)
+    M->>KB: similaritySearch
+    KB-->>M: top-K chunks
+    M-->>T: tool result
+    T-->>Exp: SSE tool_done
+    Exp-->>iOS: SSE tool_done
+    end
+
+    rect rgba(180,220,180,0.18)
+    note over G,DS: ReAct 第 2 轮
+    G->>DS: 调模型(带工具结果)
+    loop 流式 token
+        DS-->>G: chunk
+        G-->>Exp: SSE delta
+        Exp-->>iOS: SSE delta
+    end
+    end
+
+    G->>Ck: 写回新 state
+    G-->>Exp: SSE done<br/>(run_id + token usage)
+    Exp-->>iOS: SSE done
+    iOS->>U: 完成展示
+```
+
+### 0.4 核心概念速查表
+
+| 概念 | 一句话 | 在哪看 |
+|---|---|---|
+| **ReAct** | "Reason→Act→Observe→Reason" 循环,模型决定调工具,框架执行,把结果丢回模型 | `agentGraph.ts` 的图形 |
+| **StateGraph** | LangGraph 的图编程模型:节点(函数) + 边(条件路由) + 共享 state | `agentGraphState/Nodes/Graph.ts` |
+| **Checkpointer** | 自动把 state 按 thread_id 存进 SQLite,跨请求恢复对话 | `db/sqliteCheckpointer.ts` |
+| **MCP** | "工具协议":Client 调 `listTools` / `callTool`,Server 暴露工具 | `mcp/` 整个目录 |
+| **Tool Calling** | 模型不真执行代码,只返回 `{name, arguments}`,框架负责调 | `agentTools.ts` 的 wrapper |
+| **RAG** | 检索 → 拼 context → 让模型基于资料回答(防胡说) | `ragRetriever.ts` |
+| **SSE** | "Server-Sent Events":单向流式 HTTP,token 一边产一边推 | `http/sse.ts` |
+| **Embedding** | 把文本变成向量,余弦相似度近 = 语义近 | `embeddings.ts` (Ollama) |
+| **LangSmith** | 可观测平台,自动 trace 每一步 + 收用户反馈 | `langsmithClient.ts` |
+| **Eval** | 离线给 Agent 出 21 道题,4 个评分器打分,改完跑一遍看分数 | `evals/` 目录 |
+
+### 0.5 三个核心权衡
+
+学习这个项目时最值得品的三个设计取舍:
+
+```text
+1. Phase 3 createAgent  vs  Phase 4 手写 StateGraph
+   - createAgent 帮你藏起 ReAct 循环,代码少但你看不见图
+   - 手写 StateGraph 你能画出每一步,但要自己管 state、边、终止条件
+   - 项目并存两条路径,USE_LANGGRAPH 灰度切换,既能学又能对比
+
+2. 有 thread_id  vs  无 thread_id
+   - 有: 后端 checkpointer 管历史,iOS 一行 history 都不用带
+   - 无: iOS 每次带 history,后端无状态(老接口兼容)
+   - 同一个 endpoint 两种模式,看 thread_id 自动切换
+
+3. MCP 工具  vs  直接写在 Agent 里
+   - MCP 多一层(stdio 子进程 + JSON-RPC),但工具协议解耦
+   - 工具内部要换实现 / 部署成独立服务,Agent 代码不用动
+   - 这是为"以后接外部 MCP server 生态"留的口子
+```
+
+---
+
 ## Phase 演进历史
 
 这个项目是按 Phase 渐进推进的，每个 Phase 都是一个完整的学习阶段：
@@ -89,24 +273,30 @@ LangGraph 的 `SqliteCheckpointer` 会使用同一个 `dev.db` 文件，
 但 `checkpoints` / `writes` / `checkpoint_blobs` 这些表是它运行时自动建的，
 Prisma 不管它们。
 
-### 1.3（可选）安装 Ollama 跑真实 embedding
+### 1.3 安装 Ollama 跑真实 embedding(默认必装)
 
-Phase 6 后默认的 embedding provider 是 `local-keyword`（不需要任何外部依赖，
-适合零配置跑通）。如果想体验真实语义向量检索，安装本地 Ollama：
+当前默认 `EMBEDDINGS_PROVIDER=ollama`,所以**首次启动前必须装好 Ollama 并拉模型**,
+否则第一次 Agent 请求会因为连不上 Ollama 报错。
 
 ```bash
 # macOS
 brew install ollama
 ollama serve &
-ollama pull bge-m3
+ollama pull nomic-embed-text   # 默认模型,274 MB,768 维多语言
 ```
 
-然后在 `.env` 里把 embedding provider 切到 ollama：
+`.env` 里相关配置(`.env.example` 已写好默认值):
 
 ```text
 EMBEDDINGS_PROVIDER=ollama
 OLLAMA_BASE_URL=http://127.0.0.1:11434
-OLLAMA_EMBEDDING_MODEL=bge-m3
+OLLAMA_EMBEDDING_MODEL=nomic-embed-text
+```
+
+如果不想装 Ollama(纯离线 / CI 环境),可以退回到零依赖的关键词假向量:
+
+```text
+EMBEDDINGS_PROVIDER=local-keyword
 ```
 
 切换后第一次 Agent 请求会触发向量构建（约 30-50 个 chunk × 几十毫秒），
@@ -232,8 +422,8 @@ npm run rag:debug -- "SwiftUI @State 和 @Binding 有什么区别"
 ### 4.2 Embedding Provider 切换
 
 ```text
-EMBEDDINGS_PROVIDER=local-keyword     # 默认，零依赖，关键词 hash 成伪向量
-EMBEDDINGS_PROVIDER=ollama            # 真实语义向量，需要本地 Ollama
+EMBEDDINGS_PROVIDER=ollama            # 默认，真实语义向量，需要本地 Ollama
+EMBEDDINGS_PROVIDER=local-keyword     # 零依赖兜底，关键词 hash 成伪向量
 ```
 
 切换 provider 后，向量缓存会自动失效重建（缓存指纹包含 embedding 标识）。
@@ -251,6 +441,77 @@ RAG_MIN_SIMILARITY=0.08  分数下限，太低的不送进模型
 ---
 
 ## 5. 后端代码结构
+
+### 5.0 按职责分组速览
+
+```text
+backend-node/src/
+├── server.ts                    ★ 唯一入口:路由 + 中间件 + SSE
+├── config/    env.ts            统一读取 .env
+├── shared/    types.ts          全局共享类型(SSE 事件、HTTP body 等)
+│
+├── 【入口路由路径】
+│   ├── chat/                    普通聊天(/api/chat 和 /api/chat/stream)
+│   │   ├── chatCompletion.ts    组装 RAG context + history → BaseMessage[]
+│   │   ├── chatHistory.ts       清洗 iOS 历史 + 构造 RAG query
+│   │   ├── prompts.ts           所有 system prompt 在这里拼装
+│   │   └── structuredAnswer.ts  解析 /api/chat 的 JSON 输出
+│   │
+│   └── agent/                   Agent 入口 + 共用层
+│       ├── agentRunner.ts       ★ 灰度路由:Phase 3 / Phase 4 切换
+│       ├── agentObservability.ts  按 requestId 的结构化日志
+│       ├── agentTools.ts        tool_start/done SSE 事件 builder
+│       └── agentToolTypes.ts    项目内部工具结果统一类型
+│
+├── 【Agent 实现路径】(LangChain / LangGraph)
+│   └── langchain/
+│       ├── chatModel.ts         ChatDeepSeek 实例工厂(项目唯一出口)
+│       ├── chatPrompt.ts        ChatPromptTemplate + content 工具
+│       │
+│       ├── agentRunner.ts       Phase 3: createAgent + middleware
+│       ├── agentTools.ts        MCP → LangChain Tool 桥
+│       │
+│       ├── agentGraph.ts        Phase 4: 手写 StateGraph 主链路
+│       ├── agentGraphState.ts   State schema (Annotation.Root)
+│       ├── agentGraphNodes.ts   agentNode / toolNode / shouldContinue
+│       │
+│       ├── ragRetriever.ts      向量检索主入口
+│       ├── ragCache.ts          向量磁盘缓存(指纹失效)
+│       ├── documentLoader.ts    Markdown → LangChain Document
+│       ├── embeddings.ts        Embeddings 工厂(Ollama / 兜底)
+│       ├── localEmbeddings.ts   零依赖伪向量
+│       │
+│       ├── langsmithClient.ts   LangSmith feedback 入口
+│       ├── agentDebug.ts        Agent 本地调试脚本
+│       └── ragDebug.ts          RAG 本地调试脚本
+│
+├── 【工具协议层】(MCP)
+│   └── mcp/
+│       ├── mcpClient.ts         工具调用方(单例 + 自动重连)
+│       ├── mcpServer.ts         工具提供方(stdio 子进程)
+│       ├── mcpToolHandlers.ts   4 个工具真实实现
+│       ├── generateQuizDebug.ts
+│       ├── evaluateAnswerDebug.ts
+│       └── recommendNextTopicDebug.ts
+│
+├── 【数据 / 协议 / 知识库】
+│   ├── db/
+│   │   ├── prisma.ts            Prisma Client 单例
+│   │   ├── sqliteCheckpointer.ts  LangGraph SqliteSaver 单例
+│   │   ├── threadsRepository.ts 对话 CRUD(跨 Prisma + checkpointer)
+│   │   └── prismaDebug.ts
+│   ├── http/   sse.ts           SSE 写出器(一个函数)
+│   └── knowledge/ knowledge.ts  知识库外观层(facade)
+│
+└── 【生产化配套】
+    ├── ../Dockerfile            多阶段构建
+    ├── ../.dockerignore
+    ├── ../prisma/schema.prisma  threads 表 schema
+    ├── ../evals/                离线评测体系
+    └── ../../.github/workflows/ci.yml
+```
+
+### 5.1 文件用途详表
 
 ```text
 backend-node/src/server.ts
@@ -664,7 +925,7 @@ AGENT_RECURSION_LIMIT=20           图最多迭代多少步
 AGENT_MODEL_CALL_LIMIT=6           整次请求最多调几次模型
 AGENT_MODEL_RETRY_MAX_ATTEMPTS=2   单次 model 节点失败的重试次数
 CHAT_MODEL_HTTP_MAX_RETRIES=2      底层 HTTP 重试次数
-TOOL_EXECUTION_TIMEOUT_MS=8000     单个工具最长执行时间
+TOOL_EXECUTION_TIMEOUT_MS=20000    单个工具最长执行时间 (LLM-as-tool 需要更大裕度)
 ```
 
 Phase 3 用 middleware 实施，Phase 4 在 agentNode 里手写检查。

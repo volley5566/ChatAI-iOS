@@ -4,15 +4,21 @@ import { DirectoryLoader } from "@langchain/classic/document_loaders/fs/director
 import { TextLoader } from "@langchain/classic/document_loaders/fs/text";
 
 /**
- * LangChain Document metadata。
+ * ═══════════════════════════════════════════════════════════════════
+ * langchain/documentLoader.ts — 把知识库 Markdown 加载成 LangChain Document
+ * ═══════════════════════════════════════════════════════════════════
  *
- * LangChain 的 Document 本身只有两个核心字段：
- * - pageContent：真正给 splitter / embedding / model 使用的文本
- * - metadata：和这段文本绑定的结构化信息
+ * 在整体流程中的位置:
+ *   ragRetriever.ts(建索引时) / recommendNextTopic 工具(取目录时)
+ *   都从这里读文档。
  *
- * 这里把项目原来的 source/title/keywords/citation 思路放进 metadata。
- * 好处是：文档经过 splitter 切成 chunk 后，metadata 会跟着 chunk 一起走，
- * 最终检索命中时仍然知道它来自哪个文件、哪个主题。
+ * # LangChain Document 是什么
+ *   只有两个核心字段:
+ *     pageContent → 真正给 splitter / embedding / model 用的文本
+ *     metadata    → 和这段文本绑定的结构化信息(我们放 fileName/title/keywords)
+ *
+ *   文档经过 splitter 切成 chunk 后,metadata 会跟着 chunk 一起走,
+ *   检索命中时仍然知道"它来自哪个文件、哪个主题"。
  */
 export type KnowledgeDocumentMetadata = {
   source: string;

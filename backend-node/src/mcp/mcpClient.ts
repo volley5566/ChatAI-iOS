@@ -15,27 +15,36 @@ type McpAgentClient = {
 };
 
 /**
- * 工具调用方。
+ * ═══════════════════════════════════════════════════════════════════
+ * mcp/mcpClient.ts — 工具调用方(连接 MCP server 的客户端)
+ * ═══════════════════════════════════════════════════════════════════
  *
- * 整体调用流程：
- * LangChain Agent
- *         ↓
- * LangChain Tool wrapper
- *         ↓
- * mcpClient.ts
- *         ↓
- * MCP 协议
- *         ↓
- * mcpServer.ts
- *         ↓
- * mcpToolHandlers.ts 真实工具
+ * 整体工具调用链路:
+ *   LangChain Agent
+ *        ↓
+ *   LangChain Tool wrapper (agentTools.ts)
+ *        ↓
+ *   这个文件 (mcpClient.ts)
+ *        ↓
+ *   MCP 协议 (JSON-RPC over stdio)
+ *        ↓
+ *   mcpServer.ts
+ *        ↓
+ *   mcpToolHandlers.ts (真实工具实现)
+ *
+ * 暴露的两个核心方法:
+ *   - getMcpToolDefinitions() → 列出所有可用工具(用来 bind 给 LangChain)
+ *   - callMcpTool(name, args) → 执行具体工具
+ *
+ * 全进程单例 + 失败自动重连。
  */
+
 /**
- * MCP SDK 的 callTool 可能返回两种形态：
- * - 普通工具结果：包含 content / structuredContent
- * - task 工具结果：包含 toolResult
+ * MCP SDK 的 callTool 可能返回两种形态:
+ *   - 普通工具结果:content / structuredContent
+ *   - task 工具结果:toolResult
  *
- * 当前项目没有使用 MCP task，但这里兼容两种形态，
+ * 当前项目没用 MCP task,但这里兼容两种形态,
  * 以后升级长任务工具时不用重写 Agent 适配层。
  */
 type McpCallToolResponse = Awaited<ReturnType<Client["callTool"]>>;

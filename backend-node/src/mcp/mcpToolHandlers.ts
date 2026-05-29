@@ -18,15 +18,33 @@ export type GenerateQuizArguments = {
 };
 
 /**
+ * ═══════════════════════════════════════════════════════════════════
+ * mcp/mcpToolHandlers.ts — 真实工具逻辑(不关心 transport / SSE / HTTP)
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * 在整体流程中的位置:
+ *   mcpServer.ts 注册工具时调这里的 runXxxTool 函数。
+ *
+ * # 设计原则:工具逻辑和协议解耦
+ *   不关心:HTTP / SSE / DeepSeek tools 格式 / MCP transport
+ *   只关心:已经校验过的参数 → 工具结果
+ *
+ * # 工具分两类:
+ *   - 纯本地(searchKnowledge)       → 直接调 RAG retriever
+ *   - LLM-as-tool(其余 3 个)        → 工具内部再发一次 DeepSeek 请求
+ *     · generateQuiz       → LLM 出题(失败 fallback 到模板)
+ *     · evaluateAnswer     → LLM-as-judge 批改
+ *     · recommendNextTopic → LLM 规划下一步学习方向
+ */
+
+/**
  * evaluateAnswer 接收的参数。
  *
  * - question:     正在评判的题目原文(必填)
  * - userAnswer:   用户的回答(必填)
- * - topic:        可选,知识领域上下文,例如 "SwiftUI @State",
- *                 给评分模型一个范围提示
+ * - topic:        可选,知识领域上下文(例如 "SwiftUI @State"),给评分模型一个范围提示
  * - expectedConcepts: 可选,出题方期望覆盖的要点数组。
- *                 generateQuiz 升级后(Phase 7.3)会带这个字段,
- *                 让批改更精准——否则模型自己估
+ *                 generateQuiz 升级后会自然传入,让批改更精准——否则模型自己估。
  */
 export type EvaluateAnswerArguments = {
   question: string;
@@ -50,19 +68,6 @@ export type RecommendNextTopicArguments = {
   focusArea?: string;
   count: number;
 };
-
-/**
- * mcpToolHandlers.ts 放“真实工具逻辑”。
- *
- * 它不关心：
- * - HTTP 请求/响应
- * - SSE 怎么推给 iOS
- * - DeepSeek 的 tools 格式
- * - MCP 的 transport 是 stdio 还是 HTTP
- *
- * 它只负责把已经校验过的参数变成工具结果。
- * 这样以后工具逻辑可以被 MCP server、单元测试或其他入口复用。
- */
 
 export function normalizeSearchKnowledgeArguments(
   rawArguments: unknown
@@ -154,14 +159,14 @@ export async function runSearchKnowledgeTool(
 }
 
 /**
- * Phase 7.3 — generateQuiz 用 LLM 真生成。
+ * generateQuiz 用 LLM 真生成。
  *
- * 7.2 之前是固定 5 个模板套 topic,题目本身可能和 topic 关系不大
+ * 早期版本是固定 5 个模板套 topic,题目和 topic 可能没啥关系
  * (比如 "请把 RAG 讲给初学者")。LLM 生成的题目能针对具体概念出题,
- * 而且能附带 expectedConcepts——为 evaluateAnswer 的精准批改铺路。
+ * 还能附带 expectedConcepts——为 evaluateAnswer 的精准批改铺路。
  *
- * 失败兜底:LLM 调用失败时退回到模板版本,保证 generateQuiz 这个工具
- * **总能给出可用结果**——这是"graceful degradation"模式。
+ * 失败兜底:LLM 调用失败时退回到模板版本,保证 generateQuiz **总能给出可用结果**——
+ * 这是 "graceful degradation"(优雅降级)模式。
  */
 const generateQuizSystemPrompt = `
 You are an iOS / Swift / AI app development tutor. You design practice questions for a learning topic.
@@ -410,7 +415,7 @@ export function normalizeEvaluateAnswerArguments(
 
   /**
    * expectedConcepts 也是可选——批改时如果有"出题方期望覆盖的要点",
-   * 模型评分会更精准。Phase 7.3 generateQuiz 升级后会自然传入。
+   * 模型评分会更精准(generateQuiz 升级后会自然传入)。
    * 这里做防御性过滤:非字符串元素丢弃,空数组当 undefined。
    */
   const expectedConceptsRaw = rawArguments.expectedConcepts;
@@ -560,10 +565,8 @@ export async function runEvaluateAnswerTool(
   args: EvaluateAnswerArguments
 ): Promise<AgentToolExecutionResult> {
   /**
-   * 这就是 Phase 7 引入的新模式:LLM-as-judge。
-   *
-   * 工具不再是"纯函数"(像 generateQuiz 那样从模板生成),
-   * 而是工具内部再发一次 DeepSeek 请求,让模型自己评分。
+   * LLM-as-judge 模式:
+   * 工具不再是纯函数,而是工具内部再发一次 DeepSeek 请求,让模型自己评分。
    *
    * 设计要点:
    * - system prompt 严格固定 rubric 和输出格式

@@ -17,11 +17,15 @@ import { createLangChainChatModel } from "./chatModel";
 import { messageContentToString } from "./chatPrompt";
 
 /**
- * Phase 4 — 节点实现。
+ * ═══════════════════════════════════════════════════════════════════
+ * langchain/agentGraphNodes.ts — StateGraph 的节点 + 条件边实现
+ * ═══════════════════════════════════════════════════════════════════
  *
- * ─────────────────────────────────────────────────────────────────────
- * 这个文件包含图里的"两个核心节点"和"一个条件边判断函数"。
- * ─────────────────────────────────────────────────────────────────────
+ * 在整体流程中的位置:
+ *   agentGraph.ts 调 createAgentNode / createToolNode / shouldContinue
+ *   把它们注册到 StateGraph 上,构成 ReAct 循环。
+ *
+ * 本文件包含:两个核心节点(agent / tool) + 一个条件边判断函数。
  *
  * # 节点(Node)是什么?
  *
@@ -76,14 +80,12 @@ export function createAgentNode(options: {
   /**
    * bindTools 把工具的 schema 告诉模型,这样模型才能生成 tool_calls。
    *
-   * 这一步等价于 Phase 3 createAgent 内部的 `model.bindTools(tools)`。
-   * 现在我们手写,所以要自己做。
+   * 这一步等价于 createAgent 内部的 `model.bindTools(tools)`,只是这里
+   * 我们手写,所以要自己做。
    *
-   * 注意 chatModel 是 streaming 模式——这是 Phase 3 的设计延续:
-   * token 流式输出需要底层 SDK 走 SSE 模式。
-   *
-   * disableThinking / disableParallelToolCalls 也维持 Phase 3 的判断,
-   * 详见 chatModel.ts 里的注释。
+   * streaming: true 是必须的——streamEvents 要靠模型流式吐 chunk 才能
+   * 触发 on_chat_model_stream 事件。
+   * disableThinking / disableParallelToolCalls 的原因见 chatModel.ts。
    */
   const modelWithTools = createLangChainChatModel({
     streaming: true,
@@ -98,11 +100,11 @@ export function createAgentNode(options: {
     /**
      * # 第一道防线:模型调用次数上限。
      *
-     * Phase 3 用 modelCallLimitMiddleware 做这件事;
-     * Phase 4 我们手写,所以在 state 里读 modelCallCount,自己判断。
+     * createAgent 路径用 modelCallLimitMiddleware 做这件事;
+     * 这里我们手写,所以从 state 读 modelCallCount,自己判断。
      *
-     * 超额怎么办?返回一条"我已尽力,先这样吧"的 AIMessage,让图自然走到 END。
-     * 不抛异常的原因是:**不希望整个请求失败**,而是优雅降级。
+     * 超额时返回一条"我已尽力,先这样吧"的 AIMessage,让图自然走到 END。
+     * 不抛异常的原因:**不希望整个请求失败**,而是优雅降级。
      */
     if (state.modelCallCount >= agentModelCallLimit) {
       logAgentInfo(options.requestId, "agent_node", "model_call_limit_reached", {
@@ -137,11 +139,11 @@ export function createAgentNode(options: {
     /**
      * 把 systemPrompt 作为第一条消息塞到 history 最前面。
      *
-     * Phase 3 是通过 createAgent 的 systemPrompt 参数传的;
-     * Phase 4 手写,所以要在每次模型调用前自己拼。
+     * createAgent 路径是通过 systemPrompt 参数传的;这里手写,
+     * 所以每次模型调用前自己拼。
      *
-     * 注意每轮都拼 system,不存到 state.messages 里,
-     * 避免 state.messages 越来越长(checkpointer 会持久化)。
+     * 注意每轮都拼 system,但不存到 state.messages 里——
+     * 避免 state.messages 越来越长(checkpointer 会把它持久化)。
      */
     const inputMessages = [
       { role: "system" as const, content: options.systemPrompt },
@@ -243,7 +245,7 @@ export function createToolNode(options: {
      * (见 agentTools.ts:50 行 tool(...) wrapper),所以这里直接 invoke 就行,
      * 不用再做 SSE 事件。
      *
-     * Phase 3 用 disableParallelToolCalls: true,所以一轮里 tool_calls 通常只有 1 个。
+     * 因为我们设了 disableParallelToolCalls: true,一轮里 tool_calls 通常只有 1 个。
      * 但代码写成支持多个的形式,以后哪天打开并发也不用改。
      */
     const toolMessages: ToolMessage[] = [];
@@ -376,15 +378,13 @@ export function extractFinalAssistantText(
 }
 
 /**
- * 提示:agentModelRetryMaxAttempts 这个配置 Phase 4 没用到。
+ * 提示:手写 StateGraph 路径目前没用到 agentModelRetryMaxAttempts。
  *
- * Phase 3 modelRetryMiddleware 在 createAgent 内部做"一轮失败重跑整个 model node"。
- * Phase 4 我们手写图,要做这件事需要在 agentNode 里加 try/catch + 重试循环。
- *
- * 为了让 Phase 4 代码尽量贴近"最小可运行 ReAct 图",这里暂时不做软件层重试。
+ * createAgent 路径有 modelRetryMiddleware 做"一轮失败重跑整个 model node"。
+ * 手写图想做这件事需要在 agentNode 里加 try/catch + 重试循环——
+ * 为了让代码尽量贴近"最小可运行 ReAct 图",这里暂时不做软件层重试。
  * HTTP 层的 chatModelHttpMaxRetries 仍然生效(ChatDeepSeek 自带)。
  *
- * 后续如果想加,可以参考 modelRetryMiddleware 源码,在 agentNode 外面包一层
- * 带指数退避的 try/catch。
+ * 想加的话:参考 modelRetryMiddleware 源码,在 agentNode 外包一层带指数退避的 try/catch。
  */
 void agentModelRetryMaxAttempts;

@@ -1,13 +1,25 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════
+ * chat/chatHistory.ts — iOS 历史消息清洗 + RAG 检索 query 组装
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * 在整体流程中的位置:
+ *   server.ts → sanitizeChatHistory(req.body.history) → 安全的历史数组
+ *             → buildRetrievalQuery → RAG retriever
+ *
+ * # 为什么要清洗
+ *   iOS 是外部输入,不能完全信任:
+ *     - 限制 role 只能是 user / assistant(防止伪造 system / tool)
+ *     - 限制每条 content 长度(防止单条消息把 prompt 撑爆)
+ *     - 限制总消息数(避免 token 无限增长)
+ */
+
 import type { ChatHistoryItem, NormalizedChatHistoryItem } from "../shared/types";
 
-/**
- * 每次最多带多少条历史消息。
- */
+/** 每次最多带多少条历史消息 */
 const maxHistoryMessages = 6;
 
-/**
- * 每条历史消息最多保留多少字符，避免请求无限变大。
- */
+/** 每条历史消息最多保留多少字符,避免请求无限变大 */
 const maxHistoryContentCharacters = 1200;
 
 function truncateHistoryContent(content: string): string {
@@ -39,8 +51,7 @@ export function sanitizeChatHistory(history: unknown): NormalizedChatHistoryItem
       const role = historyItem.role;
       const content = historyItem.content;
 
-      // 这个很关键。
-      // 后端只允许客户端传，不允许客户端伪造，不允许客户端伪造。
+      // 安全边界:只允许 user / assistant,不接受客户端伪造的 system / tool
       if (role !== "user" && role !== "assistant") {
         return undefined;
       }

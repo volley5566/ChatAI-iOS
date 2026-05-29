@@ -10,22 +10,24 @@ import {
 import type { NormalizedChatHistoryItem } from "../shared/types";
 
 /**
- * 普通 RAG 聊天使用的 LangChain PromptTemplate。
+ * ═══════════════════════════════════════════════════════════════════
+ * langchain/chatPrompt.ts — 普通 RAG 聊天的 Prompt 模板 + content 工具
+ * ═══════════════════════════════════════════════════════════════════
  *
- * 以前项目里是手写数组：
- * [
- *   { role: "system", content: instructions },
- *   ...history,
- *   { role: "user", content: message }
- * ]
+ * 在整体流程中的位置:
+ *   chat/chatCompletion.ts → buildLangChainRagMessages → 给 ChatDeepSeek
  *
- * 现在改成 ChatPromptTemplate：
- * - system 部分放规则和 RAG context
- * - history 用 MessagesPlaceholder 插入多轮上下文
- * - 当前问题放 human message
- *
- * 这样你能看到 LangChain prompt 的标准写法，并且普通聊天接口可以直接
- * 把 BaseMessage[] 交给 ChatDeepSeek。
+ * # ChatPromptTemplate 是什么
+ *   LangChain 把 prompt 抽成"模板对象",而不是手写数组:
+ *     [
+ *       { role: "system", content: instructions },
+ *       ...history,
+ *       { role: "user", content: message }
+ *     ]
+ *   好处:
+ *     - 占位符 {instructions} / {message} 让 prompt 可参数化
+ *     - MessagesPlaceholder 让 history 数组优雅插入
+ *     - 输出标准 BaseMessage[],ChatDeepSeek 直接消费
  */
 const ragChatPrompt = ChatPromptTemplate.fromMessages([
   ["system", "{instructions}"],

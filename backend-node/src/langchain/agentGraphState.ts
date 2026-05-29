@@ -1,11 +1,14 @@
 import { Annotation, MessagesAnnotation } from "@langchain/langgraph";
 
 /**
- * Phase 4 — LangGraph State Schema。
+ * ═══════════════════════════════════════════════════════════════════
+ * langchain/agentGraphState.ts — LangGraph State Schema
+ * ═══════════════════════════════════════════════════════════════════
  *
- * ─────────────────────────────────────────────────────────────────────
- * 这一个文件是 LangGraph 学习的"基石",一定要看懂。
- * ─────────────────────────────────────────────────────────────────────
+ * 在整体流程中的位置:
+ *   agentGraph.ts 用这个 schema 调 new StateGraph(AgentState) 来建图。
+ *
+ * 这是 LangGraph 学习的"基石",一定要看懂。
  *
  * # 什么是 State?
  *
@@ -79,8 +82,8 @@ export const AgentState = Annotation.Root({
   /**
    * 已发起的模型调用次数。
    *
-   * Phase 3 用 `modelCallLimitMiddleware` 在 createAgent 内部计数;
-   * Phase 4 我们自己手写图,所以把计数器搬到 state 里。
+   * 在 createAgent 路径里 `modelCallLimitMiddleware` 帮你计数;
+   * 这里我们手写图,所以把计数器暴露在 state 里。
    *
    * reducer 是"累加":每个节点 return { modelCallCount: 1 } 表示"我又调了一次"。
    * 累加意味着图任何位置都能 += 1,不需要先读再写。
@@ -94,10 +97,8 @@ export const AgentState = Annotation.Root({
    * 已执行的工具次数。
    *
    * 用法和 modelCallCount 一样,toolNode 完成一次就 += 1。
-   *
-   * 注意它和 LangChain Phase 3 的 `toolCallLimitMiddleware` 是同一概念,
-   * 不过那时 middleware 帮我们偷偷做了;现在我们手写,所以暴露在 state 里、
-   * 在 agentNode 里检查"是否超额"。
+   * 跟 createAgent 路径里 `toolCallLimitMiddleware` 是同一概念,
+   * 只是这里我们手写,所以暴露在 state 里、在 agentNode 里检查"是否超额"。
    */
   toolCallCount: Annotation<number>({
     reducer: (current, update) => (current ?? 0) + (update ?? 0),

@@ -1,15 +1,25 @@
 import { randomUUID } from "crypto";
 
 /**
- * Agent 可观测性工具。
+ * ═══════════════════════════════════════════════════════════════════
+ * agent/agentObservability.ts — Agent 链路结构化日志 + requestId 生成
+ * ═══════════════════════════════════════════════════════════════════
  *
- * 这个文件只负责“怎么记录日志”，不参与业务决策：
- * - 不决定模型要不要调用工具
- * - 不执行 MCP tool
- * - 不写 SSE
+ * 在整体流程中的位置:
+ *   agentRunner.ts / agentGraph.ts / server.ts 在关键节点调:
+ *     logAgentInfo(requestId, phase, event, data)
+ *     logAgentError(requestId, phase, event, error, data)
  *
- * 这样做的好处是：Agent Runner / server.ts 只需要在关键节点调用
- * logAgentInfo / logAgentError，就可以得到统一格式的 trace。
+ * # 这个文件只负责"怎么记录日志",不参与业务决策
+ *   - 不决定模型要不要调工具
+ *   - 不执行 MCP tool
+ *   - 不写 SSE
+ *
+ * # 统一 JSON envelope 格式
+ *   { timestamp, level, requestId, phase, event, data }
+ *   - phase  → 链路阶段(tool_setup / tool_execution / model_call ...)
+ *   - event  → 具体事件(started / completed / failed)
+ *   这样后端日志可以按 requestId grep 出完整时间线。
  */
 const maxStringLength = 1200;
 const maxArrayItems = 20;

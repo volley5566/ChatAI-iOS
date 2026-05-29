@@ -1,3 +1,30 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════
+ * langchain/agentRunner.ts — Phase 3 createAgent 版 Agent 运行器
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * 在整体流程中的位置:
+ *   agent/agentRunner.ts → 这个文件 → LangChain createAgent + middleware
+ *
+ * 当 USE_LANGGRAPH=false(默认)时走这条路径。
+ *
+ * # 这一层做什么
+ *   1. 构造系统提示词和历史消息(BaseMessage[])
+ *   2. 从 MCP 动态创建 LangChain tools
+ *   3. 装上几个标准 middleware:重试、模型调用次数上限、工具调用次数上限
+ *   4. 用 streamEvents(v2) 把 token 一边产生一边推给上层(onDelta)
+ *   5. 统一写结构化日志 + 收集 token 用量
+ *
+ * # createAgent vs 手写 StateGraph(agentGraph.ts)
+ *   createAgent 是 LangChain 给你预设好的 ReAct Agent,内部已经把
+ *   "Thought → Action → Observation → Final Answer" 循环跑好了,你不用管。
+ *   agentGraph.ts 把这个循环用 StateGraph 自己拼一遍,更灵活,但也更复杂。
+ *
+ * # 这条路径不接 checkpointer
+ *   threadId 参数收下后忽略,保留作为"无持久化的快速回退路径"。
+ *   想要对话持久化,把 USE_LANGGRAPH 切到 true 走 agentGraph.ts。
+ */
+
 import {
   AIMessage,
   AIMessageChunk,
@@ -31,19 +58,17 @@ import { createLangChainAgentTools } from "./agentTools";
 import { createLangChainChatModel } from "./chatModel";
 import { messageContentToString } from "./chatPrompt";
 
+// ─── 类型定义 ──────────────────────────────────────────────────
+
 export type LangChainAgentRunResult = {
   outputText: string;
   toolCallCount: number;
   /**
-   * Phase 10.1 #3 — 本次 Agent 调用在 LangSmith 里的根 run UUID。
-   * 详细说明见 agentGraph.ts 的同名字段;两条路径的产出口径保持一致。
+   * LangSmith 根 run UUID。详细说明见 agentGraph.ts 的同名字段。
+   * 两条路径产出口径保持一致,server.ts 不用分别处理。
    */
   rootRunId: string | undefined;
-  /**
-   * Phase 10.4 #13 — 本次 Agent 调用消耗的 token 总量。
-   * 与 agentGraph.ts(Phase 4 路径)的同名字段对齐,
-   * 两条路径的返回值结构保持一致,gateway 层不用分别处理。
-   */
+  /** 本次 Agent 调用消耗的 token 总量(与 agentGraph.ts 同名字段对齐) */
   usage: TokenUsage;
 };
 
@@ -53,12 +78,9 @@ type RunLangChainAgentStreamOptions = {
   systemPrompt: string | undefined;
   history: NormalizedChatHistoryItem[];
   /**
-   * Phase 5.2 加这个字段是为了"接口对齐":
-   * 路由层会把 threadId 同时传给 Phase 3 和 Phase 4,所以两边必须有这个参数。
-   *
-   * 但 Phase 3(createAgent)路径**不接入 checkpointer**——保留它作为
-   * 无持久化的"快速回退路径"。这里只是收下 threadId 然后忽略,
-   * 让上层调用接口统一。
+   * 接口对齐字段:路由层会把 threadId 同时传给 Phase 3 和 Phase 4,
+   * 所以两边必须有这个参数。Phase 3 路径只是收下后忽略
+   * (不接 checkpointer,作为无持久化的快速回退路径)。
    */
   threadId?: string;
   onToolEvent?: (event: ChatStreamEvent) => void;
@@ -66,31 +88,14 @@ type RunLangChainAgentStreamOptions = {
   shouldStop?: () => boolean;
 };
 
-/**
- * LangChain Agent Runner（第三阶段）。
- *
- * Agent 的“决定 -> 调工具 -> 再决定 -> 最终回答”循环交给 LangChain createAgent；
- * 我们这一层负责：
- *
- *   1. 构造系统提示词和历史消息
- *   2. 从 MCP 动态创建 LangChain tools
- *   3. 装上几个 “更标准” 的 middleware（重试、调用次数上限、工具次数上限）
- *   4. 用 streamEvents(v2) 把 token 一边产生一边推给上层（onDelta）
- *   5. 把工具事件、模型调用事件统一写进结构化日志
- *
- * 第二阶段时我们还在用 agent.invoke()，最终一次性发整段 delta；
- * 第三阶段切到 streamEvents，是为了把“token 级流式”这个体验拿回来——
- * 同时保留 LangChain 的工具循环、retry、观测点。
- */
+// ─── 入口函数 ─────────────────────────────────────────────────
+
 export async function runLangChainAgentStream({
   requestId,
   message,
   systemPrompt,
   history,
-  /**
-   * Phase 3 路径忽略 threadId(我们故意不接 checkpointer)。
-   * 加 void 是为了消除"声明了但没用"的 lint 警告。
-   */
+  // _ 前缀表示"声明了但故意不用",消除 lint 警告
   threadId: _threadId,
   onToolEvent,
   onDelta,
@@ -100,27 +105,15 @@ export async function runLangChainAgentStream({
   const startedAt = Date.now();
   let toolCallCount = 0;
   let outputText = "";
-  /**
-   * Phase 10.1 #3 — 用一个变量捕获根 run id。
-   * 细节同 agentGraph.ts:第一个 parent_ids 为空的 on_chain_start 即根 run。
-   */
+
+  // 第一个 on_chain_start 事件的 run_id 就是 LangSmith trace 的根 run
   let rootRunId: string | undefined;
 
-  /**
-   * Phase 10.4 #13 — 累加 token 用量。
-   *
-   * 和 agentGraph.ts(Phase 4 路径)完全相同的做法:
-   * 每次模型调用结束(on_chat_model_end)时从 AIMessage.usage_metadata 读取,
-   * 累加到这两个变量。最后组装成 TokenUsage 返回。
-   *
-   * createAgent 的 ReAct 循环可能包含多次模型调用:
-   *   第 1 次:模型决定调工具 → 第 2 次:基于工具结果生成回答
-   * 所以 token 要累加,不是只取最后一次。
-   */
+  // ReAct 循环里每次 on_chat_model_end 累加 token
   let promptTokens = 0;
   let completionTokens = 0;
 
-  //Agent Runner 加载工具(LangChain Phase 2 入口)
+  // ─── 第一步:加载 MCP 工具 ─────────────────────────────────
   const tools = await loadLangChainTools(requestId, {
     onToolEvent,
     onToolCompleted: () => {
@@ -128,37 +121,28 @@ export async function runLangChainAgentStream({
     },
   });
 
+  // ─── 第二步:创建 createAgent ──────────────────────────────
+  //
+  // createAgent 是 LangChain 预设的 ReAct Agent,循环是:
+  //   Thought → 我应该用哪个工具?
+  //   Action → 调用 searchKnowledge(...)
+  //   Observation → 工具返回的结果
+  //   Thought → 我现在有足够信息回答了
+  //   Final Answer → 给用户的回答
+  // 这个循环你不用手写,createAgent 内部用状态机帮你跑。
   const agent = createAgent({
-    /**
-     * 关键变化：streaming: true。
-     *
-     * 第二阶段时这里写 false，因为 agent.invoke 模式下不需要流式，
-     * 但代价是最终回答只能等模型完整返回后再一次性 onDelta。
-     *
-     * 第三阶段切到 streamEvents 之后，底层 ChatDeepSeek 必须开 streaming，
-     * 这样 on_chat_model_stream 事件才会带 token chunks。
-     *
-     * disableThinking / disableParallelToolCalls 维持第二阶段的判断：
-     * - thinking 模式要求下一轮 reasoning_content 回传，当前 converter 不支持
-     * - parallel tool calls 关掉是为了让日志和 iOS UI 一次只对齐一个工具
-     * 
-     * createAgent 是 LangChain 给你预设好的 ReAct Agent。ReAct = Reasoning + Acting,模式是:
-     * Thought  → 我应该用哪个工具?
-     * Action   → 调用 searchKnowledge(input: "@State")
-     * Observation → 工具返回的结果
-     * Thought  → 我现在有足够信息回答了
-     * Final Answer → 给用户的回答
-     * 
-     * 这个循环你不用手写——createAgent 内部用一个状态机帮你跑。
-     */
-    model: createLangChainChatModel({// ← 谁来推理
+    model: createLangChainChatModel({
+      // streaming: true 是必须的——streamEvents 要靠模型流式吐 chunk
+      // 才能触发 on_chat_model_stream 事件(给 iOS 实时打字效果)。
       streaming: true,
+      // thinking 模式要求下一轮回传 reasoning_content,当前 converter 不支持
       disableThinking: true,
+      // 关掉并行工具调用:让日志和 iOS UI 一次只对齐一个工具
       disableParallelToolCalls: true,
     }),
-    tools,// ← 可用工具列表
-    systemPrompt: buildAgentInstructions(systemPrompt),// ← 系统提示词
-    middleware: buildAgentMiddleware(),// ← 中间件
+    tools,
+    systemPrompt: buildAgentInstructions(systemPrompt),
+    middleware: buildAgentMiddleware(),
     version: "v2",
   });
 
@@ -172,37 +156,23 @@ export async function runLangChainAgentStream({
     modelCallLimit: agentModelCallLimit,
   });
 
-  /**
-   * streamEvents v2 返回一个 IterableReadableStream<StreamEvent>。
-   * 我们订阅的事件类型主要有：
-   *
-   *   on_chat_model_start  → 模型一次调用开始
-   *   on_chat_model_stream → 流式 token chunk（这就是要转发给 iOS 的 delta）
-   *   on_chat_model_end    → 模型一次调用结束
-   *   on_tool_start        → 工具一次执行开始
-   *   on_tool_end          → 工具一次执行结束
-   *
-   * 工具相关的 SSE（tool_start / tool_done）我们仍然在 agentTools.ts 的
-   * wrapper 内部自己发——因为那里能拿到 toolCallId、result.ok、duration。
-   * streamEvents 的 on_tool_start/end 这里只用来写日志，避免重复发给 iOS。
-   *
-   * recursionLimit 是 Agent 的最后安全网：
-   * “无论模型怎么决策，总迭代步数的上限”。
-   */
-  /**
-   * Phase 10.1 — 给 LangSmith trace 加业务 metadata + tags。
-   *
-   * 与 agentGraph.ts(Phase 4 路径)对齐,但 runner 字段不同,
-   * 这样 LangSmith 网页能直接区分两条路径的 trace。
-   *
-   * 注意:createAgent 的 streamEvents 类型签名比 LangGraph 严格,
-   * 不接受顶层 metadata/tags 字段。改用 withConfig 把 metadata/tags
-   * 挂在 agent runnable 上——这是 LangChain 标准的 Runnable 配置方式,
-   * LangSmith trace 同样能拿到。
-   *
-   * Phase 3 路径不接 checkpointer,所以 thread_id 在这里只是日志值,
-   * 不会影响 createAgent 的 state 行为。
-   */
+  // ─── 第三步:streamEvents 跑 Agent,边产边推 ─────────────────
+  //
+  // 订阅的事件类型:
+  //   on_chat_model_start  → 一次模型调用开始
+  //   on_chat_model_stream → token chunk(转发给 iOS 的 delta)
+  //   on_chat_model_end    → 一次模型调用结束(含 usage_metadata)
+  //   on_tool_start        → 一次工具执行开始
+  //   on_tool_end          → 一次工具执行结束
+  //
+  // 工具相关 SSE(tool_start / tool_done)在 agentTools.ts wrapper 内部发,
+  // 因为那里能拿到 toolCallId、result.ok、duration。
+  // streamEvents 这里的 on_tool_start/end 只用来写后端日志。
+  //
+  // 关于 withConfig:
+  //   createAgent 的 streamEvents 类型签名不接受顶层 metadata/tags 字段,
+  //   所以改用 withConfig 把 metadata/tags 挂在 Runnable 上——LangSmith
+  //   trace 能拿到这些业务标签(便于网页上区分 Phase 3/4 路径)。
   const eventStream = agent
     .withConfig({
       metadata: {
@@ -213,41 +183,29 @@ export async function runLangChainAgentStream({
         use_langgraph: false,
         history_count: history.length,
       },
-      tags: [
-        "agent",
-        "phase-3",
-        _threadId ? "persistent-mode" : "stateless",
-      ],
+      tags: ["agent", "phase-3", _threadId ? "persistent-mode" : "stateless"],
     })
     .streamEvents(
       { messages },
       {
         version: "v2",
+        // Agent 总迭代步数的安全网,不管模型怎么决策都拦住
         recursionLimit: agentRecursionLimit,
       }
     );
 
-  /**
-   * 用 wallclock 计算每次模型调用耗时——多个模型调用并发不可能发生，
-   * 因为 createAgent 的图是串行的；不过为了健壮性，用 Map 按 runId 存。
-   */
+  // 用 Map 按 runId 存模型调用起始时间,算 duration
+  // (虽然 createAgent 的图是串行的,但留 Map 更健壮)
   const modelCallStarts = new Map<string, number>();
 
   try {
-    /**
-     * 把"用户消息 + 历史"塞进 Agent,Agent 开始自己跑;每跑一步就吐出一个事件,
-     * 我们在 for await (const event of eventStream) 里接住每个事件
-     */
+    // 用户消息 + 历史塞进 Agent,Agent 开始自己跑;每跑一步吐一个事件
     for await (const event of eventStream) {
-      /**
-       * iOS 端关闭连接后，server.ts 会把 clientClosed 置 true，
-       * 这里通过 shouldStop 早退：
-       * - 不再 onDelta（再发就 EPIPE）
-       * - 不主动 abort agent，让它在 LangChain 内部自然走完
-       *   （不会有任何 IO 副作用，最多浪费一次模型调用）
-       *
-       * 想真正 abort 可以加 AbortController，但学习项目里没必要。
-       */
+      // iOS 端关闭连接后,server.ts 把 clientClosed 置 true,
+      // 这里通过 shouldStop 早退:
+      //   - 不再 onDelta(再发就 EPIPE)
+      //   - 不主动 abort agent,让它在 LangChain 内部自然走完
+      //     (无 IO 副作用,最多浪费一次模型调用)
       if (shouldStop?.()) {
         logAgentInfo(requestId, "langchain_agent", "client_closed_during_stream", {
           durationMs: getDurationMs(startedAt),
@@ -256,9 +214,7 @@ export async function runLangChainAgentStream({
         break;
       }
 
-      /**
-       * Phase 10.1 #3 — 捕根 run id(见 agentGraph.ts 同名注释)。
-       */
+      // 捕根 run id(见 agentGraph.ts 同名注释)
       if (!rootRunId && event.event === "on_chain_start") {
         rootRunId = event.run_id;
       }
@@ -272,29 +228,24 @@ export async function runLangChainAgentStream({
           });
           break;
         }
-        // streamEvents 是 LangChain 提供的"看 Agent 内部发生了什么"的窗口。Agent 内部跑的时候,每经过一个阶段就吐一个事件。
-        case "on_chat_model_stream": {//← 这里是 token! 
-          /**
-           * event.data.chunk 是 AIMessageChunk。
-           * 内容可能是：
-           *   - string："Hello world"
-           *   - MessageContentComplex[]：[{ type: "text", text: "Hello" }, ...]
-           *
-           * messageContentToString 已经统一处理过两种格式。
-           *
-           * 在 Agent 决定调用工具的那一轮，content 通常是空字符串，
-           * 真正的 tool_call 信息走在 chunk.tool_call_chunks 里——我们这里直接
-           * 用 if (text) 过滤掉空 token，剩下的就只剩“给用户看的回答正文”。
-           */
-          //从 event.data.chunk.content 里取出文本
+
+        case "on_chat_model_stream": {
+          // event.data.chunk 是 AIMessageChunk,content 可能是:
+          //   - string: "Hello world"
+          //   - MessageContentComplex[]: [{ type: "text", text: "Hello" }, ...]
+          // messageContentToString 统一处理两种格式。
+          //
+          // Agent 决定调用工具的那一轮,content 通常是空字符串,
+          // 真正的 tool_call 信息走在 chunk.tool_call_chunks 里。
+          // 用 if (text) 过滤掉空 token,剩下的就只剩"给用户看的回答正文"。
           const chunk = (event.data as { chunk?: AIMessageChunk } | undefined)?.chunk;
           const text = chunk ? messageContentToString(chunk.content) : "";
 
-          if (text) {// ← 过滤空字符串
+          if (text) {
             outputText += text;
-
             if (!shouldStop?.()) {
-              onDelta?.(text);// ← 触发回调链:onDelta → writeAgentSseEvent → SSE
+              // 触发回调链: onDelta → writeAgentSseEvent → SSE → iOS
+              onDelta?.(text);
             }
           }
           break;
@@ -304,17 +255,8 @@ export async function runLangChainAgentStream({
           const modelStartedAt = modelCallStarts.get(event.run_id);
           modelCallStarts.delete(event.run_id);
 
-          /**
-           * Phase 10.4 #13 — 模型调用结束,收集 token 用量。
-           *
-           * 和 agentGraph.ts 完全相同的逻辑:
-           * LangChain 把 DeepSeek API 返回的 usage 字段
-           * 转存到 AIMessage.usage_metadata 上:
-           *   { input_tokens: 1200, output_tokens: 350, total_tokens: 1550 }
-           *
-           * 一次 Agent 请求里可能有多次模型调用(ReAct 循环),
-           * 每次 on_chat_model_end 都累加,最终得到总用量。
-           */
+          // 从 AIMessage.usage_metadata 收集 token 用量
+          // (LangChain 把 DeepSeek API 的 usage 字段转存到了 AIMessage 上)
           const output = (event.data as { output?: AIMessageChunk } | undefined)?.output;
           const usageMeta = output?.usage_metadata;
           if (usageMeta) {
@@ -334,14 +276,10 @@ export async function runLangChainAgentStream({
         }
 
         case "on_tool_start": {
-          /**
-           * 这条日志和 agentTools.ts 里发出的 SSE tool_start 是“同一件事”，
-           * 但目标不同：
-           * - SSE：给 iOS 实时展示进度
-           * - 日志：给后端按 requestId grep 工具时间线
-           *
-           * 所以两边都保留，不算重复。
-           */
+          // 这条日志和 agentTools.ts 里发出的 SSE tool_start 是"同一件事",
+          // 但目标不同:
+          //   - SSE → 给 iOS 实时展示进度
+          //   - 日志 → 给后端按 requestId grep 工具时间线
           logAgentInfo(requestId, "tool_execution", "started", {
             runId: event.run_id,
             toolName: event.name,
@@ -391,6 +329,9 @@ export async function runLangChainAgentStream({
   };
 }
 
+// ─── 辅助函数 ─────────────────────────────────────────────────
+
+/** history + 当前 message → LangChain BaseMessage 数组 */
 function buildAgentMessages(
   message: string,
   history: NormalizedChatHistoryItem[]
@@ -400,13 +341,16 @@ function buildAgentMessages(
       if (item.role === "user") {
         return new HumanMessage(item.content);
       }
-
       return new AIMessage(item.content);
     }),
     new HumanMessage(message),
   ];
 }
 
+/**
+ * 加载工具,失败时不让整次请求挂掉。
+ * LangChain Agent 在无工具模式下仍能生成普通回答(只是少了 RAG 能力)。
+ */
 async function loadLangChainTools(
   requestId: string,
   options: Parameters<typeof createLangChainAgentTools>[0]
@@ -428,10 +372,6 @@ async function loadLangChainTools(
       durationMs: getDurationMs(loadToolsStartedAt),
     });
 
-    /**
-     * 和旧 Runner 一样：工具层不可用时不让整次请求失败。
-     * LangChain Agent 会在无工具模式下继续生成普通回答。
-     */
     logAgentInfo(requestId, "tool_setup", "fallback_to_no_tools", {
       durationMs: getDurationMs(loadToolsStartedAt),
       reason: "langchain_tools_load_failed",
@@ -441,42 +381,38 @@ async function loadLangChainTools(
   }
 }
 
+/**
+ * 装配 LangChain 官方 middleware,把"边界保护"做得更标准。
+ *
+ * 1. modelRetryMiddleware
+ *    一次 model 节点失败时按指数退避自动重试。
+ *    onFailure: "continue" → 所有重试都失败也不抛异常,
+ *    而是把错误包成 AIMessage 让 Agent 自己处理(一般是直接回答用户)。
+ *    挡瞬时错误:5xx、429、网络抖动。
+ *
+ *    它和 ChatDeepSeek 自身的 maxRetries 是两层:
+ *      - SDK 层 maxRetries → 单次 HTTP 调用失败时重试
+ *      - middleware 层    → 整个 model node 失败时重试
+ *
+ * 2. modelCallLimitMiddleware
+ *    硬性限制整次 Agent 最多调用模型多少次,成本兜底。
+ *    跟 recursionLimit 的区别:
+ *      - recursionLimit  → Agent 总迭代步数上限
+ *      - modelCallLimit  → 真金白银的模型调用次数上限
+ *
+ * 3. toolCallLimitMiddleware(×3)
+ *    - searchKnowledge 1 次: 避免反复查同一个知识库
+ *    - generateQuiz    1 次: 同理
+ *    - 全局再加 1 道:防止模型在所有工具之间反复横跳
+ *    exitBehavior: "continue" → 达到上限后不抛错,只是不再允许调用,
+ *    模型必须用现有信息回答。
+ *
+ * 为什么用 middleware 而不是 prompt 约束:
+ *   - prompt 是"软劝告",模型可能不听
+ *   - middleware 是"硬约束",达到上限就执行不了
+ *   - 行为可观测(middleware 自己会输出事件)
+ */
 function buildAgentMiddleware() {
-  /**
-   * 第三阶段：用 LangChain 官方 middleware 把“边界保护”做得更标准。
-   *
-   * 我们装了三类 middleware：
-   *
-   * 1. modelRetryMiddleware
-   *    一次 model 节点失败时按指数退避自动重试。
-   *    onFailure:"continue" 表示——所有重试都失败后，不抛异常打断 Agent，
-   *    而是把错误包成一条 AIMessage 让 Agent 自己处理（一般是直接回答用户）。
-   *    这条 middleware 是“瞬时错误的安全网”，能挡住偶发 5xx / 429 / 网络抖动。
-   *
-   *    注意它和 ChatDeepSeek 自身的 maxRetries 是两层结构：
-   *    - SDK 层 maxRetries：单次 fetch 重试（针对“一次 HTTP 调用失败”）
-   *    - middleware 层：整个 model node 重试（针对“一次决策完整失败”）
-   *
-   * 2. modelCallLimitMiddleware
-   *    硬性限制整次 Agent 最多调用模型多少次。
-   *    它是成本兜底——recursionLimit 拦的是 Agent 总迭代步数，
-   *    modelCallLimit 拦的是真金白银的模型调用次数。
-   *    threadLimit 是“同一 thread/会话里的累计上限”；
-   *    runLimit 是“本次 run 内的上限”。学习项目按 run 限就够。
-   *
-   * 3. toolCallLimitMiddleware (×3)
-   *    第二阶段就有的逻辑：
-   *    - searchKnowledge 一次足够，避免模型反复查同一个知识库
-   *    - generateQuiz 同理
-   *    - 全局再加一道，防止模型在所有工具之间反复横跳
-   *    exitBehavior:"continue" 表示——达到上限后不抛错，
-   *    只是不再允许调用，模型必须用现有信息回答。
-   *
-   * 把这些规则从 prompt 升级成 middleware 的好处是：
-   * - prompt 是“软劝告”，模型可能不听
-   * - middleware 是“硬约束”，达到上限就执行不了
-   * - 行为可观测（middleware 自己会输出事件）
-   */
   return [
     modelRetryMiddleware({
       maxRetries: agentModelRetryMaxAttempts,

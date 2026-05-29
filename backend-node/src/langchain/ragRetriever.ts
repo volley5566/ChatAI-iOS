@@ -25,11 +25,28 @@ import {
 } from "./ragCache";
 
 /**
- * Phase 6.4 — 向量缓存文件路径。
+ * ═══════════════════════════════════════════════════════════════════
+ * langchain/ragRetriever.ts — 向量检索入口(LangChain MemoryVectorStore)
+ * ═══════════════════════════════════════════════════════════════════
  *
- * 放在 backend-node/.rag-cache/ 下,和 prisma/ 同级。
- * 已在 .gitignore 排除。
+ * 在整体流程中的位置:
+ *   knowledge.ts / agentTools(searchKnowledge) → retrieveLangChainKnowledge
+ *   → embedQuery + MemoryVectorStore.similaritySearchWithScore
+ *
+ * # 这一层做什么
+ *   1. 启动时把 markdown 文档 chunk 化 + embedding 化
+ *   2. 命中磁盘缓存就跳过 embedding(冷启动 2-5s → <100ms)
+ *   3. 查询时把用户问题 embed 成向量,找余弦相似度最高的 topK chunks
+ *
+ * # 进程级 Promise 缓存
+ *   MemoryVectorStore 在内存里:
+ *     优点 → 零服务依赖、启动即用、适合学习和小知识库
+ *     缺点 → 进程重启后要重建,不适合超大知识库
+ *   用 Promise 缓存处理并发:两个用户同时第一次发消息只会构建一次索引。
  */
+
+// 向量缓存文件路径,放在 backend-node/.rag-cache/(已 .gitignore)
+
 const ragCachePath = path.resolve(__dirname, "../../.rag-cache/vectors.json");
 
 type IndexedKnowledgeMetadata = KnowledgeDocumentMetadata & {
@@ -45,16 +62,7 @@ type LangChainRagIndex = {
   documentCount: number;
 };
 
-/**
- * 进程级 RAG 索引缓存。
- *
- * MemoryVectorStore 是内存向量库：
- * - 优点：零服务依赖、启动即用、适合学习和小知识库
- * - 缺点：进程重启后要重新建索引，不适合超大知识库
- *
- * 这里用 Promise 做缓存，是为了处理并发请求：
- * 如果两个用户同时发起第一条消息，只会构建一次索引。
- */
+// 进程级 RAG 索引缓存(Promise 形式,处理并发初始化)
 let ragIndexPromise: Promise<LangChainRagIndex> | undefined;
 
 export async function retrieveLangChainKnowledge(
@@ -139,15 +147,15 @@ async function buildLangChainRagIndex(): Promise<LangChainRagIndex> {
   const embeddingIdentity = getEmbeddingsIdentity();
 
   /**
-   * Phase 6.4 — 先算指纹试缓存。
+   * 先算指纹试缓存。
    *
    * 指纹覆盖:
-   *   - embedding 标识(切模型必须重建)
+   *   - embedding 标识(换模型必须重建)
    *   - chunk 切分参数(切得不一样,向量对不上)
    *   - 每个 chunk 的 fileName + 实际文本内容
    *
-   * 注意用的是切完后的 indexedDocuments,不是原始文档。
-   * 因为 splitter 自己也可能升级算法,直接对最终 chunk 内容做 hash
+   * 注意用的是切完后的 indexedDocuments,不是原始文档:
+   * splitter 自己也可能升级算法,直接对最终 chunk 内容做 hash
    * 才能完整描述"这些向量代表什么"。
    */
   const fingerprint = computeFingerprint({

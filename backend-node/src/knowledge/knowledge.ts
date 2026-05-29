@@ -2,22 +2,22 @@ import type { ScoredKnowledgeChunk } from "../shared/types";
 import { retrieveLangChainKnowledge } from "../langchain/ragRetriever";
 
 /**
- * 知识库外观层。
+ * ═══════════════════════════════════════════════════════════════════
+ * knowledge/knowledge.ts — 知识库外观层(facade)
+ * ═══════════════════════════════════════════════════════════════════
  *
- * 第一轮项目里，这个文件自己负责：
- * - 读取 Markdown
- * - 手写切 chunk
- * - 手写关键词打分
+ * 在整体流程中的位置:
+ *   chatCompletion.ts / mcpToolHandlers(searchKnowledge)
+ *     ↓
+ *   retrieveRelevantKnowledge  ← 这个文件
+ *     ↓
+ *   langchain/ragRetriever.ts(真正的 RAG 实现)
  *
- * 第二轮 LangChain 集成后，真正的 RAG 流程已经下沉到：
- *
- *   src/langchain/documentLoader.ts
- *   src/langchain/ragRetriever.ts
- *   src/langchain/embeddings.ts
- *
- * 这里保留 retrieveRelevantKnowledge / buildKnowledgeContext 这些老函数名，
- * 是为了让上层 chat、MCP、Agent 代码不需要关心底层到底是关键词检索
- * 还是 LangChain vector retriever。
+ * # 为什么保留这一层
+ *   早期项目里这个文件自己读 Markdown / 切 chunk / 关键词打分,
+ *   后来 RAG 全下沉到 langchain/ 目录,但保留这层老接口:
+ *     - 上层 chat / MCP / Agent 不用关心底层是关键词检索还是 vector retriever
+ *     - 加 buildKnowledgeContext 这种"把 chunks 排版成 prompt context"的胶水逻辑
  */
 
 const maxCharactersPerChunk = 1600;

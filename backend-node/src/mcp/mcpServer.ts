@@ -9,21 +9,27 @@ import {
 } from "./mcpToolHandlers";
 
 /**
- * 是工具提供方
+ * ═══════════════════════════════════════════════════════════════════
+ * mcp/mcpServer.ts — 工具提供方(MCP server,独立子进程运行)
+ * ═══════════════════════════════════════════════════════════════════
  *
- * 这个文件是“工具提供方”：MCP Server。
+ * 在整体流程中的位置:
+ *   mcpClient.ts 启动这个文件作为子进程,通过 stdin/stdout 交换 JSON-RPC。
  *
- * 可以把它理解成一个标准化的工具插座：
- * - 它不直接面对 iOS
- * - 它不直接面对 DeepSeek
- * - 它只通过 MCP 协议暴露工具能力
+ * # 把这个文件理解成"标准化的工具插座":
+ *   - 不直接面对 iOS
+ *   - 不直接面对 DeepSeek
+ *   - 只通过 MCP 协议暴露工具能力
  *
- * 当前为了学习和本地联调，使用 stdio transport：
- * 后端里的 mcpClient.ts 会自动启动这个进程，
- * 然后通过 stdin/stdout 和它交换 JSON-RPC 消息。
+ * # 当前注册的 4 个工具:
+ *   - searchKnowledge      → RAG 知识库检索(纯本地)
+ *   - generateQuiz         → 出题(LLM-as-tool)
+ *   - evaluateAnswer       → 批改(LLM-as-judge)
+ *   - recommendNextTopic   → 推荐下一个学习方向(LLM-as-tool)
  *
- * 以后如果要把工具服务部署成独立服务，可以把 transport 换成
- * Streamable HTTP，但工具注册这部分基本可以保留。
+ * # transport 选择
+ *   当前用 stdio(本地联调最简单)。以后部署成独立服务可以换成
+ *   Streamable HTTP,工具注册这部分代码不用动。
  */
 const mcpServer = new McpServer({
   name: "ai-ios-chat-demo-mcp",
@@ -131,10 +137,7 @@ mcpServer.registerTool(
     annotations: {
       readOnlyHint: true,
       destructiveHint: false,
-      /**
-       * Phase 7.3 升级后 generateQuiz 也内部调 LLM,所以从 idempotent 改成 false。
-       * 同样的 topic 两次调用,模型出题会略有不同,这是预期行为。
-       */
+      // 内部调 LLM,同样的 topic 两次调用模型出题会略有不同,所以 idempotent=false
       idempotentHint: false,
     },
   },
@@ -158,7 +161,7 @@ mcpServer.registerTool(
 );
 
 /**
- * evaluateAnswer — Phase 7.1 新增的批改工具。
+ * evaluateAnswer — 批改工具。
  *
  * 它和 searchKnowledge / generateQuiz 都是只读工具(不改任何持久状态),
  * 但有一个本质区别:**工具内部会再发一次 LLM 请求**。
@@ -242,7 +245,7 @@ mcpServer.registerTool(
 );
 
 /**
- * recommendNextTopic — Phase 7.2 新增的学习规划工具。
+ * recommendNextTopic — 学习规划工具。
  *
  * 它和 evaluateAnswer 都是"工具内部调 LLM"的模式,
  * 但用途完全不同——一个是"做裁判",一个是"做规划"。

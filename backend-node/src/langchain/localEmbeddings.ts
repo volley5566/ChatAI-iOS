@@ -1,28 +1,26 @@
 import { Embeddings } from "@langchain/core/embeddings";
 
 /**
- * 一个“本地学习版”的 LangChain Embeddings。
+ * ═══════════════════════════════════════════════════════════════════
+ * langchain/localEmbeddings.ts — 学习版假 Embeddings(无外部依赖)
+ * ═══════════════════════════════════════════════════════════════════
  *
- * 生产项目通常会用真正的 embedding 模型，比如 OpenAI embeddings、
- * bge / e5 / jina 等中文向量模型，或者公司内部 embedding 服务。
+ * 在整体流程中的位置:
+ *   embeddings.ts 在 EMBEDDINGS_PROVIDER=local-keyword 时返回这个实现。
  *
- * 但这个学习项目目前只有 DeepSeek chat model，没有额外 embedding API key。
- * 为了让你能先完整跑通 LangChain 的：
+ * # 为什么保留它
+ *   生产项目用 OpenAI embeddings / bge / e5 / jina 等真模型,
+ *   本项目默认走 Ollama 真 embedding。但保留这个"零依赖"版本是为了:
+ *     - 没装 Ollama 的人能看 LangChain RAG 流程跑通
+ *     - 离线 / CI 环境
  *
- *   Documents -> TextSplitter -> Embeddings -> VectorStore -> Retriever
+ * # 它做什么
+ *   - 不联网、不下载模型
+ *   - 把中英文关键词 hash 到固定维度向量里
+ *   - 交给 LangChain MemoryVectorStore 做 cosine similarity
  *
- * 这里实现一个确定性的本地 embedding：
- * - 不联网
- * - 不下载模型
- * - 把中英文关键词 hash 到固定维度向量里
- * - 交给 LangChain MemoryVectorStore 做 cosine similarity
- *
- * 它的效果介于“关键词检索”和“真正语义向量检索”之间：
- * - 适合学习 LangChain 架构和调试 RAG 流程
- * - 不适合作为最终生产级语义检索
- *
- * 后续如果你要升级成真正 embedding 模型，只需要替换 embeddings.ts 里的工厂函数，
- * retriever / MCP / iOS 都不用跟着改。
+ * 效果介于"关键词检索"和"真正语义向量检索"之间。
+ * 不适合作为最终生产级语义检索,只适合学习架构。
  */
 export class LocalKeywordEmbeddings extends Embeddings {
   /**

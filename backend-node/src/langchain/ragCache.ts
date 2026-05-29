@@ -3,27 +3,31 @@ import path from "path";
 import crypto from "crypto";
 
 /**
- * Phase 6.4 — RAG 向量缓存。
+ * ═══════════════════════════════════════════════════════════════════
+ * langchain/ragCache.ts — 向量缓存(磁盘 JSON 文件)
+ * ═══════════════════════════════════════════════════════════════════
  *
- * 解决的痛点:每次后端启动都要重新跑一遍
- *   Document → split → embedding(Ollama API 调用 × N) → 内存向量库
+ * 在整体流程中的位置:
+ *   ragRetriever.ts 启动时先查缓存,命中就跳过 embedding;没命中重建后写回。
  *
- * 这里 N = chunk 数量,5-6 个 markdown 文档大约 30-50 个 chunk。
- * 用 Ollama 时单次 embedding 大约 30-80ms,加起来启动要等 2-5 秒,
- * dev 改一行代码 ts-node-dev 自动重启就要重新等一次,非常烦。
+ * # 解决的痛点
+ *   每次后端启动都要跑:Document → split → embedding × N → 内存向量库。
+ *   N = chunk 数量,5-6 个 markdown 文档大约 30-50 个 chunk。
+ *   单次 Ollama embedding 30-80ms,启动要等 2-5 秒——
+ *   dev 改一行代码 ts-node-dev 自动重启就重新等一次,很烦。
  *
- * 缓存策略:把"已经算好的(向量, 文档内容, metadata)"序列化到一个 JSON 文件。
- * 启动时先看 fingerprint 是否还有效——
- *   - 有效:直接从 JSON 读出来,跳过整个 embedding 阶段
- *   - 无效:照常重建,顺便覆盖写新的 JSON
+ * # 缓存策略
+ *   - 序列化(向量, 文档内容, metadata)到 JSON
+ *   - 启动时先比 fingerprint:
+ *       匹配 → 直接读 JSON,跳过 embedding
+ *       不匹配 → 重建 + 覆盖写新 JSON
  *
- * fingerprint 输入包含:
+ * # fingerprint 输入
  *   - embedding 模型标识(切换模型必须重建)
- *   - chunk 切分参数(改了切分要重建)
- *   - 所有源文档的 fileName + content hash(改文档要重建)
- * 任何一项变化,fingerprint 就变,自动失效。
+ *   - chunk 切分参数(改了切分必须重建)
+ *   - 所有源文档的 fileName + content hash(改文档必须重建)
  *
- * 这套思路在生产里也通用——"用一个 hash 作为缓存有效性的判据",
+ * 这套"用 hash 作为缓存有效性判据"的思路在生产里也通用,
  * webpack / vite / npm install 全是这么做的。
  */
 

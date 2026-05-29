@@ -1,3 +1,20 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════
+ * chat/structuredAnswer.ts — 把 AI 返回的 JSON 文本转成 ChatResponseBody
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * 在整体流程中的位置:
+ *   /api/chat 路由拿到模型返回的字符串 → parseStructuredAnswer →
+ *   ChatResponseBody { title, summary, points, next_question } → 返回 iOS
+ *
+ * # 为什么需要这个文件
+ *   模型偶尔会写坏 JSON(夹带未转义引号、多余 markdown 代码围栏等)。
+ *   这里做"双层防御":
+ *     1. 先尝试 JSON.parse(提取 {...} 部分)
+ *     2. parse 失败时用正则从"像 JSON 的文本"提取字段
+ *   保证 iOS 永远能拿到结构化结果,即使模型抽风。
+ */
+
 import type { ChatResponseBody } from "../shared/types";
 
 function extractJsonText(rawText: string): string {

@@ -8,16 +8,20 @@ import type { ChatStreamEvent } from "../shared/types";
 export type { AgentToolExecutionResult, AgentToolName };
 
 /**
- * Agent 工具 UI 事件辅助函数。
+ * ═══════════════════════════════════════════════════════════════════
+ * agent/agentTools.ts — 工具执行过程 → iOS SSE 事件的转换层
+ * ═══════════════════════════════════════════════════════════════════
  *
- * 第二阶段以后，工具决策和工具执行交给 LangChain Agent / LangChain Tool。
- * 但 iOS 端已经约定好展示这些 SSE 事件：
+ * 在整体流程中的位置:
+ *   langchain/agentTools.ts(MCP 桥接 wrapper)调这里的两个 builder:
+ *     buildToolStartEventFromParts(toolCallId, toolName)
+ *     buildToolDoneEventFromParts(toolCallId, toolName, result, durationMs)
+ *   产出标准 ChatStreamEvent,再发给 iOS。
  *
- *   tool_start
- *   tool_done
- *
- * 所以这个文件不再负责工具 schema / tool wrapper 适配，只保留“把工具执行过程
- * 转成 iOS 能展示的安全摘要”这一层。
+ * # 职责边界
+ *   这个文件只做"工具执行过程 → 安全的 UI 摘要"。
+ *   不负责工具决策、不负责工具执行(那是 LangChain Agent 的事)、
+ *   不暴露完整工具结果给 iOS(完整结果作为 ToolMessage 交回 Agent)。
  */
 
 function getAgentToolDisplayName(toolName: string): string {
@@ -131,14 +135,9 @@ export function buildToolDoneEventFromParts(
   toolName: string,
   result: AgentToolExecutionResult,
   /**
-   * 工具从 tool_start 到 tool_done 的耗时（毫秒）。
-   *
-   * 加这个字段是为了第三阶段的“工具进度更标准”：
-   * - iOS 可以直接展示“查询知识库 完成 (213ms)”
-   * - 后端日志和 SSE 事件能用同一个 duration 对齐
-   *
-   * 调用方目前一定会传；保持可选是为了让历史调用点（比如未来加的单元测试）
-   * 不需要立即跟着改。
+   * 工具从 tool_start 到 tool_done 的耗时(毫秒)。
+   * iOS 可以直接展示"查询知识库 完成 (213ms)"。
+   * 调用方目前一定会传,保持可选只是为了让未来加的单元测试不用立即跟着改。
    */
   durationMs?: number
 ): ChatStreamEvent {

@@ -1,3 +1,45 @@
+/**
+ * ═══════════════════════════════════════════════════════════════════
+ * langchain/agentGraph.ts — 手写 StateGraph 版 Agent 运行器
+ * ═══════════════════════════════════════════════════════════════════
+ *
+ * 在整体流程中的位置:
+ *   agent/agentRunner.ts → 这个文件 → langchain/agentGraphNodes.ts
+ *
+ * 当 USE_LANGGRAPH=true 时走这条路径(替代 Phase 3 的 createAgent)。
+ * 函数签名跟 Phase 3 的 runLangChainAgentStream 完全一致,server.ts 无感切换。
+ *
+ * # 图的形状(经典 ReAct 循环)
+ *
+ *   ┌─────────┐
+ *   │  START  │
+ *   └────┬────┘
+ *        ▼
+ *   ┌─────────┐
+ *   │  agent  │   ← 调模型,产生 AIMessage(可能含 tool_calls)
+ *   └────┬────┘
+ *        ▼
+ *   ┌──────────────────┐
+ *   │ shouldContinue?  │   ← 条件边:看上一条 AIMessage 有没有 tool_calls
+ *   └──┬───────────────┘
+ *      │             │
+ *  有 tool_calls   没有
+ *      ▼             ▼
+ *   ┌───────┐      ┌─────┐
+ *   │ tools │      │ END │
+ *   └───┬───┘      └─────┘
+ *       └──────→ agent (循环)
+ *
+ * # 时间线示意
+ *   t0  START
+ *   t1  agent → 模型决定调 searchKnowledge
+ *   t2  shouldContinue → "tools"
+ *   t3  tools → 拿到工具结果
+ *   t4  回到 agent
+ *   t5  agent → 模型基于工具结果生成最终回答
+ *   t6  shouldContinue → END
+ */
+
 import {
   AIMessage,
   AIMessageChunk,
@@ -28,63 +70,11 @@ import {
 import { messageContentToString } from "./chatPrompt";
 import { getSqliteCheckpointer } from "../db/sqliteCheckpointer";
 
-/**
- * Phase 4 — 把图拼起来。
- *
- * ─────────────────────────────────────────────────────────────────────
- * 这是 Phase 4 的入口文件,完整等价于 Phase 3 的 agentRunner.ts,
- * 但内部用手写的 StateGraph 取代了 createAgent 预设。
- * ─────────────────────────────────────────────────────────────────────
- *
- * # 图的形状
- *
- *   ┌──────────────┐
- *   │    START     │
- *   └──────┬───────┘
- *          │
- *          ▼
- *   ┌──────────────┐
- *   │  agent       │   ← agentNode:调模型,产生 AIMessage
- *   └──────┬───────┘
- *          │
- *          ▼
- *   ┌──────────────────┐
- *   │ shouldContinue?  │   ← 条件边:看上一条 AIMessage 有没有 tool_calls
- *   └──┬──────────────┬┘
- *      │              │
- *  有 tool_calls    没有 tool_calls
- *      │              │
- *      ▼              ▼
- *   ┌──────────┐    ┌─────┐
- *   │  tools   │    │ END │
- *   └────┬─────┘    └─────┘
- *        │
- *        └─────────→ agent (回到 agent 让模型基于工具结果继续推理)
- *
- *
- * # 这个图的 "时间线" 模拟
- *
- *   t0  START
- *   t1  agent 跑     → 模型决定调 searchKnowledge
- *   t2  shouldContinue → "tools"
- *   t3  tools 跑     → 拿到工具结果
- *   t4  回到 agent
- *   t5  agent 跑     → 模型基于工具结果生成最终回答
- *   t6  shouldContinue → END
- *   t7  END,图结束
- *
- * 整个循环就是经典的 ReAct(Reasoning + Acting)模式,只不过 Phase 3
- * createAgent 帮你预设好了,Phase 4 我们自己用 StateGraph 拼。
- */
+// ─── 类型定义 ──────────────────────────────────────────────────
 
 /**
- * Phase 10.4 #13 — Token 用量统计。
- *
- * DeepSeek API 每次返回结果时会带 usage 字段,LangChain 在 on_chat_model_end
- * 事件的 AIMessage.usage_metadata 里暴露出来。
- *
- * 一次 Agent 调用可能有多次模型调用(ReAct 循环:模型 → 工具 → 模型 → ...),
- * 所以我们需要把所有模型调用的 token 加起来。
+ * 一次 Agent 调用的 token 用量(ReAct 循环里所有模型调用的累加)。
+ * 来源:LangChain 在 on_chat_model_end 事件的 AIMessage.usage_metadata。
  */
 export type TokenUsage = {
   /** 所有模型调用的 input token 总和 */
@@ -99,21 +89,13 @@ export type LangGraphAgentRunResult = {
   outputText: string;
   toolCallCount: number;
   /**
-   * Phase 10.1 #3 — 本次 Agent 调用在 LangSmith 里的根 run UUID。
-   *
-   * 来源:streamEvents 循环里第一个 parent_ids 为空的 on_chain_start 事件
-   * 的 run_id 字段(就是编译后的 graph 自己启动的那条事件)。
-   *
-   * server.ts 会把这个 id 塞进 SSE done payload,iOS 再用它调 /api/feedback。
-   *
-   * 可能为 undefined 的极端场景:stream 还没产出任何事件就异常退出
-   * (基本不会发生,但类型上留容错)。
+   * LangSmith 根 run UUID。
+   * 来源:streamEvents 第一个 on_chain_start 事件的 run_id。
+   * server.ts 把它塞进 SSE done payload,iOS 用它调 /api/feedback。
+   * 可能 undefined:stream 没产出任何事件就异常(基本不会发生)。
    */
   rootRunId: string | undefined;
-  /**
-   * Phase 10.4 #13 — 本次 Agent 调用消耗的 token 总量。
-   * 累加了所有 ReAct 循环中的模型调用。
-   */
+  /** 本次 Agent 调用消耗的 token 总量 */
   usage: TokenUsage;
 };
 
@@ -123,19 +105,14 @@ type RunLangGraphAgentStreamOptions = {
   systemPrompt: string | undefined;
   history: NormalizedChatHistoryItem[];
   /**
-   * Phase 5.2 新增 —— 对话 ID。
+   * 对话 ID。
    *
-   * 传了的话:
-   *   - LangGraph 会用这个 id 在 checkpointer 里找已有的 state 快照
-   *   - 没找到就当新对话开始
-   *   - 跑完图会把新的 state 快照存回 checkpointer
+   * 传了 → 启用 checkpointer 持久化:
+   *   - 从 SQLite 加载已有 state(没有就当新对话)
+   *   - 跑完图后把新 state 存回数据库
    *
-   * 不传(undefined):
-   *   - 走"无持久化"模式
-   *   - 图跑完 state 立刻丢弃,等价于 Phase 4 老行为
-   *   - 这种模式仍然支持,主要为了让 server.ts 在 iOS 端没改造前不挂
-   *
-   * 一般 thread_id 由 server 层生成 UUID,iOS 端记着用。
+   * 不传 → 无持久化模式,图跑完 state 立即丢弃
+   * (兼容老版本 iOS,server.ts 不传 thread_id 时走这条)
    */
   threadId?: string;
   onToolEvent?: (event: ChatStreamEvent) => void;
@@ -143,9 +120,11 @@ type RunLangGraphAgentStreamOptions = {
   shouldStop?: () => boolean;
 };
 
+// ─── 入口函数 ─────────────────────────────────────────────────
+
 /**
- * 入口函数,签名和 Phase 3 的 runLangChainAgentStream 完全一致——
- * server.ts 不需要修改,只是底层从 createAgent 换成手写 StateGraph。
+ * Phase 4 入口函数,签名和 Phase 3 的 runLangChainAgentStream 完全一致。
+ * server.ts 不需要改,底层从 createAgent 换成手写 StateGraph。
  */
 export async function runLangGraphAgentStream({
   requestId,
@@ -160,33 +139,17 @@ export async function runLangGraphAgentStream({
   const startedAt = Date.now();
   let toolCallCount = 0;
   let outputText = "";
-  /**
-   * Phase 10.1 #3 — 用一个变量捕获根 run id。
-   *
-   * 在 for-await 循环里,第一个"没有 parent"的 on_chain_start 事件
-   * 就是根 run(也就是整张图本身的启动事件)。一旦捕到就不再覆盖。
-   */
+
+  // 第一个 on_chain_start 事件的 run_id 就是 LangSmith trace 的根 run
   let rootRunId: string | undefined;
 
-  /**
-   * Phase 10.4 #13 — 累加 token 用量。
-   *
-   * 每次模型调用结束(on_chat_model_end)时,从 AIMessage.usage_metadata 里
-   * 读取本次调用的 token 数量,累加到这里。
-   *
-   * 一次 Agent 请求里可能有 2-6 次模型调用(ReAct 循环),
-   * 所以最终的 usage 是所有模型调用的总和。
-   */
+  // ReAct 循环里每次 on_chat_model_end 累加 token
   let promptTokens = 0;
   let completionTokens = 0;
 
-  /**
-   * 第一步:加载工具(和 Phase 3 一样,从 MCP 拉)。
-   *
-   * 这一层我们故意保留 Phase 3 的 createLangChainAgentTools,
-   * 因为它把"MCP 工具 → LangChain Tool"的桥接和 SSE 事件发送都做了,
-   * Phase 4 不需要重写这一层。
-   */
+  // ─── 第一步:加载 MCP 工具 ─────────────────────────────────
+  // createLangChainAgentTools 把"MCP 工具 → LangChain Tool"的桥接和
+  // SSE 事件发送都做了,Phase 4 直接复用,不重写这一层。
   const tools = await loadLangGraphTools(requestId, {
     onToolEvent,
     onToolCompleted: () => {
@@ -194,18 +157,16 @@ export async function runLangGraphAgentStream({
     },
   });
 
-  /**
-   * 第二步:构建图。
-   *
-   * StateGraph 的 API 链式调用:
-   *   new StateGraph(stateSchema)
-   *     .addNode("name", nodeFn)
-   *     .addEdge(fromName, toName)
-   *     .addConditionalEdges(fromName, conditionFn)
-   *     .compile()
-   *
-   * compile() 返回一个 CompiledStateGraph,有 invoke / stream / streamEvents 方法。
-   */
+  // ─── 第二步:构建图 ────────────────────────────────────────
+  //
+  // StateGraph 的 API 链式调用:
+  //   new StateGraph(stateSchema)
+  //     .addNode("name", nodeFn)
+  //     .addEdge(fromName, toName)
+  //     .addConditionalEdges(fromName, conditionFn)
+  //     .compile()
+  //
+  // compile() 返回 CompiledStateGraph,有 invoke / stream / streamEvents 方法。
   const agentNode = createAgentNode({
     requestId,
     systemPrompt: buildAgentInstructions(systemPrompt),
@@ -230,71 +191,44 @@ export async function runLangGraphAgentStream({
   });
 
   /**
-   * Phase 5.2:有 threadId 就挂上 checkpointer,让 state 自动存档。
+   * checkpointer 决定图要不要做"对话持久化":
+   *   - 有 threadId → 用 SqliteCheckpointer,每次节点跑完自动存 state
+   *   - 无 threadId → undefined,跑完即丢
    *
-   * 没 threadId(undefined)就走老行为(不持久化)——这条路径主要给
-   * server.ts 在 iOS 端还没改造之前用的兼容路径。
-   *
-   * compile({ checkpointer }) 的效果:
-   *   - 每次节点跑完,LangGraph 自动把更新后的 state 写到 checkpointer
-   *   - 下次同 thread_id 调用 streamEvents 时,LangGraph 自动从 checkpointer
-   *     读出上次的 state,接着往下跑
-   *
-   * 注意 checkpointer 是图编译期决定的,**编译后不能改**。所以这里要在
-   * .compile() 调用时决定要不要传它。
+   * 注意:checkpointer 是图编译期决定的,**编译后不能改**。
    */
   const checkpointer = threadId ? getSqliteCheckpointer() : undefined;
 
   const graph = new StateGraph(AgentState)
-    /**
-     * .addNode 把节点函数注册到图里,起一个名字(后面 addEdge 要用)。
-     * 名字是字符串,但 LangGraph 的类型系统会把它收集起来,addEdge 时类型检查
-     * 会报错"不存在的节点名"——这是 LangGraph 类型安全的一个亮点。
-     */
+    // addNode 把节点函数注册到图里,起一个名字(后面 addEdge 要用)。
+    // 名字是字符串,但 LangGraph 类型系统会收集起来,addEdge 时类型检查
+    // 会报"不存在的节点名"——LangGraph 类型安全的亮点之一。
     .addNode("agent", agentNode)
     .addNode("tools", toolNode)
-    /**
-     * .addEdge 加一条"必然走"的边。
-     * START → agent:图启动后第一个节点就是 agent。
-     */
+    // addEdge 加"必然走"的边:START → agent
     .addEdge(START, "agent")
-    /**
-     * .addConditionalEdges 加一条"根据 state 决定去哪"的边。
-     * 第二个参数 shouldContinue 返回字符串,表示下一个节点的名字(或 END)。
-     *
-     * 第三个参数是"可能的返回值列表",帮助 LangGraph 做静态分析+生成更准的类型。
-     * 不传也能跑,但推荐传——LangGraph 才能画图、推导类型。
-     */
+    // addConditionalEdges:根据 state 决定下一个节点(返回节点名 or END)。
+    // 第三个参数是"可能的返回值列表",帮助 LangGraph 做静态分析、类型推导、画图。
     .addConditionalEdges("agent", shouldContinue, ["tools", END])
-    /**
-     * tools 跑完一定回 agent,让模型基于工具结果继续推理。
-     */
+    // tools 跑完一定回 agent,让模型基于工具结果继续推理
     .addEdge("tools", "agent")
-    /**
-     * compile 编译成可运行的图。
-     * 编译期会做几项检查:
-     *   - 所有 edge 的端点都已经 addNode
-     *   - 没有"死节点"(没有任何边能到达的节点)
-     *   - 没有缺路径(START 必须能到 END)
-     *
-     * checkpointer 是可选的:传了就启用持久化,不传就纯内存模式。
-     */
+    // compile 编译成可运行的图,编译期检查:
+    //   - 所有 edge 端点都已 addNode
+    //   - 没有死节点
+    //   - START 必须能到 END
     .compile({ checkpointer });
 
-  /**
-   * 第三步:准备初始 state(送进图的 messages 列表)。
-   *
-   * 这里要根据是否启用 checkpointer 分两种构造方式:
-   *
-   * - 有 threadId(走 checkpointer):
-   *     state.messages 已经在数据库里,LangGraph 会自动加载。
-   *     我们**只塞新消息**,LangGraph 用 messagesStateReducer 自动追加。
-   *     如果再传一遍 history,会和数据库里已有的重复!
-   *
-   * - 没 threadId(无持久化):
-   *     state 是空的(图启动时白板从默认值 [] 开始),
-   *     所以要把 history + 当前消息一起塞进去。
-   */
+  // ─── 第三步:构造初始 messages ──────────────────────────────
+  //
+  // 根据是否启用 checkpointer 分两种构造方式:
+  //
+  // - 有 threadId(走 checkpointer):
+  //     state.messages 已经在数据库里,LangGraph 自动加载。
+  //     只塞新消息,messagesStateReducer 自动追加。
+  //     再传一遍 history 会和数据库里的重复!
+  //
+  // - 无 threadId(无持久化):
+  //     state 从默认值 [] 开始,所以要把 history + 当前消息一起塞进去。
   const initialMessages = threadId
     ? [new HumanMessage(message)]
     : buildInitialMessages(message, history);
@@ -306,31 +240,15 @@ export async function runLangGraphAgentStream({
     threadId: threadId ?? "(none, no persistence)",
   });
 
-  /**
-   * 第四步:用 streamEvents 跑图,token 一边产生一边推给 iOS。
-   *
-   * Phase 5.2 新增:传 configurable.thread_id。
-   *   - LangGraph 会用它找 checkpointer 里已有的 state(如果有)
-   *   - 跑完后把新 state 写回 checkpointer
-   *
-   * 没传 thread_id 也能跑(checkpointer 也是可选的),那就是纯内存模式。
-   *
-   * 注意 configurable 是 LangGraph 的"特殊配置入口",
-   * thread_id 是其中**最常用的字段**——所有 checkpointer 都靠它隔离不同对话。
-   */
-  /**
-   * Phase 10.1 — 给 LangSmith trace 加业务 metadata + tags。
-   *
-   * metadata 字段会出现在 LangSmith 网页 trace 详情的 "Metadata" 区,
-   * 可以在 Project 列表页用 metadata 过滤(比如只看某个 thread 的所有 trace)。
-   *
-   * tags 是逗号分隔的字符串数组,LangSmith 网页可以按 tag 快速筛选——
-   * 比如 ["agent", "phase-4"] 表示"这是 Phase 4 路径的 Agent 调用",
-   * 区分 Phase 3 createAgent trace 时一眼可见。
-   *
-   * 这两个字段不影响 Agent 行为,纯粹是给 trace 加"业务标签",
-   * 没接 LangSmith 也不会出错(LangChain 会静默忽略)。
-   */
+  // ─── 第四步:streamEvents 跑图,边产边推 ─────────────────────
+  //
+  // configurable.thread_id 是 LangGraph 的"特殊配置入口",
+  // 所有 checkpointer 都靠它隔离不同对话。
+  //
+  // metadata + tags 是给 LangSmith trace 加的业务标签:
+  //   - metadata 在 trace 详情的 Metadata 区,可以按它过滤
+  //   - tags 在 LangSmith 网页可以快速筛选(如 phase-4 区分 Phase 3 路径)
+  // 没接 LangSmith 也不会出错,LangChain 会静默忽略。
   const eventStream = graph.streamEvents(
     { messages: initialMessages },
     {
@@ -345,11 +263,7 @@ export async function runLangGraphAgentStream({
         use_langgraph: true,
         history_count: history.length,
       },
-      tags: [
-        "agent",
-        "phase-4",
-        threadId ? "persistent" : "stateless",
-      ],
+      tags: ["agent", "phase-4", threadId ? "persistent" : "stateless"],
     }
   );
 
@@ -363,37 +277,23 @@ export async function runLangGraphAgentStream({
         break;
       }
 
-      /**
-       * Phase 10.1 #3 — 捕根 run id。
-       *
-       * streamEvents 在事件层面保证"父 chain 的 on_chain_start 一定先于子 chain
-       * 的任何事件"——所以循环里**第一个** on_chain_start 必然是整张图本身的
-       * 启动事件,它的 run_id 就是这条 LangSmith trace 的根 run。
-       *
-       * (理论上 StreamEvent 运行时还带一个 parent_ids 字段可以更精确判定根,
-       * 但 @langchain/core 的 TS 类型没暴露这个字段,用了编译不过。
-       * "第一个 on_chain_start"在实际行为上同样可靠且足够清晰。)
-       *
-       * 这段放在 switch 外面,因为只关心捕一次;捕到后 if 守卫不再覆盖。
-       */
+      // 捕根 run id:streamEvents 保证父 chain 的 on_chain_start
+      // 一定先于子 chain 任何事件,所以第一个 on_chain_start 必然是
+      // 整张图自己的启动事件,它的 run_id 就是 LangSmith 根 run。
       if (!rootRunId && event.event === "on_chain_start") {
         rootRunId = event.run_id;
       }
 
       switch (event.event) {
         case "on_chat_model_stream": {
-          /**
-           * event.data.chunk 是 AIMessageChunk,跟 Phase 3 完全一样。
-           * 在 agentNode 内部模型 .stream() 的每个 chunk 都会触发这个事件,
-           * 不管 chunk 在哪个节点里产生。
-           */
+          // event.data.chunk 是 AIMessageChunk(模型 .stream() 的每个 chunk)
+          // 不管 chunk 来自哪个节点都会触发这个事件。
           const chunk = (event.data as { chunk?: AIMessageChunk } | undefined)
             ?.chunk;
           const text = chunk ? messageContentToString(chunk.content) : "";
 
           if (text) {
             outputText += text;
-
             if (!shouldStop?.()) {
               onDelta?.(text);
             }
@@ -402,19 +302,10 @@ export async function runLangGraphAgentStream({
         }
 
         case "on_chat_model_end": {
-          /**
-           * Phase 10.4 #13 — 模型调用结束,收集 token 用量。
-           *
-           * LangChain 在 on_chat_model_end 事件的 output(AIMessage)里
-           * 挂了一个 usage_metadata 字段:
-           *   { input_tokens: 1200, output_tokens: 350, total_tokens: 1550 }
-           *
-           * 这个数据来自 DeepSeek API 返回的 usage 字段,
-           * LangChain 只是把它转存到了 AIMessage 上。
-           *
-           * 注意:一次 Agent 请求里可能有多次模型调用(ReAct 循环),
-           * 每次 on_chat_model_end 都累加,最终得到总用量。
-           */
+          // 模型调用结束 → 从 AIMessage.usage_metadata 收集 token 用量。
+          // usage_metadata = { input_tokens, output_tokens, total_tokens }
+          // 数据来自 DeepSeek API 的 usage 字段,LangChain 只是转存。
+          // ReAct 循环里可能有多次模型调用,每次都累加。
           const output = (event.data as { output?: AIMessageChunk } | undefined)?.output;
           const usageMeta = output?.usage_metadata;
           if (usageMeta) {
@@ -425,10 +316,8 @@ export async function runLangGraphAgentStream({
         }
 
         case "on_tool_start": {
-          /**
-           * SSE tool_start 已经在 agentTools.ts wrapper 里发了,
-           * 这里只用来写后端结构化日志(给 grep 用)。
-           */
+          // SSE tool_start 事件已经在 agentTools.ts wrapper 里发了,
+          // 这里只写后端结构化日志(给 grep 用)。
           logAgentInfo(requestId, "tool_execution", "started", {
             runId: event.run_id,
             toolName: event.name,
@@ -478,14 +367,14 @@ export async function runLangGraphAgentStream({
   };
 }
 
+// ─── 辅助函数 ─────────────────────────────────────────────────
+
 /**
- * 把(message + history)转成 LangChain BaseMessage 数组。
+ * 把(history + 当前 message)转成 LangChain BaseMessage 数组。
  *
- * 和 Phase 3 buildAgentMessages 一模一样,只是搬过来不引入跨文件依赖。
- *
- * 注意 system prompt 不在这里加——agentNode 在每次模型调用时
- * 才把 system prompt 拼到最前面,避免把 system 存进 state.messages(
- * 那会让 checkpointer 持久化时多存一份冗余)。
+ * 注意:system prompt 不在这里加——agentNode 每次模型调用时才把 system
+ * 拼到最前面,避免把 system 存进 state.messages(那会让 checkpointer
+ * 持久化时多存一份冗余)。
  */
 function buildInitialMessages(
   message: string,
@@ -503,11 +392,9 @@ function buildInitialMessages(
 }
 
 /**
- * 加载工具的小封装,逻辑跟 Phase 3 loadLangChainTools 一样:
- *  - 成功:返回工具列表
- *  - 失败:写错误日志,返回空数组(让 Agent 在无工具模式下继续)
- *
- * 这一层不需要 LangGraph 改造,createLangChainAgentTools 已经做得很好。
+ * 加载工具的小封装:
+ *   - 成功 → 返回工具列表
+ *   - 失败 → 写错误日志,返回 [](让 Agent 无工具模式继续跑)
  */
 async function loadLangGraphTools(
   requestId: string,
@@ -540,10 +427,8 @@ async function loadLangGraphTools(
 }
 
 /**
- * 一个调试用导出:让外部能拿到当前的"最终回答文本",
- * 主要给 agentDebug.ts 之类的脚本用。
- *
+ * 调试用导出:让外部能拿到"最终回答文本"(给 agentDebug.ts 之类的脚本用)。
  * Phase 4 内部已经在 streamEvents 循环里累积 outputText 了,
- * 这个导出主要是为了 API 完整性(和 Phase 3 对齐)。
+ * 这个导出主要是 API 完整性(和 Phase 3 对齐)。
  */
 export { extractFinalAssistantText };

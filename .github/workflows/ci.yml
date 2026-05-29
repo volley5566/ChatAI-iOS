@@ -27,9 +27,11 @@ permissions:
   pull-requests: write
 
 # ─── 什么时候触发 ───
+# push 到 main 或 feature 分支都会跑（开发期方便验证）
+# PR 对 main 也会跑（合并前检查）
 on:
   push:
-    branches: [main]
+    branches: [main, "feature/**"]
   pull_request:
     branches: [main]
 

@@ -22,6 +22,15 @@
 
 FROM node:20-slim AS builder
 
+# better-sqlite3 是 C++ 原生模块,npm ci 时需要用 node-gyp 编译它。
+# node:20-slim 镜像太精简,缺编译工具链,所以要手动装:
+#   python3  — node-gyp 用 Python 生成构建脚本
+#   make     — 执行编译
+#   g++      — C++ 编译器
+#
+# 这些只在 builder 阶段需要,runner 阶段用的是编译好的 .node 二进制,不用装。
+RUN apt-get update && apt-get install -y python3 make g++ && rm -rf /var/lib/apt/lists/*
+
 # 设置工作目录(容器内路径,不是宿主机)
 WORKDIR /app
 
@@ -49,6 +58,17 @@ COPY . .
 # tsc 读 tsconfig.json 的 outDir(dist/),产出 .js 文件
 RUN npm run build
 
+# 单独跑一次"只保留生产依赖"的安装,给 runner 阶段用。
+# 为什么不在 runner 里 npm ci --omit=dev?
+# 因为 better-sqlite3 是 C++ 原生模块,编译需要 python3 / make / g++,
+# 这些工具只在 builder 里装了。在 builder 里编译好,runner 直接复制就行。
+#
+# npm ci --omit=dev 会删掉 devDependencies(typescript 等),
+# 只保留生产依赖 + 已编译好的 .node 原生模块。
+RUN cp -r node_modules node_modules_full && \
+    npm ci --omit=dev && \
+    npx prisma generate
+
 # ─── 阶段 2: 运行 ───────────────────────────────────────────────
 
 FROM node:20-slim AS runner
@@ -56,22 +76,16 @@ FROM node:20-slim AS runner
 WORKDIR /app
 
 # 只复制生产需要的东西:
-#   - package*.json: npm ci --omit=dev 要用
+#   - package*.json: 运行时 npx 命令需要
 #   - prisma/: schema + migrations,运行时 migrate deploy 要用
 #   - dist/: 编译好的 JS
 #   - knowledge/: RAG 知识库 markdown 文件
+#   - node_modules/: 从 builder 复制,已经编译好原生模块 + 只含生产依赖
 COPY package.json package-lock.json ./
 COPY prisma ./prisma/
 COPY --from=builder /app/dist ./dist
+COPY --from=builder /app/node_modules ./node_modules
 COPY knowledge ./knowledge/
-
-# 只装生产依赖(不装 devDependencies 如 typescript / ts-node)
-# 这是 runner 阶段镜像小的关键
-RUN npm ci --omit=dev
-
-# Prisma generate: runner 阶段也要跑,因为 @prisma/client 是 postinstall 生成的,
-# npm ci --omit=dev 不会跑 devDependencies 的 postinstall。
-RUN npx prisma generate
 
 # 暴露端口(文档作用,docker-compose 里的 ports 才是真正的端口映射)
 EXPOSE 8000

@@ -34,6 +34,8 @@
     "cors": "^2.8.6",
     "dotenv": "^17.4.2",
     "express": "^5.2.1",
+    "express-rate-limit": "^8.5.2",
+    "helmet": "^8.2.0",
     "langchain": "^1.4.0",
     "langsmith": "^0.7.1",
     "zod": "^4.4.3"

@@ -48,7 +48,7 @@ iOS SwiftUI（对话列表 + 聊天页）
 | Phase 5.6 | iOS 对话列表 UI | `Views/ThreadListView.swift` |
 | Phase 6 | Ollama 真实 Embedding + 向量缓存 | `langchain/embeddings.ts` `langchain/ragCache.ts` |
 | Phase 7 | 工具集扩展到 4 个（LLM-as-judge + 学习规划） | `mcp/mcpToolHandlers.ts` |
-| Phase 10 | 生产化：LangSmith trace + Eval 评测体系 + 用户反馈 | `langsmithClient.ts` `evals/` |
+| Phase 10 | 生产化：LangSmith trace + Eval + CI/CD + 安全加固 + Docker | `langsmithClient.ts` `evals/` `Dockerfile` |
 
 Phase 3 和 Phase 4 通过 `USE_LANGGRAPH` 环境变量灰度切换，行为完全等价。
 
@@ -353,11 +353,21 @@ backend-node/evals/
   evals/evaluators/              4 个评分器（toolChoice / keyword / toolChain / llmJudge）
   evals/runEval.ts               主入口（读数据集 → 跑 Agent → 评分 → 出报告）
 
+# Phase 10.4 生产化
+backend-node/Dockerfile
+  多阶段构建（builder 编译 + runner 只跑 JS）
+backend-node/.dockerignore
+  Docker 构建时忽略的文件
+docker-compose.yml
+  编排配置（端口 / 环境变量 / 数据卷 / 重启策略）
+.github/workflows/ci.yml
+  GitHub Actions CI（tsc 检查 + eval 快速检查 + PR 自动评论）
+
 # 通用
 backend-node/src/http/sse.ts
   统一写 SSE event
 backend-node/src/shared/types.ts
-  后端共享类型
+  后端共享类型（含 SSE 事件 token 用量字段）
 ```
 
 拆分后的职责关系：
@@ -469,7 +479,7 @@ data: {"type":"delta","delta":"SwiftUI ","request_id":"req_xxx","phase":"final_s
 
 data: {"type":"delta","delta":"里的 @State ","request_id":"req_xxx","phase":"final_stream"}
 
-data: {"type":"done","request_id":"req_xxx","phase":"request_completed","duration_ms":3421}
+data: {"type":"done","request_id":"req_xxx","phase":"request_completed","duration_ms":3421,"prompt_tokens":1200,"completion_tokens":350,"total_tokens":1550}
 ```
 
 iOS 解析：
@@ -478,7 +488,7 @@ iOS 解析：
 tool_start：在当前 AI 气泡里显示"正在 xxx"
 tool_done：更新成"已 xxx，结果摘要"
 delta：追加到同一条 AI 气泡的 content
-done：结束本次回答
+done：结束本次回答（附带 run_id + token 用量统计）
 error：显示错误提示
 ```
 
@@ -778,12 +788,149 @@ npm run eval -- --fail-below 0.7       # 总分 < 0.7 时 CI 红灯
 
 ---
 
-## 10. 后续规划
+## 10. 生产化基础（Phase 10.4）
+
+Phase 10.4 把后端从"能跑"升级到"能部署"——加了安全加固、成本可观测、容器化三块。
+
+### 10.1 Rate Limiting + Helmet 安全头（#12）
 
 ```text
-Phase 8   Multi-Agent 协作（Router + 子 Agent）
-Phase 9   高级 LangGraph（HITL 人工审核 + Subgraph 子图 + Time-travel 时光机）
-Phase 10  生产化 + LangSmith Eval ← 进行中（10.1 trace/feedback 完成，10.2 eval 体系完成，10.3 CI 待做）
+问题:
+  后端直接暴露在公网上,没有任何防护:
+  - 没有限流 → 恶意脚本无限调 /api/agent/stream → API token 余额烧光
+  - 没有安全头 → 安全扫描工具一堆 warning
+
+解决:
+  1. Helmet — 一行代码给每个 HTTP 响应加十几个安全头
+     X-Content-Type-Options: nosniff     ← 防 MIME 嗅探
+     X-Frame-Options: SAMEORIGIN         ← 防点击劫持
+     Strict-Transport-Security           ← 强制 HTTPS
+     ...
+
+  2. express-rate-limit — 同一 IP,15 分钟最多 100 次请求
+     超了返回 429 "Too Many Requests"
+     只限 /api 路径(健康检查 /health 不限)
 ```
 
-推荐推进顺序：**先做 Phase 10 的 LangSmith trace + 最小 eval 数据集**（建立观测和评测 baseline），再做 Phase 9 的 HITL（给后续多 Agent 加安全带），最后做 Phase 8 多 Agent。
+Android 类比: Helmet 就像 `android:usesCleartextTraffic="false"` + `networkSecurityConfig`,一个配置提升安全基线。Rate limit 就像 OkHttp Interceptor 里的频率检查。
+
+关键文件: `backend-node/src/server.ts`（helmet + apiLimiter 中间件）
+
+### 10.2 Token + Cost 追踪（#13）
+
+```text
+问题:
+  Agent 每次请求会调 1-6 次 DeepSeek API,每次都花 token(花钱),
+  但之前完全不知道每次请求花了多少 token。
+
+解决:
+  DeepSeek API 每次返回结果时带 usage 字段,
+  LangChain 在 on_chat_model_end 事件的 AIMessage.usage_metadata 里暴露出来。
+
+  一次 Agent 请求可能有多次模型调用(ReAct 循环):
+    第 1 次: 模型决定调工具 → 消耗 input_tokens + output_tokens
+    第 2 次: 基于工具结果生成回答 → 又消耗一波
+    ...
+
+  所以需要把所有模型调用的 token 累加起来。
+
+数据流:
+  on_chat_model_end 事件
+    → AIMessage.usage_metadata.input_tokens / output_tokens
+    → promptTokens += / completionTokens +=
+    → 最终组装成 TokenUsage { promptTokens, completionTokens, totalTokens }
+    → 写进 Agent 返回值
+    → 写进后端日志(按 requestId 可 grep)
+    → 写进 SSE done 事件(prompt_tokens / completion_tokens / total_tokens)
+    → iOS 可以展示"本次消耗了多少 token"
+
+两条 Agent 路径(Phase 3 createAgent / Phase 4 StateGraph)
+都做了相同的 token 收集,gateway 层统一返回。
+```
+
+关键文件:
+- `backend-node/src/langchain/agentGraph.ts`（Phase 4 路径 token 收集）
+- `backend-node/src/langchain/agentRunner.ts`（Phase 3 路径 token 收集）
+- `backend-node/src/shared/types.ts`（done 事件新增 token 字段）
+- `backend-node/src/server.ts`（SSE done 事件带 token 用量）
+
+### 10.3 Dockerfile + Docker Compose（#14）
+
+```text
+问题:
+  开发时 npm run dev 用 ts-node 直接跑 .ts 文件很方便,
+  但部署到服务器时:
+  - 不想装 ts-node / TypeScript(生产环境只需要 .js)
+  - 不想暴露源码
+  - 不想"我本地能跑服务器上跑不了"
+
+解决:
+  Docker 把"编译 + 运行环境"打成一个镜像,在哪都能跑。
+```
+
+**多阶段构建(multi-stage build)**:
+
+```text
+阶段 1  builder
+  ├── npm ci              ← 装全量依赖(含 devDependencies)
+  ├── prisma generate     ← 生成 @prisma/client 类型
+  └── npm run build       ← tsc 编译: src/ → dist/
+
+阶段 2  runner
+  ├── npm ci --omit=dev   ← 只装生产依赖(不装 typescript / ts-node)
+  ├── prisma generate     ← 重新生成 client
+  ├── COPY dist/          ← 从 builder 阶段复制编译产物
+  └── CMD prisma migrate deploy && node dist/server.js
+
+好处: devDependencies 不进最终镜像,体积小一半。
+```
+
+Android 类比: 就像 `assembleRelease` — 编译产物打进 APK,但编译器(kotlinc)不跟着打包。
+
+**Docker Compose 编排**:
+
+```text
+docker compose up --build     # 构建 + 启动(第一次或代码改了)
+docker compose up -d          # 后台启动
+docker compose down           # 停止
+docker compose logs -f        # 看日志
+
+配置了什么:
+  - 端口映射: 宿主机 8000 → 容器 8000
+  - 环境变量: 从 backend-node/.env 注入
+  - 数据卷:
+      db-data → /app/data/     ← SQLite 数据库(容器重启不丢数据)
+      knowledge/ → /app/knowledge/ (只读) ← RAG 知识库热更新
+  - 重启策略: unless-stopped(崩了自动拉起)
+```
+
+关键文件:
+- `backend-node/Dockerfile`（多阶段构建）
+- `backend-node/.dockerignore`（构建时忽略列表）
+- `docker-compose.yml`（编排配置,在项目根目录）
+
+### 10.4 GitHub Actions CI/CD（#10 #11）
+
+```text
+每次 push 或提 PR,GitHub Actions 自动跑:
+  1. TypeScript 编译检查(tsc --noEmit)
+  2. Eval 快速检查(前 5 条 case,总分 < 0.6 报红)
+  3. PR 自动评论(把 eval 报告贴到 PR 评论区)
+
+触发条件:
+  push 到 main / feature/** 分支
+  PR 对 main 分支
+```
+
+关键文件: `.github/workflows/ci.yml`
+
+---
+
+## 11. 后续规划
+
+```text
+Phase 9   高级 LangGraph（HITL 人工审核 + Subgraph 子图 + Time-travel 时光机）
+Phase 8   Multi-Agent 协作（Router + 子 Agent）
+```
+
+推荐推进顺序: **先做 Phase 9 HITL**（给后续多 Agent 加安全带），再做 Phase 8 多 Agent。

@@ -1,0 +1,85 @@
+# ═══════════════════════════════════════════════════════════════════
+# Phase 10.4 #14 — Docker Compose 编排
+# ═══════════════════════════════════════════════════════════════════
+#
+# 这个文件告诉 Docker:"帮我把后端服务跑起来,环境变量、端口、数据卷都配好。"
+#
+# 为什么需要 docker-compose:
+#   Dockerfile 只定义"怎么打包镜像",但运行时还有一堆配置:
+#     - 环境变量从哪读
+#     - 端口怎么映射
+#     - 数据库文件存哪(容器重启后数据不丢)
+#     - 知识库文件怎么挂载
+#   docker-compose.yml 把这些"运行时配置"集中管理,一条命令全搞定。
+#
+# Android 类比:
+#   Dockerfile ≈ build.gradle(怎么编译打包)
+#   docker-compose.yml ≈ AndroidManifest.xml(运行时配置:权限/入口/服务声明)
+#
+# 用法:
+#   docker compose up --build       # 构建镜像 + 启动(第一次或代码改了用)
+#   docker compose up -d            # 后台启动(不占终端)
+#   docker compose down             # 停止并删除容器
+#   docker compose logs -f backend  # 看日志(实时跟踪)
+#
+
+services:
+  backend:
+    # ─── 构建配置 ──────────────────────────────────────────────
+    # context: Dockerfile 所在目录(也是 COPY 的相对路径基准)
+    build:
+      context: ./backend-node
+      dockerfile: Dockerfile
+
+    # ─── 端口映射 ──────────────────────────────────────────────
+    # 宿主机 8000 → 容器 8000
+    # 访问 http://localhost:8000 就能打到容器里的 Express
+    ports:
+      - "8000:8000"
+
+    # ─── 环境变量 ──────────────────────────────────────────────
+    # 从 backend-node/.env 读环境变量注入容器。
+    # 这样你本地的 .env(含 DEEPSEEK_API_KEY)在容器里也能用。
+    #
+    # 如果部署到服务器,换成 environment: 直接写,或者用 secret manager。
+    env_file:
+      - ./backend-node/.env
+
+    # ─── 覆盖 DATABASE_URL ────────────────────────────────────
+    # .env 里的 DATABASE_URL 是 "file:./dev.db"(相对于 prisma/ 目录),
+    # 容器里 prisma/ 在 /app/prisma/,所以路径仍然有效。
+    #
+    # 但为了让数据库存到 volume(容器重启不丢数据),
+    # 我们把 DATABASE_URL 覆盖成指向 /app/data/dev.db。
+    # Prisma 和 SqliteCheckpointer 都会用这个路径。
+    environment:
+      - DATABASE_URL=file:/app/data/dev.db
+
+    # ─── 数据卷 ────────────────────────────────────────────────
+    # volumes 把容器内的路径映射到宿主机:
+    #
+    # db-data → /app/data/
+    #   SQLite 数据库文件。用 named volume 而不是 bind mount,
+    #   Docker 自己管理存储位置,容器删了数据还在。
+    #
+    # ./backend-node/knowledge → /app/knowledge/ (只读)
+    #   RAG 知识库。用 bind mount 让你在宿主机改了 .md 文件后
+    #   容器里也能看到(不用重新构建镜像)。:ro 表示只读,
+    #   容器里的代码不应该改知识库文件。
+    volumes:
+      - db-data:/app/data
+      - ./backend-node/knowledge:/app/knowledge:ro
+
+    # ─── 重启策略 ──────────────────────────────────────────────
+    # unless-stopped: 容器崩了自动重启,除非你手动 docker compose down。
+    # 适合长期跑的服务。
+    restart: unless-stopped
+
+# ─── Named Volumes ──────────────────────────────────────────────
+# 声明 db-data volume。Docker 会在宿主机的特定位置创建存储,
+# 容器删了重建后数据还在(只要 volume 没被删)。
+#
+# 查看 volume 位置: docker volume inspect ai-ios-chat-demo_db-data
+# 清除 volume:      docker compose down -v (慎用,数据会丢!)
+volumes:
+  db-data:

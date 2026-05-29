@@ -1,0 +1,35 @@
+# Phase 10.4 #14 — Docker 构建时忽略的文件。
+#
+# 作用和 .gitignore 类似,但是针对 `docker build` 的:
+# COPY 指令会跳过这里列出的文件,让镜像更小、构建更快。
+#
+# Android 类比: 就像 .gradle/ 和 build/ 不该打进 APK。
+
+# 依赖目录(容器里会 npm ci 重新装)
+node_modules
+
+# TypeScript 编译产物(容器里会 npm run build 重新编译)
+dist
+
+# 开发数据库(容器里挂 volume,不用把本地的 .db 打进镜像)
+prisma/dev.db
+prisma/dev.db-shm
+prisma/dev.db-wal
+
+# 环境变量(容器通过 docker-compose 的 env_file 或 environment 注入)
+.env
+
+# 向量缓存(容器里会重新构建)
+.rag-cache
+
+# Eval 报告(CI 产物,不进镜像)
+eval-report.md
+
+# Git
+.git
+.gitignore
+
+# IDE
+.vscode
+.idea
+*.swp

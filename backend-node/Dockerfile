@@ -73,6 +73,10 @@ RUN cp -r node_modules node_modules_full && \
 
 FROM node:20-slim AS runner
 
+# Prisma 的查询引擎是编译好的二进制文件,运行时依赖 OpenSSL。
+# node:20-slim 太精简没有装,不加这行 Prisma 启动时会报 loadEngine 错误。
+RUN apt-get update && apt-get install -y openssl && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
 
 # 只复制生产需要的东西:

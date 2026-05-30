@@ -32,6 +32,7 @@ import {
   HumanMessage,
 } from "@langchain/core/messages";
 import type { TokenUsage } from "./agentGraph";
+import type { PendingToolApproval } from "../shared/types";
 import {
   createAgent,
   modelCallLimitMiddleware,
@@ -70,6 +71,12 @@ export type LangChainAgentRunResult = {
   rootRunId: string | undefined;
   /** 本次 Agent 调用消耗的 token 总量(与 agentGraph.ts 同名字段对齐) */
   usage: TokenUsage;
+  /**
+   * HITL 挂起信息(与 LangGraphAgentRunResult 接口对齐)。
+   * Phase 3 createAgent 路径**不接 checkpointer**,所以这里永远 undefined。
+   * 想用 HITL 必须走 USE_LANGGRAPH=true。
+   */
+  pending?: PendingToolApproval;
 };
 
 type RunLangChainAgentStreamOptions = {

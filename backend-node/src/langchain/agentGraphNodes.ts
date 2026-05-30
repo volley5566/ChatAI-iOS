@@ -6,15 +6,65 @@ import {
 } from "@langchain/core/messages";
 import type { ClientTool } from "@langchain/core/tools";
 import type { ToolCall } from "@langchain/core/messages/tool";
-import { END } from "@langchain/langgraph";
+import { END, interrupt } from "@langchain/langgraph";
 import {
   agentModelCallLimit,
   agentModelRetryMaxAttempts,
 } from "../config/env";
 import { logAgentInfo } from "../agent/agentObservability";
+import type { ChatStreamEvent } from "../shared/types";
 import type { AgentStateType, AgentStateUpdate } from "./agentGraphState";
 import { createLangChainChatModel } from "./chatModel";
 import { messageContentToString } from "./chatPrompt";
+
+/**
+ * HITL 审核名单:这些工具在执行前会 interrupt(),等用户在 iOS 上点批准。
+ *
+ * 为什么是这 3 个?
+ *   - LLM-as-tool: 工具内部会再发一次 DeepSeek 请求,有真实成本(token + 时间)
+ *   - 输出影响用户后续动作(评分会影响信心,推荐会影响学习路径)
+ * searchKnowledge 是只读 RAG,无成本无副作用,不进审核名单。
+ */
+const TOOLS_REQUIRING_APPROVAL = new Set<string>([
+  "evaluateAnswer",
+  "generateQuiz",
+  "recommendNextTopic",
+]);
+
+/**
+ * interrupt() 抛出的 payload 形状(iOS 通过 SSE tool_pending 收到这份数据)。
+ * 单独 export 出来给 server.ts 的 /pending 接口复用类型。
+ */
+export type ToolApprovalRequest = {
+  tool_call_id: string;
+  tool_name: string;
+  args: Record<string, unknown>;
+};
+
+/**
+ * iOS 通过 POST /resume 提交的决策。
+ * approved=false 时,工具不执行,而是返回一条 "user denied" 的 ToolMessage 给模型。
+ * approved=true 且传了 edited_args 时,用编辑过的参数执行(给用户"先改再批"的能力)。
+ */
+export type ToolApprovalResponse = {
+  approved: boolean;
+  edited_args?: Record<string, unknown>;
+};
+
+function getToolDisplayName(toolName: string): string {
+  switch (toolName) {
+    case "searchKnowledge":
+      return "查询知识库";
+    case "generateQuiz":
+      return "生成练习题";
+    case "evaluateAnswer":
+      return "批改答题";
+    case "recommendNextTopic":
+      return "推荐学习方向";
+    default:
+      return toolName;
+  }
+}
 
 /**
  * ═══════════════════════════════════════════════════════════════════
@@ -206,6 +256,12 @@ export function createAgentNode(options: {
 export function createToolNode(options: {
   requestId: string;
   tools: ClientTool[];
+  /**
+   * 用来在调 interrupt() 之前推一个 tool_pending SSE 事件给 iOS。
+   * 这一步必须在 interrupt 之前同步发出,因为 interrupt 会立刻抛 GraphInterrupt,
+   * 之后 toolNode 函数就被中断,没机会再发事件。
+   */
+  onToolEvent?: (event: ChatStreamEvent) => void;
 }) {
   /**
    * 把 tools 数组做成 name → tool 的 Map,后面按 tool_call.name O(1) 查找。
@@ -269,15 +325,92 @@ export function createToolNode(options: {
       }
 
       /**
+       * # HITL: 如果是审核名单里的工具,先 interrupt() 等用户批准。
+       *
+       * interrupt() 的语义(LangGraph 1.x):
+       *   - 第一次执行到这里 → 抛 GraphInterrupt,图挂起,state 存进 checkpointer
+       *   - 后续用 Command(resume=...) 续跑 → interrupt() 同步返回 resume 值
+       *
+       * 关键: 同一个节点函数会被"重跑两次":
+       *   1. 第一次跑到 interrupt 抛错,前面的代码(包括 SSE 事件发送)已经执行
+       *   2. resume 后从节点头部重新执行,interrupt 这次直接返回 resume 值
+       *   所以下面的 tool_pending SSE 事件,在 resume 后会被发第二次——
+       *   iOS 端需要按 tool_call_id 去重,或者把"已审批"状态记下来。
+       *
+       * 不需要审核的工具直接走原路径,行为完全不变。
+       */
+      let toolCallArgs = toolCall.args as Record<string, unknown>;
+
+      if (TOOLS_REQUIRING_APPROVAL.has(toolCall.name)) {
+        const approvalRequest: ToolApprovalRequest = {
+          tool_call_id: toolCall.id || "",
+          tool_name: toolCall.name,
+          args: toolCallArgs,
+        };
+
+        // 在 interrupt 之前发 SSE 通知 iOS。
+        // 不要把这行包进 try/catch — interrupt 抛的 GraphInterrupt 必须冒出去。
+        options.onToolEvent?.({
+          type: "tool_pending",
+          tool_call_id: approvalRequest.tool_call_id,
+          tool_name: approvalRequest.tool_name,
+          display_name: getToolDisplayName(approvalRequest.tool_name),
+          args: approvalRequest.args,
+        });
+
+        logAgentInfo(options.requestId, "hitl", "tool_approval_requested", {
+          toolName: toolCall.name,
+          toolCallId: toolCall.id,
+        });
+
+        // 关键:interrupt() 抛错 → 图挂起 → 等 /resume 接口续跑
+        const decision = interrupt<ToolApprovalRequest, ToolApprovalResponse>(
+          approvalRequest
+        );
+
+        // 走到这里说明已经 resume,decision 是 iOS 提交的批准/拒绝决定
+        logAgentInfo(options.requestId, "hitl", "tool_approval_resolved", {
+          toolName: toolCall.name,
+          toolCallId: toolCall.id,
+          approved: decision.approved,
+          edited: Boolean(decision.edited_args),
+        });
+
+        if (!decision.approved) {
+          // 用户拒绝:不调用工具,直接给模型一条 "user denied" 的 ToolMessage,
+          // 让模型基于这个反馈改口(通常会道歉并尝试用其他方式回答)。
+          toolMessages.push(
+            new ToolMessage({
+              tool_call_id: toolCall.id || "",
+              name: toolCall.name,
+              content: JSON.stringify({
+                ok: false,
+                error: "User denied this tool call. Please answer without using this tool, or ask the user for clarification.",
+              }),
+            })
+          );
+          continue;
+        }
+
+        // 用户批准:如果传了编辑过的参数,用编辑版;否则用原参数
+        if (decision.edited_args) {
+          toolCallArgs = decision.edited_args;
+        }
+      }
+
+      /**
        * 调用 LangChain Tool。
        *
        * 注意我们把整个 toolCall 对象传给 tool.invoke(...),不只是 args。
        * 因为 LangChain Tool wrapper 内部要从 runtime.toolCallId 取 id
-       * 来对齐 tool_start / tool_done 事件——这一切都在
-       * agentTools.ts:52 行那段闭包里。
+       * 来对齐 tool_start / tool_done 事件——这一切都在 agentTools.ts 的
+       * tool(...) wrapper 闭包里。
+       *
+       * args 用 toolCallArgs(可能被 HITL 编辑过),而不是 toolCall.args。
        */
       const toolResult = await tool.invoke({
         ...toolCall,
+        args: toolCallArgs,
         type: "tool_call",
       });
 

@@ -58,6 +58,7 @@ import { agentRecursionLimit } from "../config/env";
 import type {
   ChatStreamEvent,
   NormalizedChatHistoryItem,
+  PendingToolApproval,
 } from "../shared/types";
 import { createLangChainAgentTools } from "./agentTools";
 import { AgentState } from "./agentGraphState";
@@ -97,6 +98,14 @@ export type LangGraphAgentRunResult = {
   rootRunId: string | undefined;
   /** 本次 Agent 调用消耗的 token 总量 */
   usage: TokenUsage;
+  /**
+   * HITL: 如果图被 interrupt() 挂起,这里携带挂起的 tool_call 信息。
+   * server.ts 收到后把它塞进 SSE done.pending,iOS 收到后展示审批卡片。
+   * undefined 表示图正常跑完,没有挂起。
+   *
+   * 注意:只有 threadId 路径才可能 pending(无 checkpointer 无法恢复)。
+   */
+  pending?: PendingToolApproval;
 };
 
 type RunLangGraphAgentStreamOptions = {
@@ -188,6 +197,8 @@ export async function runLangGraphAgentStream({
   const toolNode = createToolNode({
     requestId,
     tools,
+    // 把 onToolEvent 透传给 toolNode,让 HITL 在 interrupt() 之前能发 tool_pending SSE
+    onToolEvent,
   });
 
   /**
@@ -351,12 +362,55 @@ export async function runLangGraphAgentStream({
     totalTokens: promptTokens + completionTokens,
   };
 
+  /**
+   * # HITL: 检测图是否被 interrupt() 挂起
+   *
+   * streamEvents 自然结束有两种可能:
+   *   1. 图正常跑完(走到 END)
+   *   2. 图被 interrupt() 挂起在某个节点
+   *
+   * 区分方式:graph.getState(config) 返回的 snapshot 有一个 `tasks` 数组,
+   * 每个 task 可能带 interrupts(本次被挂起的 interrupt 调用)。只要有任何 task
+   * 还有未消化的 interrupts,就说明图在等用户决策。
+   *
+   * 只在 threadId 路径才查:没有 checkpointer 的话 getState 无法定位 state。
+   */
+  let pending: PendingToolApproval | undefined;
+  if (threadId) {
+    try {
+      const snapshot = await graph.getState({
+        configurable: { thread_id: threadId },
+      });
+      const pendingInterrupt = snapshot.tasks
+        ?.flatMap((task) => task.interrupts ?? [])
+        .find((it) => it && typeof it.value === "object");
+
+      if (pendingInterrupt) {
+        const approvalReq = pendingInterrupt.value as {
+          tool_call_id?: string;
+          tool_name?: string;
+          args?: Record<string, unknown>;
+        };
+        pending = {
+          tool_call_id: approvalReq.tool_call_id ?? "",
+          tool_name: approvalReq.tool_name ?? "",
+          display_name: getDisplayNameForTool(approvalReq.tool_name ?? ""),
+          args: approvalReq.args ?? {},
+        };
+      }
+    } catch (error) {
+      // getState 失败不应该让整次请求挂掉 — 业务降级为"图跑完了,没 pending"
+      logAgentError(requestId, "langgraph_agent", "get_state_failed", error);
+    }
+  }
+
   logAgentInfo(requestId, "langgraph_agent", "completed", {
     durationMs: getDurationMs(startedAt),
     toolCallCount,
     outputCharCount: outputText.length,
     rootRunId: rootRunId ?? "(missing)",
     usage,
+    pending: pending ? pending.tool_name : "(none)",
   });
 
   return {
@@ -364,7 +418,27 @@ export async function runLangGraphAgentStream({
     toolCallCount,
     rootRunId,
     usage,
+    pending,
   };
+}
+
+/**
+ * 工具显示名映射 — 和 agent/agentTools.ts 的同名函数保持一致。
+ * 这里独立一份是为了让 agentGraph.ts 不依赖 agent/ 目录。
+ */
+function getDisplayNameForTool(toolName: string): string {
+  switch (toolName) {
+    case "searchKnowledge":
+      return "查询知识库";
+    case "generateQuiz":
+      return "生成练习题";
+    case "evaluateAnswer":
+      return "批改答题";
+    case "recommendNextTopic":
+      return "推荐学习方向";
+    default:
+      return toolName;
+  }
 }
 
 // ─── 辅助函数 ─────────────────────────────────────────────────

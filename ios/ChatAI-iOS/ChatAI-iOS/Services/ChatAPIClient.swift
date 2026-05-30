@@ -34,6 +34,14 @@ enum ChatStreamUpdate: Equatable {
     case delta(String)
     case toolStart(AgentToolUpdate)
     case toolDone(AgentToolUpdate)
+    /// Phase 9 #3 — HITL: 后端把一个 LLM-as-tool 调用挂起,等用户审批。
+    ///
+    /// 后端发 `tool_pending` SSE 事件后,流会很快结束(图挂起在 toolNode),
+    /// VM 收到这个 update 应该:
+    ///   1. 把 pending 存到 @Published pendingApproval(让 UI 弹卡片)
+    ///   2. 不再追加 streamedAnswer(模型还没生成最终回答)
+    ///   3. 用户在卡片上点完按钮后,调 resumeThread() 续跑
+    case toolPending(PendingApproval)
     /// Phase 10.1 #4 — 后端 SSE done 事件,带回 LangSmith 根 run id。
     ///
     /// 故意做成"流的最后一个事件",而不是把 run_id 挂在某个回调外参数上——
@@ -43,7 +51,11 @@ enum ChatStreamUpdate: Equatable {
     /// runID 可选:LANGSMITH_TRACING 关掉时后端不会带这个字段(或带 null),
     /// VM 拿到 nil 时就跳过"把 runId 写到消息上"那一步——结果是 MessageBubbleView
     /// 自然不显示反馈按钮(它的判定就是 runId != nil)。
-    case done(runID: String?)
+    ///
+    /// Phase 9 #3 — done 事件可能携带 pending(图挂起时的最后通知)。
+    /// 这是"双保险":即使 tool_pending SSE 事件因为网络丢失/解析失败没收到,
+    /// done.pending 也能让 VM 知道当前在审批态。
+    case done(runID: String?, pending: PendingApproval?)
 }
 
 /// 一次 Agent 工具状态更新。
@@ -169,6 +181,47 @@ protocol ChatAPI {
     /// 失败会抛 ChatAPIError——ViewModel 应该把已乐观写入的 feedbackScore 还原回 nil,
     /// 并显示 errorMessage 提示用户重试。
     func submitFeedback(runID: String, score: Double) async throws
+
+    /// Phase 9 #3 — HITL 续跑挂起的 Agent。
+    ///
+    /// 对应后端 POST /api/threads/:id/resume。
+    /// 行为和 sendAgentStreamingMessage 一致(SSE 流式),只是入参不同:
+    ///   - approved=true,editedArgs=nil    → 用原参数执行工具
+    ///   - approved=true,editedArgs=[...]   → 用编辑过的参数执行工具
+    ///   - approved=false                   → 跳过工具,模型基于 "user denied" 改口
+    ///
+    /// 返回的流可能再次出现 tool_pending(模型批准后又想调另一个 LLM-as-tool)。
+    func resumeThread(
+        threadID: String,
+        approved: Bool,
+        editedArgs: [String: JSONValue]?
+    ) throws -> AsyncThrowingStream<ChatStreamUpdate, Error>
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 9 #7-#8 — Time-travel(时光机)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 列出某个 thread 的所有"用户可分叉时刻"。
+    ///
+    /// 对应后端 GET /api/threads/:id/checkpoints。
+    /// 返回的 checkpoints 按时间正序(最早的在前面),长度等于 thread 中
+    /// "AI 说完完整回答"的次数 —— 也就是 iOS 端可见 AI 消息的条数。
+    ///
+    /// 调用时机:ChatView 出现时 .task 里调一次,把结果缓存到 VM。
+    /// 后续用户长按 AI 消息时,直接用"第 N 条 AI 消息" → 第 N 个 checkpoint。
+    func listCheckpoints(threadID: String) async throws -> [Checkpoint]
+
+    /// 从某个 checkpoint 分叉出一个新 thread。
+    ///
+    /// 对应后端 POST /api/threads/:id/fork。
+    /// title 可选;不传后端会自动生成默认标题("分叉对话 · N 条消息")。
+    ///
+    /// 返回新建 thread 的 summary,iOS 拿到 id 后用户可以选择跳转过去。
+    func forkThread(
+        threadID: String,
+        checkpointID: String,
+        title: String?
+    ) async throws -> ThreadSummary
 }
 
 /// iOS 调用 Node.js 后端时可能遇到的错误。
@@ -585,6 +638,14 @@ final class ChatAPIClient: ChatAPI {
                                 continuation.yield(.toolDone(toolUpdate))
                             }
 
+                        case "tool_pending":
+                            // Phase 9 #3 — HITL: 工具调用挂起,等用户审批。
+                            // tool_pending 之后流会很快结束(done 事件随后到达),
+                            // VM 会把 pendingApproval 存起来弹卡片。
+                            if let pending = event.pendingApproval {
+                                continuation.yield(.toolPending(pending))
+                            }
+
                         case "done":
                             // done 表示后端已经读完模型流，本次回答结束。
                             //
@@ -595,7 +656,13 @@ final class ChatAPIClient: ChatAPI {
                             // event.runID 可能为 nil(后端没开 LangSmith 或拿不到根 run id),
                             // 那就传 nil,VM 会跳过赋值——MessageBubbleView 看到 runId == nil
                             // 就不显示反馈按钮,行为自然降级。
-                            continuation.yield(.done(runID: event.runID))
+                            //
+                            // Phase 9 #3 — done 也可能携带 pending(HITL 挂起态)。
+                            // event.pending 是后端在图被挂起时塞进 done 的双保险。
+                            continuation.yield(.done(
+                                runID: event.runID,
+                                pending: event.pending?.toPendingApproval()
+                            ))
                             continuation.finish()
                             return
 
@@ -702,6 +769,51 @@ final class ChatAPIClient: ChatAPI {
         _ = try await performJSONRequest(method: "DELETE", path: "api/threads/\(encodedID)", body: nil)
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 9 #7-#8 — Time-travel(时光机)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 列 checkpoints。GET /api/threads/:id/checkpoints
+    func listCheckpoints(threadID: String) async throws -> [Checkpoint] {
+        let encodedID =
+            threadID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? threadID
+        let data = try await performJSONRequest(
+            method: "GET",
+            path: "api/threads/\(encodedID)/checkpoints",
+            body: nil
+        )
+        let response = try JSONDecoder().decode(CheckpointsResponse.self, from: data)
+        return response.checkpoints
+    }
+
+    /// 从 checkpoint 分叉。POST /api/threads/:id/fork
+    ///
+    /// 请求体:{ checkpoint_id: ..., title?: ... }
+    /// 后端返回新创建 thread 的 ThreadSummary。
+    func forkThread(
+        threadID: String,
+        checkpointID: String,
+        title: String?
+    ) async throws -> ThreadSummary {
+        let encodedID =
+            threadID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? threadID
+
+        var bodyDict: [String: Any] = ["checkpoint_id": checkpointID]
+        if let title, !title.isEmpty {
+            bodyDict["title"] = title
+        }
+        let bodyData = try JSONSerialization.data(withJSONObject: bodyDict)
+
+        let data = try await performJSONRequest(
+            method: "POST",
+            path: "api/threads/\(encodedID)/fork",
+            body: bodyData
+        )
+
+        // ThreadSummary 有 ISO 8601 带毫秒的时间字段,用专用 decoder
+        return try ChatAPIClient.makeThreadDecoder().decode(ThreadSummary.self, from: data)
+    }
+
     /// Phase 10.1 #4 — 提交用户反馈。POST /api/feedback
     ///
     /// 请求体协议(和后端 FeedbackRequestBody 对齐):
@@ -728,6 +840,153 @@ final class ChatAPIClient: ChatAPI {
         let bodyData = try JSONSerialization.data(withJSONObject: bodyDict)
 
         _ = try await performJSONRequest(method: "POST", path: "api/feedback", body: bodyData)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 9 #3 — HITL Resume(续跑挂起的 Agent)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 续跑挂起的 Agent。POST /api/threads/:id/resume
+    ///
+    /// 实现要点:
+    ///   - URL 不同(挂在 /threads/:id/resume,thread id 在路径里)
+    ///   - body 是 { approved, edited_args? },没有 message / history / thread_id
+    ///   - 响应仍然是 SSE 流,所以底层调用一个**新的私有方法**
+    ///     sendStreamingResumeRequest,和 sendStreamingRequest 共享 SSE 解析代码
+    ///
+    /// 为什么不直接复用 sendStreamingRequest?
+    ///   sendStreamingRequest 的 body 是 ChatRequestBody(为聊天接口设计),
+    ///   字段是 message/system_prompt/history/thread_id,跟 resume 完全不重合。
+    ///   硬塞会让请求体结构和路由耦合,反而难懂。分两个方法各管各的更清晰。
+    func resumeThread(
+        threadID: String,
+        approved: Bool,
+        editedArgs: [String: JSONValue]?
+    ) throws -> AsyncThrowingStream<ChatStreamUpdate, Error> {
+        sendStreamingResumeRequest(
+            threadID: threadID,
+            approved: approved,
+            editedArgs: editedArgs
+        )
+    }
+
+    /// resumeThread 的底层 SSE 实现 —— 跟 sendStreamingRequest 的 SSE 解析逻辑
+    /// **完全一致**,只是 URL 和 body 不同。这里允许少量重复,因为抽公共部分
+    /// 反而要引入回调泛型让代码更难看。
+    private func sendStreamingResumeRequest(
+        threadID: String,
+        approved: Bool,
+        editedArgs: [String: JSONValue]?
+    ) -> AsyncThrowingStream<ChatStreamUpdate, Error> {
+        return AsyncThrowingStream { continuation in
+            let task = Task {
+                do {
+                    // URL path 编码:thread id 一般是 UUID,但万一带特殊字符也得安全
+                    let encodedID = threadID.addingPercentEncoding(
+                        withAllowedCharacters: .urlPathAllowed
+                    ) ?? threadID
+                    let url = baseURL.appending(path: "api/threads/\(encodedID)/resume")
+
+                    var request = URLRequest(url: url)
+                    request.httpMethod = "POST"
+                    request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+
+                    // 构造 body:approved 必填,edited_args 可选
+                    var bodyDict: [String: Any] = ["approved": approved]
+                    if let editedArgs {
+                        // 把 [String: JSONValue] 编码成普通 Dictionary,
+                        // 再用 JSONSerialization 套外层 — JSONValue 自己实现了 Codable,
+                        // 所以走两步:先 encode 成 Data,再 JSONSerialization 反解出 Any。
+                        let encoded = try JSONEncoder().encode(editedArgs)
+                        if let any = try JSONSerialization.jsonObject(with: encoded) as? [String: Any] {
+                            bodyDict["edited_args"] = any
+                        }
+                    }
+                    request.httpBody = try JSONSerialization.data(withJSONObject: bodyDict)
+
+                    let (bytes, response) = try await urlSession.bytes(for: request)
+
+                    guard let httpResponse = response as? HTTPURLResponse else {
+                        continuation.finish(throwing: ChatAPIError.invalidResponse)
+                        return
+                    }
+
+                    // 404 = 没 pending、503 = HITL 未启用 等等 — 走错误分支
+                    guard (200...299).contains(httpResponse.statusCode) else {
+                        var errorText = ""
+                        for try await line in bytes.lines {
+                            errorText += line
+                        }
+                        if let errorData = errorText.data(using: .utf8),
+                           let errorBody = try? JSONDecoder().decode(ChatErrorResponseBody.self, from: errorData) {
+                            continuation.finish(throwing: ChatAPIError.serverMessage(errorBody.error))
+                            return
+                        }
+                        continuation.finish(
+                            throwing: ChatAPIError.serverMessage("Resume 失败,HTTP 状态码:\(httpResponse.statusCode)")
+                        )
+                        return
+                    }
+
+                    // 复用同样的 SSE 解析(逐行 → data: 前缀 → JSON decode → 事件分发)
+                    let decoder = JSONDecoder()
+                    let dataPrefix = "data:"
+
+                    for try await line in bytes.lines {
+                        guard line.hasPrefix(dataPrefix) else {
+                            continue
+                        }
+                        let jsonText = String(line.dropFirst(dataPrefix.count))
+                            .trimmingCharacters(in: .whitespacesAndNewlines)
+                        guard let eventData = jsonText.data(using: .utf8) else {
+                            continue
+                        }
+                        let event = try decoder.decode(ChatStreamEvent.self, from: eventData)
+
+                        switch event.type {
+                        case "delta":
+                            if let delta = event.delta, !delta.isEmpty {
+                                continuation.yield(.delta(delta))
+                            }
+                        case "tool_start":
+                            if let toolUpdate = event.agentToolUpdate {
+                                continuation.yield(.toolStart(toolUpdate))
+                            }
+                        case "tool_done":
+                            if let toolUpdate = event.agentToolUpdate {
+                                continuation.yield(.toolDone(toolUpdate))
+                            }
+                        case "tool_pending":
+                            // 续跑后模型可能再调一个需要审批的工具,二次挂起
+                            if let pending = event.pendingApproval {
+                                continuation.yield(.toolPending(pending))
+                            }
+                        case "done":
+                            continuation.yield(.done(
+                                runID: event.runID,
+                                pending: event.pending?.toPendingApproval()
+                            ))
+                            continuation.finish()
+                            return
+                        case "error":
+                            let message = event.error ?? "Resume 失败,请稍后再试。"
+                            continuation.finish(throwing: ChatAPIError.serverMessage(message))
+                            return
+                        default:
+                            continue
+                        }
+                    }
+
+                    continuation.finish()
+                } catch {
+                    continuation.finish(throwing: error)
+                }
+            }
+
+            continuation.onTermination = { _ in
+                task.cancel()
+            }
+        }
     }
 
     /// 4 个对话管理接口共用的 HTTP 底层。
@@ -888,6 +1147,12 @@ private struct ChatStreamEvent: Decodable {
     /// Phase 10.1 #4 — done 事件的 LangSmith 根 run id。
     /// 其它事件类型(delta / tool_*)上不出现,所以是 Optional。
     let runID: String?
+    /// Phase 9 #3 — tool_pending 事件携带的工具参数。
+    /// 类型 [String: JSONValue] 适配任意 JSON object。
+    let args: [String: JSONValue]?
+    /// Phase 9 #3 — done 事件可能携带的 pending 描述。
+    /// 流式 SSE 已经先发了 tool_pending,这里再带一份是"双保险"。
+    let pending: PendingEventPayload?
 
     enum CodingKeys: String, CodingKey {
         case type
@@ -899,6 +1164,8 @@ private struct ChatStreamEvent: Decodable {
         case message
         case ok
         case runID = "run_id"
+        case args
+        case pending
     }
 
     /// 把 SSE 原始字段整理成 ViewModel 更好消费的工具状态。
@@ -916,6 +1183,49 @@ private struct ChatStreamEvent: Decodable {
             displayName: displayName,
             message: message,
             ok: ok
+        )
+    }
+
+    /// Phase 9 #3 — 把 tool_pending 事件整理成 PendingApproval。
+    /// tool_pending 事件本身的顶层字段就是 PendingApproval 的字段,直接组装。
+    var pendingApproval: PendingApproval? {
+        guard let toolCallID,
+              let toolName,
+              let displayName,
+              let args else {
+            return nil
+        }
+        return PendingApproval(
+            toolCallID: toolCallID,
+            toolName: toolName,
+            displayName: displayName,
+            args: args
+        )
+    }
+}
+
+/// done 事件里嵌套的 pending 对象 — 字段顺序和顶层 tool_pending 完全对齐。
+/// 单独建 struct 是因为它出现在 done 事件的 `pending` 字段下,
+/// 不能复用 ChatStreamEvent 自己。
+private struct PendingEventPayload: Decodable {
+    let toolCallID: String
+    let toolName: String
+    let displayName: String
+    let args: [String: JSONValue]
+
+    enum CodingKeys: String, CodingKey {
+        case toolCallID = "tool_call_id"
+        case toolName = "tool_name"
+        case displayName = "display_name"
+        case args
+    }
+
+    func toPendingApproval() -> PendingApproval {
+        PendingApproval(
+            toolCallID: toolCallID,
+            toolName: toolName,
+            displayName: displayName,
+            args: args
         )
     }
 }

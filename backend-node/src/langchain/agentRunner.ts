@@ -32,6 +32,8 @@ import {
   HumanMessage,
 } from "@langchain/core/messages";
 import type { TokenUsage } from "./agentGraph";
+import type { PendingToolApproval } from "../shared/types";
+import type { ToolApprovalResponse } from "./agentGraphNodes";
 import {
   createAgent,
   modelCallLimitMiddleware,
@@ -70,6 +72,12 @@ export type LangChainAgentRunResult = {
   rootRunId: string | undefined;
   /** 本次 Agent 调用消耗的 token 总量(与 agentGraph.ts 同名字段对齐) */
   usage: TokenUsage;
+  /**
+   * HITL 挂起信息(与 LangGraphAgentRunResult 接口对齐)。
+   * Phase 3 createAgent 路径**不接 checkpointer**,所以这里永远 undefined。
+   * 想用 HITL 必须走 USE_LANGGRAPH=true。
+   */
+  pending?: PendingToolApproval;
 };
 
 type RunLangChainAgentStreamOptions = {
@@ -83,6 +91,12 @@ type RunLangChainAgentStreamOptions = {
    * (不接 checkpointer,作为无持久化的快速回退路径)。
    */
   threadId?: string;
+  /**
+   * HITL 续跑参数(接口对齐字段)。
+   * Phase 3 createAgent **不支持 HITL** —— 收到非空值时直接抛错,
+   * 提示调用方切到 USE_LANGGRAPH=true。
+   */
+  resumePayload?: ToolApprovalResponse;
   onToolEvent?: (event: ChatStreamEvent) => void;
   onDelta?: (delta: string) => void;
   shouldStop?: () => boolean;
@@ -97,11 +111,21 @@ export async function runLangChainAgentStream({
   history,
   // _ 前缀表示"声明了但故意不用",消除 lint 警告
   threadId: _threadId,
+  resumePayload,
   onToolEvent,
   onDelta,
   shouldStop,
 }: RunLangChainAgentStreamOptions): Promise<LangChainAgentRunResult> {
   void _threadId;
+
+  // Phase 3 createAgent 没接 checkpointer,根本无法 resume 一个挂起的图。
+  // 收到 resumePayload 直接报错,避免上层误以为续跑成功了。
+  if (resumePayload) {
+    throw new Error(
+      "HITL resume is not supported on Phase 3 createAgent path. " +
+        "Set USE_LANGGRAPH=true to use the LangGraph StateGraph path."
+    );
+  }
   const startedAt = Date.now();
   let toolCallCount = 0;
   let outputText = "";

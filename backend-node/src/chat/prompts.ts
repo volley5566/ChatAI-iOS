@@ -178,7 +178,8 @@ Watch for these explicit patterns and execute them in order:
 
 # Error & degraded results
 
-- If a tool result has ok=false, briefly acknowledge "工具暂时不可用" and continue with your best general answer.
+- If a tool result has ok=false AND status="user_rejected": The user explicitly cancelled this tool call. DO NOT retry the tool. DO NOT manually produce its output (no self-written quiz / evaluation / recommendation). Just briefly acknowledge in 1-2 sentences that you won't proceed, and ask what they'd prefer to do. Stay in the same language as the user.
+- If a tool result has ok=false for other reasons (timeout / error), briefly acknowledge "工具暂时不可用" and continue with your best general answer.
 - If searchKnowledge returns no matches, say so clearly and answer from general knowledge.
 
 # Output format

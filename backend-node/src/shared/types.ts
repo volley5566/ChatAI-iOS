@@ -121,11 +121,14 @@ type ChatStreamEventMetadata = {
 /**
  * 所有 SSE 事件的联合类型。iOS 根据 type 字段做模式匹配:
  *
- *   delta       → 追加文本到 AI 气泡
- *   done        → 回答结束(附 run_id + token 用量)
- *   error       → 显示错误
- *   tool_start  → 显示"正在查询知识库..."
- *   tool_done   → 更新"已查询,找到 N 条"
+ *   delta         → 追加文本到 AI 气泡
+ *   done          → 回答结束(附 run_id + token 用量,可能带 pending 标记)
+ *   error         → 显示错误
+ *   tool_start    → 显示"正在查询知识库..."
+ *   tool_done     → 更新"已查询,找到 N 条"
+ *   tool_pending  → HITL: 工具调用挂起,等用户在 iOS 卡片上批准/拒绝
+ *                   收到这个事件后流会很快结束(done 带 pending=true),
+ *                   iOS 应该展示审批卡片,然后调 /api/threads/:id/resume 续跑
  */
 export type ChatStreamEvent = ChatStreamEventMetadata &
   (
@@ -148,6 +151,11 @@ export type ChatStreamEvent = ChatStreamEventMetadata &
         prompt_tokens?: number;
         completion_tokens?: number;
         total_tokens?: number;
+        /**
+         * HITL: 图被 interrupt() 挂起在某个 tool_call 上,而不是正常跑完。
+         * iOS 收到这个标记后应展示审批卡片,等用户决策后调 /resume。
+         */
+        pending?: PendingToolApproval;
       }
     | { type: "error"; error: string }
     | {
@@ -165,4 +173,22 @@ export type ChatStreamEvent = ChatStreamEventMetadata &
         ok: boolean;
         message: string;
       }
+    | {
+        type: "tool_pending";
+        tool_call_id: string;
+        tool_name: string;
+        display_name: string;
+        /** 模型生成的参数,iOS 可以让用户编辑后再 resume */
+        args: Record<string, unknown>;
+      }
   );
+
+/**
+ * HITL 审批挂起描述(SSE done 和 /api/threads/:id/pending 共用)。
+ */
+export type PendingToolApproval = {
+  tool_call_id: string;
+  tool_name: string;
+  display_name: string;
+  args: Record<string, unknown>;
+};

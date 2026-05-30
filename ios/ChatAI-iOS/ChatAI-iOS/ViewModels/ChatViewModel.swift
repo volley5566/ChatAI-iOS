@@ -79,6 +79,67 @@ final class ChatViewModel: ObservableObject {
     /// @Published：这个变量一变化，就通知 SwiftUI 页面刷新。
     @Published var errorMessage: String?
 
+    /// Phase 9 #3 — HITL: 当前挂起的工具批准请求。
+    ///
+    /// 生命周期:
+    ///   - 收到 .toolPending 或 .done(pending: 非 nil) → 设上
+    ///   - 用户点[批准]/[拒绝] → resumeApproval(...) 把它清空,开始续跑
+    ///   - 续跑流到 done(pending: 非 nil) → 再次设上(模型连环挂起的情况)
+    ///
+    /// ChatView 用 .sheet(item:) 监听这个值:非 nil 时弹卡片,nil 时关闭。
+    /// Identifiable 让 sheet(item:) 能正确识别"新的 pending"——
+    /// 同一 thread 连续挂起两次时,sheet 会被重新弹出。
+    @Published var pendingApproval: PendingApproval?
+
+    /// Phase 9 #3 — 挂起期间记住对应的 assistant 消息 id。
+    ///
+    /// resume 续跑后,新的 SSE delta 应该追加到**同一条**气泡上,
+    /// 而不是新开一条。这个 id 在 sendMessage() 第一次挂起时记下,
+    /// resumeApproval() 时复用,直到 done(pending: nil) 才清掉。
+    private var suspendedMessageID: UUID?
+
+    /// Phase 9 #3 — 挂起期间累积的部分回答文本。
+    /// resume 后从这个值继续 += delta,避免 UI 上文本被截断。
+    private var suspendedStreamedAnswer: String = ""
+
+    /// Phase 9 #3 — 刚 resume 过的 tool_call_id,用来过滤"回声 tool_pending"。
+    ///
+    /// 为什么需要?
+    /// LangGraph 的 interrupt() 语义是:resume 时**节点函数从头重跑**,
+    /// interrupt 之前的代码(包括后端 onToolEvent 发出的 tool_pending SSE)
+    /// 会再次执行,iOS 端会收到同一个 tool_call_id 的第二条 tool_pending。
+    ///
+    /// 如果不去重,sheet 会被重新弹出 → 用户再点批准 → /resume 又发一次 →
+    /// 工具被执行两次。
+    ///
+    /// 解决:resolvePending 进入时记下当前的 tool_call_id,
+    /// 在 resume 流里收到的 tool_pending 如果 id 相同,就直接忽略。
+    /// resume 流结束(done with pending: nil)时清空,避免污染后续会话。
+    private var justResumedToolCallID: String?
+
+    // ─── Phase 9 #8 — Time-travel(时光机)─────────────────────
+
+    /// 当前 thread 的 "可分叉时刻"列表,按时间正序。
+    ///
+    /// 生命周期:
+    ///   - ChatView 进入时 .task 里调 loadCheckpoints() 拉一次
+    ///   - 每次 sendMessage() / resolvePending() 完成后再拉一次刷新
+    ///   - 用户长按某条 AI 消息时,根据"这是第几条 AI 消息"找对应 checkpoint
+    ///
+    /// 为什么不用 @Published?
+    /// 现在 UI 不需要直接观察这个数组(没有"checkpoints 列表"页面),
+    /// 只在长按动作里用一下,private 即可。将来如果加"时光机面板"再升级。
+    private var forkableCheckpoints: [Checkpoint] = []
+
+    /// Time-travel 操作结果。ChatView 监听这个值在 toast / alert 里告诉用户。
+    /// nil = 没动作,String = 成功提示 / 错误提示。
+    @Published var forkResultMessage: String?
+
+    /// fork 成功后新建的 thread 的 id,iOS 端可以拿来跳转或显示在 toast。
+    /// 目前 UI 选择不直接跳转(让用户 dismiss 回列表自己点),
+    /// 字段保留是为了将来要做"分叉后自动跳过去"的扩展。
+    @Published var forkedNewThreadID: String?
+
     // 这个是网络层接口：
     //
     // View
@@ -225,6 +286,11 @@ final class ChatViewModel: ObservableObject {
         // defer：不管这个函数后面怎么结束，离开函数前都执行这段代码。
         defer {
             isSending = false
+            // Phase 9 #8 — 发完消息刷新一下 checkpoints 列表,
+            // 这样用户立刻长按新出的 AI 消息也能分叉。
+            // Task 包一下是因为 defer 块不支持 async,
+            // 起一个后台任务静默拉就行,不卡 UI。
+            Task { await loadCheckpoints() }
         }
 
         // 两个临时变量
@@ -326,7 +392,16 @@ final class ChatViewModel: ObservableObject {
                         )
                     }
 
-                case .done(let runID):
+                case .toolPending(let pending):
+                    // Phase 9 #3 — HITL: 工具调用挂起,等用户审批。
+                    // 1. 记下当前气泡 id 和已累积文本,resume 后续接
+                    // 2. 把 pending 暴露给 UI,触发 sheet 弹出
+                    // 后端会紧接着发 done 事件(pending 也会再带一份双保险)。
+                    suspendedMessageID = assistantMessageID
+                    suspendedStreamedAnswer = streamedAnswer
+                    pendingApproval = pending
+
+                case .done(let runID, let pending):
                     // Phase 10.1 #4 — 把 LangSmith 根 run id 写到这条 AI 消息上。
                     //
                     // runID 可能为 nil(后端没启用 LangSmith / 没拿到根 run id)——
@@ -335,13 +410,28 @@ final class ChatViewModel: ObservableObject {
                     if let runID, let assistantMessageID {
                         updateMessageRunId(id: assistantMessageID, runId: runID)
                     }
+
+                    // Phase 9 #3 — done.pending 是双保险:如果 tool_pending SSE
+                    // 由于网络抖动丢了,这里也能让 UI 知道挂起。
+                    // 已经设过就不重复设(避免 sheet 被同一个 id 重弹)。
+                    if let pending, pendingApproval?.toolCallID != pending.toolCallID {
+                        suspendedMessageID = assistantMessageID
+                        suspendedStreamedAnswer = streamedAnswer
+                        pendingApproval = pending
+                    }
                 }
             }
 
             // 如果后端正常结束，但没有任何文本片段，
             // 这通常表示模型返回异常或上游没有输出内容。
             // 这里复用已有 emptyAnswer 错误，给用户一个明确提示。
-            if streamedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            //
+            // Phase 9 #3 — HITL 挂起场景例外:模型可能直接 tool_call 不发任何 delta,
+            // 然后流就因为 interrupt 自然结束。pendingApproval 非 nil 说明
+            // 我们在等用户审批,**不是**模型异常,跳过这个检查。
+            if pendingApproval == nil
+                && streamedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
                 throw ChatAPIError.emptyAnswer
             }
         } catch {
@@ -351,12 +441,181 @@ final class ChatViewModel: ObservableObject {
             //
             // 如果已经收到部分内容，则保留 partial answer，
             // 同时显示错误提示，方便用户知道回答中途断了。
-            if streamedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            //
+            // Phase 9 #3 — 挂起态下也保留空气泡:resume 续跑后会往里填内容,
+            // 如果这里移掉了,用户审批完会看到一条"凭空冒出来的"新气泡。
+            if pendingApproval == nil
+                && streamedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                let assistantMessageID {
                 messages.removeAll { $0.id == assistantMessageID }
             }
 
             // 出错时不崩溃，而是把错误显示在页面上。
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 9 #3 — HITL Approve / Reject
+    // ─────────────────────────────────────────────────────────────────────
+    //
+    // # 完整时序(用户在卡片上点完按钮之后)
+    //
+    //   t0  用户点[批准]或[拒绝]
+    //        ↓
+    //   t1  ChatView 闭包: Task { await viewModel.approvePending() }
+    //        ↓                              (或 rejectPending)
+    //   t2  approvePending → resolvePending(approved: true, editedArgs: nil)
+    //        ↓
+    //   t3  ★ pendingApproval = nil
+    //         → SwiftUI .sheet(item:) 检测到 binding 变 nil,sheet 关闭
+    //        ↓
+    //   t4  发 POST /api/threads/:id/resume → 后端用 Command(resume) 续跑图
+    //        ↓
+    //   t5  for try await update in stream { ... }
+    //         ├ .delta       → append 到原气泡(suspendedMessageID)
+    //         ├ .toolStart/Done → 展示新一轮工具进度
+    //         ├ .toolPending → 去重判断,可能弹新 sheet(模型连环挂起)
+    //         └ .done        → 写 runId,清挂起状态
+    //
+    // # 为什么把 pendingApproval 清空放在 resolvePending 第一行
+    //
+    // 卡片关闭由 SwiftUI 的 `.sheet(item: $pendingApproval)` 驱动:
+    // binding 变 nil → sheet 自动 dismiss。
+    //
+    // 我们 **不在** ToolApprovalCard 里直接调 dismiss(),因为:
+    //   - dismiss() 是 SwiftUI 的环境 action,运行时机不确定
+    //   - 如果 dismiss 比 Task 里的 resolvePending 先跑,binding 已 nil,
+    //     guard 失败 → resume 永远不发(这就是历史上踩过的 bug)
+    //
+    // 让 VM 当 pendingApproval 的唯一控制者,行为可预测。
+
+    /// 用户在审批卡片上点[批准]。
+    /// editedArgs == nil 表示用原参数;非 nil 表示用编辑过的参数。
+    /// (当前 UI 还不支持编辑,但 API 留好了口子。)
+    func approvePending(editedArgs: [String: JSONValue]? = nil) async {
+        await resolvePending(approved: true, editedArgs: editedArgs)
+    }
+
+    /// 用户在审批卡片上点[拒绝]。
+    ///
+    /// 后端收到 approved=false 后,会在 toolNode 里塞一条
+    /// `{ ok: false, status: "user_rejected" }` 的 ToolMessage 给模型,
+    /// 配合 agentOutputGuide 里的指令,模型会简短道歉并问"想干啥",
+    /// **不会再尝试调同一个工具**,也**不会自己手写答案**。
+    func rejectPending() async {
+        await resolvePending(approved: false, editedArgs: nil)
+    }
+
+    /// 共用的 resume 实现 —— 批准 / 拒绝路径只差 approved 一个布尔值。
+    ///
+    /// 关键步骤(按顺序):
+    ///   1. 校验有挂起态 + 有 thread id(防御性)
+    ///   2. 记下 justResumedToolCallID(用于回声去重,见上面字段注释)
+    ///   3. **立刻清空 pendingApproval** → sheet 自动关闭
+    ///   4. 发 /resume 拿到新 SSE 流
+    ///   5. 在循环里复用 sendMessage 的逻辑(同样的 update case 分发)
+    ///   6. 流里收到 toolPending 时按 toolCallID 去重
+    ///   7. 流到 done(pending: nil) 时清挂起痕迹
+    private func resolvePending(
+        approved: Bool,
+        editedArgs: [String: JSONValue]?
+    ) async {
+        // 防御:没有挂起态就不该走到这里(UI 已经把卡片关掉了)
+        guard let currentPending = pendingApproval,
+              let threadID = currentThreadID else {
+            return
+        }
+
+        // ★ 关键 1: 记下"刚批准的 tool_call_id"
+        // resume 流里再收到同 id 的 tool_pending 是后端 toolNode 重跑的回声,
+        // 要忽略;否则 sheet 会重弹,用户再点一次批准 → /resume 又发一次 →
+        // 工具被执行两次。这是历史上踩过的 bug,这一行就是它的疫苗。
+        justResumedToolCallID = currentPending.toolCallID
+
+        // ★ 关键 2: 立刻把 pendingApproval 清空,卡片消失,UI 进入"AI 正在回复"态
+        // (见上面"为什么把 pendingApproval 清空放在 resolvePending 第一行"那段)
+        pendingApproval = nil
+        errorMessage = nil
+        isSending = true
+
+        defer {
+            isSending = false
+            // Phase 9 #8 — resume 完一样刷新 checkpoints(新 AI 答案产生了新 checkpoint)
+            Task { await loadCheckpoints() }
+        }
+
+        // 复用挂起前已经累积的文本 + 气泡 id
+        // 这样 resume 后的新 delta 会接到**同一个气泡**上,
+        // 视觉上是"思考被中断审批了一下,继续回答",而不是两条消息。
+        var streamedAnswer = suspendedStreamedAnswer
+        let assistantMessageID = suspendedMessageID
+
+        do {
+            let stream = try chatAPI.resumeThread(
+                threadID: threadID,
+                approved: approved,
+                editedArgs: editedArgs
+            )
+
+            for try await update in stream {
+                switch update {
+                case .delta(let delta):
+                    streamedAnswer += delta
+                    if let assistantMessageID {
+                        updateMessageContent(id: assistantMessageID, content: streamedAnswer)
+                    }
+
+                case .toolStart(let toolUpdate):
+                    if let assistantMessageID {
+                        updateAgentToolStep(
+                            messageID: assistantMessageID,
+                            update: toolUpdate,
+                            status: .running
+                        )
+                    }
+
+                case .toolDone(let toolUpdate):
+                    if let assistantMessageID {
+                        updateAgentToolStep(
+                            messageID: assistantMessageID,
+                            update: toolUpdate,
+                            status: toolUpdate.ok == false ? .failed : .completed
+                        )
+                    }
+
+                case .toolPending(let pending):
+                    // 关键去重:resume 时后端 toolNode 会从头重跑,
+                    // interrupt 之前的代码(包括 onToolEvent)会再次执行,
+                    // iOS 会收到同一个 tool_call_id 的第二条 tool_pending。
+                    // 这是回声,不是真正的新挂起,直接忽略。
+                    if pending.toolCallID == justResumedToolCallID {
+                        break
+                    }
+                    // 真正的新挂起:模型批准了 A 工具,又决定调 B 工具(需审批)
+                    suspendedStreamedAnswer = streamedAnswer
+                    // suspendedMessageID 保持不变(还是同一个气泡)
+                    pendingApproval = pending
+
+                case .done(let runID, let pending):
+                    if let runID, let assistantMessageID {
+                        updateMessageRunId(id: assistantMessageID, runId: runID)
+                    }
+                    if let pending,
+                       pending.toolCallID != justResumedToolCallID,
+                       pendingApproval?.toolCallID != pending.toolCallID {
+                        // 真正的新挂起(同样要排除回声)
+                        suspendedStreamedAnswer = streamedAnswer
+                        pendingApproval = pending
+                    } else if pending == nil {
+                        // 真正结束了,清掉挂起痕迹和回声去重 id
+                        suspendedMessageID = nil
+                        suspendedStreamedAnswer = ""
+                        justResumedToolCallID = nil
+                    }
+                }
+            }
+        } catch {
             errorMessage = error.localizedDescription
         }
     }
@@ -407,6 +666,108 @@ final class ChatViewModel: ObservableObject {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 9 #8 — Time-travel(时光机)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 从后端拉一次 checkpoints 列表,缓存到 forkableCheckpoints。
+    ///
+    /// 时机:
+    ///   - ChatView 进入时(只有当 threadID 非 nil,新对话不需要)
+    ///   - 每次发完消息后(让"可分叉点"和最新消息同步)
+    ///
+    /// 失败处理:静默吞掉错误,只在 console 打一行。
+    /// Time-travel 是辅助功能,网络挂了不该让用户看到红色 banner —— 至多
+    /// 长按分叉时发现"找不到对应 checkpoint",到那时再提示。
+    func loadCheckpoints() async {
+        guard let threadID = currentThreadID else {
+            forkableCheckpoints = []
+            return
+        }
+
+        do {
+            let result = try await chatAPI.listCheckpoints(threadID: threadID)
+            forkableCheckpoints = result
+        } catch {
+            // Time-travel 是 nice-to-have,失败不影响主流程,只打日志
+            print("[Time-travel] loadCheckpoints failed: \(error.localizedDescription)")
+            forkableCheckpoints = []
+        }
+    }
+
+    /// 用户长按一条 AI 消息点了"分叉"。
+    ///
+    /// # 怎么找到对应的 checkpoint?
+    ///
+    /// iOS 端 messages 数组是顺序的,后端 forkableCheckpoints 也是按时间正序。
+    /// 两边都过滤掉了 ToolMessage / pending 工具中间态,
+    /// 所以"第 N 条 visible AI 消息" ↔ "第 N 个 checkpoint" 是 1-to-1 对应。
+    ///
+    /// 这里计算"被长按的 AI 消息是第几条 AI 消息"(0-indexed),
+    /// 拿那个 index 去 forkableCheckpoints 里找。
+    ///
+    /// # 防御性处理
+    ///
+    /// 极端情况下后端 checkpoint 数 < iOS 看到的 AI 消息数(网络延迟、
+    /// fork 路径上有过期数据等),会找不到对应 checkpoint。这种情况:
+    ///   - 在 forkResultMessage 里给一个提示
+    ///   - 调用方(ChatView)用 alert 展示
+    func forkFromMessage(messageID: UUID) async {
+        guard currentThreadID != nil else {
+            forkResultMessage = "当前对话还没保存,无法分叉。"
+            return
+        }
+        guard let threadID = currentThreadID else { return }
+
+        // 在 messages 数组里数:被长按的消息是第几条 AI 消息?
+        var aiMessageIndex = -1
+        var foundIndex = -1
+        for message in messages {
+            if message.role == .assistant {
+                aiMessageIndex += 1
+                if message.id == messageID {
+                    foundIndex = aiMessageIndex
+                    break
+                }
+            }
+        }
+
+        guard foundIndex >= 0 else {
+            forkResultMessage = "找不到这条 AI 消息,无法分叉。"
+            return
+        }
+
+        // 找到对应 checkpoint(可能数据还没刷新)。
+        // 第一次找不到就重拉一次再试,还找不到就提示用户稍后重试。
+        if foundIndex >= forkableCheckpoints.count {
+            await loadCheckpoints()
+        }
+        guard foundIndex < forkableCheckpoints.count else {
+            forkResultMessage = "可分叉时刻数据未同步,稍后再试。"
+            return
+        }
+
+        let checkpoint = forkableCheckpoints[foundIndex]
+
+        do {
+            let newThread = try await chatAPI.forkThread(
+                threadID: threadID,
+                checkpointID: checkpoint.checkpointID,
+                title: nil  // 让后端自动生成"分叉对话 · N 条消息"
+            )
+            forkedNewThreadID = newThread.id
+            forkResultMessage = "已分叉为新对话「\(newThread.title ?? newThread.id)」"
+        } catch {
+            forkResultMessage = "分叉失败:\(error.localizedDescription)"
+        }
+    }
+
+    /// 清空 fork 操作的提示和结果,通常在用户关掉 alert 后调用。
+    func clearForkResult() {
+        forkResultMessage = nil
+        forkedNewThreadID = nil
     }
 
     /// 清空聊天记录，保留一条欢迎语。

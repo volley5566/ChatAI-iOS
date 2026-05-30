@@ -82,7 +82,51 @@ struct ChatView: View {
             // 新对话(threadID == nil)init 时已经放好欢迎语,啥也不做。
             if let threadID {
                 await viewModel.loadThread(threadID: threadID)
+                // Phase 9 #8 — 历史加载完后顺便拉一次 checkpoints,
+                // 这样用户进对话立刻长按消息分叉也能找到 checkpoint。
+                await viewModel.loadCheckpoints()
             }
+        }
+        // Phase 9 #3 — HITL 审批卡片。
+        //
+        // sheet(item:) 监听 pendingApproval:
+        //   - 非 nil → 自动弹卡片
+        //   - 用户点[批准]/[拒绝] → dismiss → VM.approvePending/rejectPending
+        //   - resolvePending 内部把 pendingApproval 清回 nil → sheet 自动关闭
+        //
+        // 用 `item:` 不用 `isPresented:` 是因为我们需要把 pending 数据传进去,
+        // 而 isPresented 只能传布尔。
+        .sheet(item: $viewModel.pendingApproval) { pending in
+            ToolApprovalCard(
+                pending: pending,
+                onApprove: {
+                    Task { await viewModel.approvePending() }
+                },
+                onReject: {
+                    Task { await viewModel.rejectPending() }
+                }
+            )
+        }
+        // Phase 9 #8 — Time-travel fork 结果提示。
+        //
+        // 用 alert(isPresented:) 监听 forkResultMessage 是不是非 nil。
+        // 用户点[好的] → 调 clearForkResult 把消息清掉 → alert 自动消失。
+        //
+        // 不在这里做"自动跳转到新 thread":让用户自己回列表看,体验更可控。
+        // 实测中"长按 → 看到提示 → dismiss 回列表"比"长按 → 突然跳走"心智负担小。
+        .alert(
+            "Time-travel",
+            isPresented: Binding(
+                get: { viewModel.forkResultMessage != nil },
+                set: { newValue in
+                    if !newValue { viewModel.clearForkResult() }
+                }
+            ),
+            presenting: viewModel.forkResultMessage
+        ) { _ in
+            Button("好的") { viewModel.clearForkResult() }
+        } message: { message in
+            Text(message)
         }
     }
 
@@ -123,6 +167,13 @@ struct ChatView: View {
                                         score: score
                                     )
                                 }
+                            },
+                            // Phase 9 #8 — 用户长按 AI 消息选了"从这里分叉"。
+                            // VM 内部按"这是第几条 AI 消息" → 找对应 checkpoint → 调 /fork。
+                            onForkRequested: {
+                                Task {
+                                    await viewModel.forkFromMessage(messageID: message.id)
+                                }
                             }
                         )
                         .id(message.id)
@@ -149,6 +200,10 @@ struct ChatView: View {
     }
 
     /// 顶部错误条。
+    ///
+    /// 点击关闭:errorMessage 默认只在下次发消息时才清空,
+    /// 期间一直挂着会让 UI 看起来有"过期错误"。点一下就关。
+    /// 关闭按钮单独放右边,文案区也可点(扩大热区,符合 iOS HIG)。
     private func errorBanner(_ message: String) -> some View {
         HStack(spacing: 8) {
             Image(systemName: "exclamationmark.triangle.fill")
@@ -158,10 +213,22 @@ struct ChatView: View {
                 .font(.footnote)
                 .foregroundStyle(.primary)
                 .frame(maxWidth: .infinity, alignment: .leading)
+
+            // 关闭按钮:点哪都行(整个 HStack 也加了 onTapGesture)
+            Image(systemName: "xmark.circle.fill")
+                .foregroundStyle(.secondary)
+                .imageScale(.medium)
         }
         .padding(.horizontal)
         .padding(.vertical, 8)
         .background(Color.red.opacity(0.12))
+        .contentShape(Rectangle())  // 让整个 banner 区域响应点击,不只是图标
+        .onTapGesture {
+            viewModel.errorMessage = nil
+        }
+        // 短动画让消失不那么突兀
+        .transition(.opacity.combined(with: .move(edge: .top)))
+        .animation(.easeOut(duration: 0.2), value: viewModel.errorMessage)
     }
 
     // ─────────────────────────────────────────────────────────────────────

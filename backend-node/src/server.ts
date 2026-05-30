@@ -38,6 +38,13 @@ import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { runLangChainAgentStream } from "./agent/agentRunner";
 import {
+  forkThreadFromCheckpoint,
+  getPendingApprovalForThread,
+  listCheckpointsForThread,
+} from "./langchain/agentGraph";
+import { randomUUID } from "crypto";
+import type { ToolApprovalResponse } from "./langchain/agentGraphNodes";
+import {
   createAgentRequestId,
   getDurationMs,
   logAgentError,
@@ -45,7 +52,7 @@ import {
 } from "./agent/agentObservability";
 import { logChatContext, prepareChatCompletion } from "./chat/chatCompletion";
 import { sanitizeChatHistory } from "./chat/chatHistory";
-import { logLangSmithStatus, model, port } from "./config/env";
+import { logLangSmithStatus, model, port, useLangGraph } from "./config/env";
 import { writeSseEvent } from "./http/sse";
 import { parseStructuredAnswer } from "./chat/structuredAnswer";
 import {
@@ -446,6 +453,8 @@ app.post(
         prompt_tokens: agentRun.usage.promptTokens,
         completion_tokens: agentRun.usage.completionTokens,
         total_tokens: agentRun.usage.totalTokens,
+        // HITL: 图被挂起在某个 tool_call 上 → 通知 iOS 展示审批卡片
+        pending: agentRun.pending,
       });
 
       responseCompleted = true;
@@ -574,6 +583,386 @@ app.delete("/api/threads/:id", async (req: Request, res: Response) => {
     res.status(500).json({ error: "Failed to delete thread." });
   }
 });
+
+// ═══════════════════════════════════════════════════════════════════
+// HITL — 人工审核接口
+// ═══════════════════════════════════════════════════════════════════
+//
+// 这两个接口配合 /api/agent/stream 的 SSE done.pending 一起工作:
+//
+//   1. iOS 发 /api/agent/stream → 模型决定调 evaluateAnswer
+//   2. toolNode 在 interrupt() 处挂起 → done.pending 通知 iOS
+//   3. iOS 重连 / 切回后用 GET /pending 查"还有没有等审批的"
+//   4. 用户在卡片上点[批准]/[拒绝] → POST /resume 续跑(SSE 流式响应)
+//
+// 注意:HITL 只在 USE_LANGGRAPH=true 路径生效。Phase 3 createAgent
+// 没接 checkpointer 无法挂起,这两个接口会返回 503。
+
+/**
+ * GET /api/threads/:id/pending
+ *
+ * 查询某 thread 是否有挂起的工具批准请求。
+ *
+ * 返回:
+ *   200 + { pending: PendingToolApproval | null }
+ *   400 thread_id 缺失
+ *   503 USE_LANGGRAPH=false 时不可用
+ */
+app.get("/api/threads/:id/pending", async (req: Request, res: Response) => {
+  if (!useLangGraph) {
+    res.status(503).json({
+      error: "HITL requires USE_LANGGRAPH=true. Phase 3 createAgent does not persist state.",
+    });
+    return;
+  }
+
+  const rawId = req.params.id;
+  const threadId = typeof rawId === "string" ? rawId.trim() : "";
+  if (!threadId) {
+    res.status(400).json({ error: "Thread id is required." });
+    return;
+  }
+
+  try {
+    const pending = await getPendingApprovalForThread(threadId);
+    res.status(200).json({ pending });
+  } catch (error) {
+    console.error(`[HITL] get pending failed for ${threadId}:`, error);
+    res.status(500).json({ error: "Failed to query pending approval." });
+  }
+});
+
+/**
+ * POST /api/threads/:id/resume
+ *
+ * 续跑挂起的图。SSE 流式响应,语义和 /api/agent/stream 一致
+ * (因为图续跑后还会继续吐 delta / tool 事件,可能再次 pending)。
+ *
+ * body: { approved: boolean, edited_args?: object }
+ *   approved=true  → 用 args(或 edited_args)执行工具
+ *   approved=false → 跳过工具,塞一条 "user denied" ToolMessage 给模型,让它改口
+ *
+ * 错误:
+ *   400  thread_id 缺失 / body 格式错
+ *   503  USE_LANGGRAPH=false
+ *   404  该 thread 当前没挂起的工具(已经被 resume 过 / 从未挂起)
+ */
+app.post(
+  "/api/threads/:id/resume",
+  async (req: Request, res: Response<ErrorResponseBody>) => {
+    const requestId = createAgentRequestId();
+    const requestStartedAt = Date.now();
+    let clientClosed = false;
+    let responseCompleted = false;
+    let activePhase = "request_validation";
+
+    const writeAgentSseEvent = (event: ChatStreamEvent) => {
+      writeSseEvent(res, { ...event, request_id: requestId });
+    };
+
+    res.setHeader("X-Request-ID", requestId);
+    res.on("close", () => {
+      clientClosed = true;
+      if (!responseCompleted) {
+        logAgentInfo(requestId, "http", "client_closed", {
+          durationMs: getDurationMs(requestStartedAt),
+          activePhase,
+        });
+      }
+    });
+
+    try {
+      if (!useLangGraph) {
+        res.status(503).json({
+          error: "HITL requires USE_LANGGRAPH=true.",
+        });
+        responseCompleted = true;
+        return;
+      }
+
+      const rawId = req.params.id;
+      const threadId = typeof rawId === "string" ? rawId.trim() : "";
+      if (!threadId) {
+        res.status(400).json({ error: "Thread id is required." });
+        responseCompleted = true;
+        return;
+      }
+
+      // 校验 body
+      const body = (req.body ?? {}) as Partial<ToolApprovalResponse>;
+      if (typeof body.approved !== "boolean") {
+        res.status(400).json({ error: "body.approved must be boolean." });
+        responseCompleted = true;
+        return;
+      }
+
+      const decision: ToolApprovalResponse = {
+        approved: body.approved,
+        edited_args:
+          body.edited_args && typeof body.edited_args === "object"
+            ? (body.edited_args as Record<string, unknown>)
+            : undefined,
+      };
+
+      // 防御性检查: 没挂起就 resume 是 no-op,提前告诉调用方避免误用
+      const pending = await getPendingApprovalForThread(threadId);
+      if (!pending) {
+        res.status(404).json({
+          error: "No pending tool approval for this thread.",
+        });
+        responseCompleted = true;
+        return;
+      }
+
+      logAgentInfo(requestId, "hitl_resume", "received", {
+        threadId,
+        toolName: pending.tool_name,
+        approved: decision.approved,
+        edited: Boolean(decision.edited_args),
+      });
+
+      // 续跑过程中可能再次刷新 thread updatedAt
+      await touchThread(threadId);
+
+      // ── 建立 SSE ─────────────────────────────────────────────
+      res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
+      res.setHeader("Cache-Control", "no-cache, no-transform");
+      res.setHeader("Connection", "keep-alive");
+      res.flushHeaders();
+
+      activePhase = "langgraph_agent_resume";
+      const agentStartedAt = Date.now();
+      let deltaCount = 0;
+      let outputCharCount = 0;
+
+      // 调灰度入口续跑(message 字段在续跑时被忽略,但接口要求传)
+      const agentRun = await runLangChainAgentStream({
+        requestId,
+        message: "",
+        systemPrompt: undefined,
+        history: [],
+        threadId,
+        resumePayload: decision,
+        onToolEvent: (event) => {
+          if (!clientClosed) {
+            writeAgentSseEvent({ ...event, phase: "tool_execution" });
+          }
+        },
+        onDelta: (delta) => {
+          if (clientClosed) return;
+          deltaCount += 1;
+          outputCharCount += delta.length;
+          writeAgentSseEvent({ type: "delta", delta, phase: "final_stream" });
+        },
+        shouldStop: () => clientClosed,
+      });
+
+      if (clientClosed) {
+        responseCompleted = true;
+        res.end();
+        return;
+      }
+
+      const totalDurationMs = getDurationMs(requestStartedAt);
+
+      logAgentInfo(requestId, "hitl_resume", "completed", {
+        durationMs: totalDurationMs,
+        toolCallCount: agentRun.toolCallCount,
+        deltaCount,
+        outputCharCount,
+        usage: agentRun.usage,
+        rePending: agentRun.pending ? agentRun.pending.tool_name : "(none)",
+      });
+
+      writeAgentSseEvent({
+        type: "done",
+        phase: "request_completed",
+        duration_ms: totalDurationMs,
+        run_id: agentRun.rootRunId,
+        prompt_tokens: agentRun.usage.promptTokens,
+        completion_tokens: agentRun.usage.completionTokens,
+        total_tokens: agentRun.usage.totalTokens,
+        // 续跑后模型可能再次想调一个需要审批的工具,这里再次 pending
+        pending: agentRun.pending,
+      });
+
+      responseCompleted = true;
+      res.end();
+    } catch (error) {
+      const totalDurationMs = getDurationMs(requestStartedAt);
+      logAgentError(requestId, activePhase, "failed", error, {
+        durationMs: totalDurationMs,
+      });
+
+      if (!res.headersSent) {
+        res.status(500).json({ error: "Failed to resume agent." });
+        responseCompleted = true;
+        return;
+      }
+
+      if (!clientClosed) {
+        writeAgentSseEvent({
+          type: "error",
+          error: "Failed to resume agent.",
+          phase: activePhase,
+          duration_ms: totalDurationMs,
+        });
+      }
+
+      responseCompleted = true;
+      res.end();
+    }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════════
+// Time-travel — 时光机接口(Phase 9 #7)
+// ═══════════════════════════════════════════════════════════════════
+//
+// 利用 LangGraph checkpointer 把每一步 state 都存了的特性,提供两个接口:
+//
+//   1. GET  /api/threads/:id/checkpoints  列出"用户可分叉的时刻"
+//   2. POST /api/threads/:id/fork         从某个 checkpoint 分叉出新 thread
+//
+// 类比 git:thread 是分支,checkpoint 是 commit。
+// fork 就是从某个 commit 拉一个新分支出去,原分支保持完整。
+
+/**
+ * GET /api/threads/:id/checkpoints
+ *
+ * 返回该 thread 的所有"用户可分叉时刻"(过滤掉工具调用中间态)。
+ *
+ * 返回:
+ *   200 + { checkpoints: CheckpointSummary[] }
+ *   400 thread_id 缺失
+ *   503 USE_LANGGRAPH=false
+ */
+app.get(
+  "/api/threads/:id/checkpoints",
+  async (req: Request, res: Response) => {
+    if (!useLangGraph) {
+      res.status(503).json({
+        error:
+          "Time-travel requires USE_LANGGRAPH=true. Phase 3 createAgent does not persist state.",
+      });
+      return;
+    }
+
+    const rawId = req.params.id;
+    const threadId = typeof rawId === "string" ? rawId.trim() : "";
+    if (!threadId) {
+      res.status(400).json({ error: "Thread id is required." });
+      return;
+    }
+
+    try {
+      const checkpoints = await listCheckpointsForThread(threadId);
+      res.status(200).json({ checkpoints });
+    } catch (error) {
+      console.error(`[Time-travel] list checkpoints failed for ${threadId}:`, error);
+      res.status(500).json({ error: "Failed to list checkpoints." });
+    }
+  }
+);
+
+/**
+ * POST /api/threads/:id/fork
+ *
+ * 从指定 checkpoint 分叉出一个新 thread。
+ *
+ * body: { checkpoint_id: string, title?: string }
+ *
+ * 流程:
+ *   1. 验证 source thread + checkpoint 都存在
+ *   2. 生成新 thread_id (UUID)
+ *   3. Prisma 创建新 thread 行(title 用 body.title 或自动生成 "...的分叉")
+ *   4. LangGraph 把源 checkpoint 的 state 写到新 thread
+ *   5. 返回新 thread 的 summary,iOS 拿到 id 跳转过去
+ *
+ * 返回:
+ *   201 + ThreadSummary
+ *   400 body 格式错 / thread_id 缺失
+ *   404 source thread 或 checkpoint 不存在
+ *   503 USE_LANGGRAPH=false
+ */
+app.post(
+  "/api/threads/:id/fork",
+  async (req: Request, res: Response) => {
+    if (!useLangGraph) {
+      res.status(503).json({
+        error: "Time-travel requires USE_LANGGRAPH=true.",
+      });
+      return;
+    }
+
+    const rawId = req.params.id;
+    const sourceThreadId = typeof rawId === "string" ? rawId.trim() : "";
+    if (!sourceThreadId) {
+      res.status(400).json({ error: "Source thread id is required." });
+      return;
+    }
+
+    const body = (req.body ?? {}) as {
+      checkpoint_id?: string;
+      title?: string;
+    };
+    const checkpointId =
+      typeof body.checkpoint_id === "string" ? body.checkpoint_id.trim() : "";
+    if (!checkpointId) {
+      res.status(400).json({ error: "body.checkpoint_id is required." });
+      return;
+    }
+
+    // 生成新 thread_id — 在 LangGraph 写 state 之前先做,这样新 id
+    // 在 Prisma 和 checkpointer 两边是同一个,后续查询能对得上
+    const newThreadId = randomUUID();
+    const customTitle =
+      typeof body.title === "string" && body.title.trim()
+        ? body.title.trim()
+        : undefined;
+
+    try {
+      // 1. 复制 state 到新 thread(走 LangGraph updateState,不直接动 SQLite)
+      const forkResult = await forkThreadFromCheckpoint({
+        sourceThreadId,
+        sourceCheckpointId: checkpointId,
+        newThreadId,
+      });
+
+      // 2. Prisma 建新 thread 行
+      //    标题默认:"原 thread 的分叉 · 共 N 条消息"
+      const fallbackTitle = `分叉对话 · ${forkResult.messageCount} 条消息`;
+      const newThread = await createThread({
+        id: newThreadId,
+        title: customTitle ?? fallbackTitle,
+      });
+
+      console.log(
+        `[Time-travel] forked thread ${sourceThreadId} → ${newThreadId} ` +
+          `at checkpoint ${checkpointId.slice(0, 8)}... (${forkResult.messageCount} messages)`
+      );
+
+      res.status(201).json(newThread);
+    } catch (error) {
+      // 常见失败:checkpoint_id 不存在 / source thread 没有 state
+      // 错误信息里有 "no messages" → 当 404 处理,其它当 500
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(
+        `[Time-travel] fork failed: source=${sourceThreadId} ` +
+          `checkpoint=${checkpointId}:`,
+        error
+      );
+
+      if (/no messages|not found/i.test(message)) {
+        res.status(404).json({
+          error: "Source checkpoint not found or has no messages.",
+        });
+        return;
+      }
+      res.status(500).json({ error: "Failed to fork thread." });
+    }
+  }
+);
 
 // ═══════════════════════════════════════════════════════════════════
 // /api/feedback — 用户反馈(写回 LangSmith)

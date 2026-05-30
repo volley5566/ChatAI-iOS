@@ -547,26 +547,7 @@ export async function runLangGraphAgentStream({
 export async function getPendingApprovalForThread(
   threadId: string
 ): Promise<PendingToolApproval | null> {
-  const checkpointer = getSqliteCheckpointer();
-
-  // 最小图:节点函数不会被执行,所以用 no-op 就行。
-  // 关键点是**拓扑结构必须和真图一致**(节点名 agent/tools + 条件边),
-  // 否则:
-  //   1. LangGraph 编译期校验会拒绝(unreachable nodes)
-  //   2. checkpoint 里记录的 task 名字("tools")在这里找不到对应节点
-  // 节点函数体可以是空的,因为我们只调 getState,不调 invoke/stream。
-  // Phase 9 #6 — dummy graph 拓扑要和真图保持一致(包括 evaluateAnswer 节点),
-  // 否则 checkpointer 里记录的 task 名 "evaluateAnswer" 在这里找不到对应节点,
-  // LangGraph 编译期会拒绝。
-  const dummyGraph = new StateGraph(AgentState)
-    .addNode("agent", async () => ({}))
-    .addNode("tools", async () => ({}))
-    .addNode("evaluateAnswer", async () => ({}))
-    .addEdge(START, "agent")
-    .addConditionalEdges("agent", () => END, ["tools", "evaluateAnswer", END])
-    .addEdge("tools", "agent")
-    .addEdge("evaluateAnswer", "agent")
-    .compile({ checkpointer });
+  const dummyGraph = getDummyStateGraph();
 
   const snapshot = await dummyGraph.getState({
     configurable: { thread_id: threadId },
@@ -593,6 +574,249 @@ export async function getPendingApprovalForThread(
     display_name: getDisplayNameForTool(approvalReq.tool_name ?? ""),
     args: approvalReq.args ?? {},
   };
+}
+
+// ─── Dummy graph 工厂(共享给查询类接口用)──────────────────
+
+/**
+ * 模块级缓存的"假图" — 给只读 state 查询(getState / getStateHistory /
+ * updateState 写另一个 thread 等)用,**不会被真的 invoke / stream 跑起来**。
+ *
+ * 为什么要这个东西?
+ *   LangGraph 的 state 操作 API 都挂在 CompiledStateGraph 上,
+ *   要读/写一个 thread 的 state,必须先 .compile() 一张图。
+ *   但 .compile 完整真图需要加载 MCP 工具(每次调用都搞这一遍太重)。
+ *
+ * 这个假图:
+ *   - state schema 和真图一致(都用 AgentState),否则反序列化报错
+ *   - 节点名和真图一致(agent / tools / evaluateAnswer),否则 checkpointer
+ *     里记录的 task name 在这里找不到对应节点
+ *   - 节点函数体是空的,因为我们不会真的跑节点
+ *   - 拓扑也要对得上,否则 compile 期校验会拒绝(unreachable node)
+ *
+ * 模块级 lazy 单例:第一次调时编一次,之后全部复用。
+ */
+let cachedDummyGraph: ReturnType<typeof buildDummyStateGraph> | undefined;
+
+function getDummyStateGraph() {
+  if (!cachedDummyGraph) {
+    cachedDummyGraph = buildDummyStateGraph();
+  }
+  return cachedDummyGraph;
+}
+
+function buildDummyStateGraph() {
+  return new StateGraph(AgentState)
+    .addNode("agent", async () => ({}))
+    .addNode("tools", async () => ({}))
+    .addNode("evaluateAnswer", async () => ({}))
+    .addEdge(START, "agent")
+    .addConditionalEdges("agent", () => END, ["tools", "evaluateAnswer", END])
+    .addEdge("tools", "agent")
+    .addEdge("evaluateAnswer", "agent")
+    .compile({ checkpointer: getSqliteCheckpointer() });
+}
+
+// ─── Time-travel 接口(Phase 9 #7)────────────────────────────
+
+/**
+ * 一个 thread 的某个历史时刻的摘要,供 iOS 显示"分叉菜单"用。
+ */
+export type CheckpointSummary = {
+  /** LangGraph 给每个 checkpoint 分配的不透明 id,fork 时原样回传 */
+  checkpoint_id: string;
+  /** 创建时间(ISO 8601) */
+  created_at: string;
+  /** 在 thread 的时间线上的位置(0 表示最早,1 表示其次,以此类推) */
+  step: number;
+  /** 这一刻 state 里有几条消息 */
+  message_count: number;
+  /** 给用户看的"这一刻 AI 说了啥"预览(最多 80 字符) */
+  preview: string;
+};
+
+/**
+ * 列出一个 thread 的所有"用户可分叉的时刻"。
+ *
+ * # 什么是"用户可分叉的时刻"
+ *
+ * LangGraph 每个节点跑完都存一个 checkpoint,一次"用户问 → 答"对话
+ * 会产生 5-10 个 checkpoint(包括工具调用中间态)。对用户来说,中间态
+ * (比如 "tools 节点刚跑完,agent 还没消化")没意义。
+ *
+ * 我们只暴露 "agentNode 跑完且 AI 消息没有 tool_calls" 的 checkpoint,
+ * 即"模型说完最终答案、ReAct 循环回到 END 的那一刻"。
+ *
+ * 实现上:
+ *   - graph.getStateHistory 返回**倒序**(最新在前)的 snapshot 迭代器
+ *   - 过滤出 "最后一条消息是 AIMessage 且没有 tool_calls" 的 snapshot
+ *   - 倒序变正序,给每个 snapshot 编 step(0, 1, 2, ...)
+ *
+ * @returns 按时间正序的 CheckpointSummary 数组;thread 不存在 → []
+ */
+export async function listCheckpointsForThread(
+  threadId: string
+): Promise<CheckpointSummary[]> {
+  const dummyGraph = getDummyStateGraph();
+
+  // getStateHistory 是个异步迭代器,逐个吐出 StateSnapshot(倒序)
+  const allSnapshots: StateSnapshotShape[] = [];
+  for await (const snap of dummyGraph.getStateHistory({
+    configurable: { thread_id: threadId },
+  })) {
+    allSnapshots.push(snap as unknown as StateSnapshotShape);
+  }
+
+  // 过滤"完整对话时刻":最后一条消息是 AI 且没有 tool_calls
+  const userFacing = allSnapshots.filter((snap) => {
+    const messages = (snap.values as { messages?: unknown[] } | undefined)
+      ?.messages;
+    if (!Array.isArray(messages) || messages.length === 0) {
+      return false;
+    }
+    const last = messages[messages.length - 1] as {
+      // LangChain 序列化后的 AIMessage 大致长这样
+      lc_id?: string[];
+      tool_calls?: unknown[];
+    };
+
+    // 不是 AIMessage(检查 lc_id 路径) → 不算用户视角的完整时刻
+    const isAi = last.lc_id?.includes("AIMessage");
+    if (!isAi) return false;
+
+    // AI 还在调工具 → 中间态,跳过
+    if (Array.isArray(last.tool_calls) && last.tool_calls.length > 0) {
+      return false;
+    }
+    return true;
+  });
+
+  // getStateHistory 是倒序(最新在前),我们要正序(最早在前)展示
+  userFacing.reverse();
+
+  return userFacing.map((snap, index) => ({
+    checkpoint_id: extractCheckpointId(snap),
+    created_at: snap.createdAt ?? new Date().toISOString(),
+    step: index,
+    message_count:
+      (snap.values as { messages?: unknown[] } | undefined)?.messages
+        ?.length ?? 0,
+    preview: buildCheckpointPreview(snap),
+  }));
+}
+
+/**
+ * 从某个 checkpoint 分叉出一个新 thread。
+ *
+ * # 分叉语义
+ *
+ *   原 thread A:
+ *     msg1 → msg2 → msg3 → msg4 → msg5    [checkpoints: c1, c2, c3, c4, c5]
+ *                            ↑
+ *                       用户选 c3 分叉
+ *
+ *   新 thread B 创建后:
+ *     msg1 → msg2 → msg3                  [checkpoint: 复制自 c3]
+ *     ↑ 用户后续发的新消息会接在这里
+ *
+ *   原 thread A **保持完整**,用户随时可以回去。
+ *
+ * # 实现要点
+ *
+ *   1. graph.getState({ thread_id: A, checkpoint_id: c3 }) 拿到 c3 时刻的 state
+ *   2. 把那一刻的 messages 用 graph.updateState({ thread_id: B }, { messages })
+ *      写到新 thread。LangGraph 会自动给新 thread 建第一个 checkpoint。
+ *
+ * # 为什么不能直接复制 SQLite 行
+ *
+ *   LangGraph 的 checkpoint 内部结构(channel_values / pending_writes / 父子链
+ *   等)复杂且版本敏感,手动复制容易踩坑。走 LangGraph 的 updateState API,
+ *   让框架自己处理序列化和元数据,稳。
+ */
+export async function forkThreadFromCheckpoint(options: {
+  sourceThreadId: string;
+  sourceCheckpointId: string;
+  newThreadId: string;
+}): Promise<{ messageCount: number }> {
+  const dummyGraph = getDummyStateGraph();
+
+  // 1. 拿到源 thread 在指定 checkpoint 的 state 快照
+  //    configurable.checkpoint_id 让 LangGraph 取指定那一刻,而不是最新
+  const snapshot = await dummyGraph.getState({
+    configurable: {
+      thread_id: options.sourceThreadId,
+      checkpoint_id: options.sourceCheckpointId,
+    },
+  });
+
+  const messages = (snapshot.values as { messages?: unknown[] } | undefined)
+    ?.messages;
+
+  if (!Array.isArray(messages) || messages.length === 0) {
+    throw new Error(
+      `Cannot fork: checkpoint ${options.sourceCheckpointId} has no messages.`
+    );
+  }
+
+  // 2. 把消息写到新 thread。
+  //    updateState 在新 thread 上是 no-op-then-create: LangGraph 看到新 thread
+  //    没任何 state,会把这次 update 当成"创世 checkpoint"。
+  await dummyGraph.updateState(
+    { configurable: { thread_id: options.newThreadId } },
+    { messages }
+  );
+
+  return { messageCount: messages.length };
+}
+
+// ─── Time-travel 内部 helper ──────────────────────────────────
+
+/**
+ * StateSnapshot 的实际形状(LangGraph 类型导出不完整,这里手写关键字段)。
+ * 不 export — 只在本文件内部用。
+ */
+type StateSnapshotShape = {
+  values: Record<string, unknown>;
+  config?: { configurable?: { checkpoint_id?: string } };
+  createdAt?: string;
+  metadata?: { step?: number };
+};
+
+function extractCheckpointId(snap: StateSnapshotShape): string {
+  return snap.config?.configurable?.checkpoint_id ?? "";
+}
+
+function buildCheckpointPreview(snap: StateSnapshotShape): string {
+  const messages =
+    (snap.values as { messages?: unknown[] } | undefined)?.messages ?? [];
+  const last = messages[messages.length - 1] as
+    | { content?: unknown }
+    | undefined;
+  if (!last) return "(空对话)";
+
+  // content 可能是 string 也可能是 MessageContentComplex[]
+  const text =
+    typeof last.content === "string"
+      ? last.content
+      : Array.isArray(last.content)
+      ? last.content
+          .map((part: unknown) => {
+            if (typeof part === "string") return part;
+            if (
+              part &&
+              typeof part === "object" &&
+              "text" in part &&
+              typeof (part as { text: unknown }).text === "string"
+            ) {
+              return (part as { text: string }).text;
+            }
+            return "";
+          })
+          .join("")
+      : "";
+
+  const trimmed = text.replace(/\s+/g, " ").trim();
+  return trimmed.length > 80 ? `${trimmed.slice(0, 80)}…` : trimmed;
 }
 
 /**

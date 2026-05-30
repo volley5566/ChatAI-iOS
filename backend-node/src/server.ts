@@ -37,7 +37,12 @@ import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { runLangChainAgentStream } from "./agent/agentRunner";
-import { getPendingApprovalForThread } from "./langchain/agentGraph";
+import {
+  forkThreadFromCheckpoint,
+  getPendingApprovalForThread,
+  listCheckpointsForThread,
+} from "./langchain/agentGraph";
+import { randomUUID } from "crypto";
 import type { ToolApprovalResponse } from "./langchain/agentGraphNodes";
 import {
   createAgentRequestId,
@@ -806,6 +811,155 @@ app.post(
 
       responseCompleted = true;
       res.end();
+    }
+  }
+);
+
+// ═══════════════════════════════════════════════════════════════════
+// Time-travel — 时光机接口(Phase 9 #7)
+// ═══════════════════════════════════════════════════════════════════
+//
+// 利用 LangGraph checkpointer 把每一步 state 都存了的特性,提供两个接口:
+//
+//   1. GET  /api/threads/:id/checkpoints  列出"用户可分叉的时刻"
+//   2. POST /api/threads/:id/fork         从某个 checkpoint 分叉出新 thread
+//
+// 类比 git:thread 是分支,checkpoint 是 commit。
+// fork 就是从某个 commit 拉一个新分支出去,原分支保持完整。
+
+/**
+ * GET /api/threads/:id/checkpoints
+ *
+ * 返回该 thread 的所有"用户可分叉时刻"(过滤掉工具调用中间态)。
+ *
+ * 返回:
+ *   200 + { checkpoints: CheckpointSummary[] }
+ *   400 thread_id 缺失
+ *   503 USE_LANGGRAPH=false
+ */
+app.get(
+  "/api/threads/:id/checkpoints",
+  async (req: Request, res: Response) => {
+    if (!useLangGraph) {
+      res.status(503).json({
+        error:
+          "Time-travel requires USE_LANGGRAPH=true. Phase 3 createAgent does not persist state.",
+      });
+      return;
+    }
+
+    const rawId = req.params.id;
+    const threadId = typeof rawId === "string" ? rawId.trim() : "";
+    if (!threadId) {
+      res.status(400).json({ error: "Thread id is required." });
+      return;
+    }
+
+    try {
+      const checkpoints = await listCheckpointsForThread(threadId);
+      res.status(200).json({ checkpoints });
+    } catch (error) {
+      console.error(`[Time-travel] list checkpoints failed for ${threadId}:`, error);
+      res.status(500).json({ error: "Failed to list checkpoints." });
+    }
+  }
+);
+
+/**
+ * POST /api/threads/:id/fork
+ *
+ * 从指定 checkpoint 分叉出一个新 thread。
+ *
+ * body: { checkpoint_id: string, title?: string }
+ *
+ * 流程:
+ *   1. 验证 source thread + checkpoint 都存在
+ *   2. 生成新 thread_id (UUID)
+ *   3. Prisma 创建新 thread 行(title 用 body.title 或自动生成 "...的分叉")
+ *   4. LangGraph 把源 checkpoint 的 state 写到新 thread
+ *   5. 返回新 thread 的 summary,iOS 拿到 id 跳转过去
+ *
+ * 返回:
+ *   201 + ThreadSummary
+ *   400 body 格式错 / thread_id 缺失
+ *   404 source thread 或 checkpoint 不存在
+ *   503 USE_LANGGRAPH=false
+ */
+app.post(
+  "/api/threads/:id/fork",
+  async (req: Request, res: Response) => {
+    if (!useLangGraph) {
+      res.status(503).json({
+        error: "Time-travel requires USE_LANGGRAPH=true.",
+      });
+      return;
+    }
+
+    const rawId = req.params.id;
+    const sourceThreadId = typeof rawId === "string" ? rawId.trim() : "";
+    if (!sourceThreadId) {
+      res.status(400).json({ error: "Source thread id is required." });
+      return;
+    }
+
+    const body = (req.body ?? {}) as {
+      checkpoint_id?: string;
+      title?: string;
+    };
+    const checkpointId =
+      typeof body.checkpoint_id === "string" ? body.checkpoint_id.trim() : "";
+    if (!checkpointId) {
+      res.status(400).json({ error: "body.checkpoint_id is required." });
+      return;
+    }
+
+    // 生成新 thread_id — 在 LangGraph 写 state 之前先做,这样新 id
+    // 在 Prisma 和 checkpointer 两边是同一个,后续查询能对得上
+    const newThreadId = randomUUID();
+    const customTitle =
+      typeof body.title === "string" && body.title.trim()
+        ? body.title.trim()
+        : undefined;
+
+    try {
+      // 1. 复制 state 到新 thread(走 LangGraph updateState,不直接动 SQLite)
+      const forkResult = await forkThreadFromCheckpoint({
+        sourceThreadId,
+        sourceCheckpointId: checkpointId,
+        newThreadId,
+      });
+
+      // 2. Prisma 建新 thread 行
+      //    标题默认:"原 thread 的分叉 · 共 N 条消息"
+      const fallbackTitle = `分叉对话 · ${forkResult.messageCount} 条消息`;
+      const newThread = await createThread({
+        id: newThreadId,
+        title: customTitle ?? fallbackTitle,
+      });
+
+      console.log(
+        `[Time-travel] forked thread ${sourceThreadId} → ${newThreadId} ` +
+          `at checkpoint ${checkpointId.slice(0, 8)}... (${forkResult.messageCount} messages)`
+      );
+
+      res.status(201).json(newThread);
+    } catch (error) {
+      // 常见失败:checkpoint_id 不存在 / source thread 没有 state
+      // 错误信息里有 "no messages" → 当 404 处理,其它当 500
+      const message = error instanceof Error ? error.message : String(error);
+      console.error(
+        `[Time-travel] fork failed: source=${sourceThreadId} ` +
+          `checkpoint=${checkpointId}:`,
+        error
+      );
+
+      if (/no messages|not found/i.test(message)) {
+        res.status(404).json({
+          error: "Source checkpoint not found or has no messages.",
+        });
+        return;
+      }
+      res.status(500).json({ error: "Failed to fork thread." });
     }
   }
 );

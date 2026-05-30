@@ -27,6 +27,14 @@ struct MessageBubbleView: View {
     /// 解耦后这个 View 也能在别的页面复用(比如未来的"历史回顾"页)。
     var onSubmitFeedback: (Double) -> Void = { _ in }
 
+    /// Phase 9 #8 — 用户在 AI 消息上**长按 → 点[从这里分叉]菜单项**时的回调。
+    ///
+    /// 实现:在 AI 气泡上挂 .contextMenu(iOS 原生长按弹菜单,不会和气泡的
+    /// .textSelection 选文字冲突)。菜单项被点击时调这个闭包。
+    ///
+    /// 默认空闭包 — 用户消息和 Preview 场景都不需要,ChatView 才传真实回调。
+    var onForkRequested: () -> Void = { }
+
     /// 这个值后面会决定三件事：
     /// 1. 气泡靠左还是靠右
     /// 2. 气泡背景颜色
@@ -59,6 +67,8 @@ struct MessageBubbleView: View {
                     // 允许用户长按/拖选复制文字。
                     // 这个对 AI Chat 很重要，因为用户经常要复制 AI 回复。
                     .textSelection(.enabled)
+                    // Phase 9 #8 — 给 AI 消息挂 contextMenu(Time-travel 入口)
+                    .contextMenu { contextMenuItems }
 
                 feedbackBar
             }
@@ -125,6 +135,23 @@ struct MessageBubbleView: View {
         // BorderlessButton 在 List/ScrollView 里能避免"整行被识别为点击"的问题,
         // 让点击事件精准命中图标本身。
         .buttonStyle(.borderless)
+    }
+
+    /// Phase 9 #8 — 长按 AI 消息弹出的菜单项(Time-travel 入口)。
+    ///
+    /// 用户消息的菜单为空(不显示分叉),所以这里用 ViewBuilder + isUserMessage 判断。
+    /// 空 ViewBuilder 时 SwiftUI 会自动不显示 contextMenu(用户长按没反应)。
+    @ViewBuilder
+    private var contextMenuItems: some View {
+        if !isUserMessage {
+            Button {
+                onForkRequested()
+            } label: {
+                // 系统图标 "arrow.triangle.branch" 视觉上就是 git 分支的样子,
+                // 让用户一眼明白这是"从这里分叉"
+                Label("从这里分叉", systemImage: "arrow.triangle.branch")
+            }
+        }
     }
 
     /// 根据消息来源切换气泡颜色。

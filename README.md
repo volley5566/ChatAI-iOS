@@ -194,6 +194,9 @@ sequenceDiagram
 | **Embedding** | 把文本变成向量,余弦相似度近 = 语义近 | `embeddings.ts` (Ollama) |
 | **LangSmith** | 可观测平台,自动 trace 每一步 + 收用户反馈 | `langsmithClient.ts` |
 | **Eval** | 离线给 Agent 出 21 道题,4 个评分器打分,改完跑一遍看分数 | `evals/` 目录 |
+| **HITL** (Phase 9) | Human-in-the-Loop:`interrupt()` 让图暂停,等用户在 iOS 上批准再执行工具 | §11 章节 |
+| **Subgraph** (Phase 9) | 把复杂工具的内部流程拆成"图中图",主图把子图当普通节点用 | §12 章节 |
+| **Time-travel** (Phase 9) | 从历史 checkpoint 分叉出新 thread,像 git checkout 一样回到过去 | §13 章节 |
 
 ### 0.5 三个核心权衡
 
@@ -233,11 +236,11 @@ sequenceDiagram
 | Phase 6 | Ollama 真实 Embedding + 向量缓存 | `langchain/embeddings.ts` `langchain/ragCache.ts` |
 | Phase 7 | 工具集扩展到 4 个（LLM-as-judge + 学习规划） | `mcp/mcpToolHandlers.ts` |
 | Phase 10 | 生产化：LangSmith trace + Eval + CI/CD + 安全加固 + Docker | `langsmithClient.ts` `evals/` `Dockerfile` |
-| Phase 9 (进行中) | 高级 LangGraph：HITL 人工审核 ✅ + Subgraph 子图 ✅ + Time-travel ⏳ | `agentGraphNodes.ts` `subgraphs/evaluateAnswerGraph.ts` |
+| **Phase 9** | **高级 LangGraph:HITL 人工审核 + Subgraph 子图 + Time-travel 时光机** | `agentGraphNodes.ts` `subgraphs/evaluateAnswerGraph.ts` `ToolApprovalCard.swift` |
 
 Phase 3 和 Phase 4 通过 `USE_LANGGRAPH` 环境变量灰度切换,行为完全等价。
-**注意 Phase 9 (HITL + Subgraph) 只在 USE_LANGGRAPH=true 路径生效**——
-createAgent 路径不接 checkpointer,无法挂起也无法续跑。
+**注意 Phase 9 整块(HITL + Subgraph + Time-travel)只在 USE_LANGGRAPH=true 路径生效**——
+createAgent 路径不接 checkpointer,这三个能力都依赖 checkpointer 持久化 state。
 
 ---
 
@@ -1444,15 +1447,175 @@ backend-node/src/langchain/
 
 ---
 
-## 13. 后续规划
+## 13. Time-travel — 时光机(Phase 9 #7-#8)
+
+**核心一句话**:LangGraph 的 checkpointer 已经把图每一步都存盘了 — 我们顺势就有了 "git checkout" 一样的能力,**从对话历史的任意一刻分叉出一条新对话**,试不同的回答路径,而原对话保持完整不动。
+
+### 13.1 用 git 比喻
 
 ```text
-Phase 9   高级 LangGraph
-  ✅ #1-#3  HITL 人工审核
-  ✅ #5-#6  Subgraph 子图(evaluateAnswer 重构)
-  ⏳ #7-#8  Time-travel 时光机(checkpoints 列表 + iOS 长按分叉)
+              git              ←→         LangGraph Time-travel
+        ─────────────────────────────────────────────────────
+        repo                              thread
+        commit                            checkpoint
+        branch                            分叉出的新 thread
+        git checkout <hash>               GET /api/threads/:id/pending  ← 看历史
+        git checkout -b new <hash>        POST /api/threads/:id/fork    ← 从那点开分支
 
-Phase 8   Multi-Agent 协作(Router + 子 Agent)
+原 thread 永远完整。fork 只是从中间某个 checkpoint 拉出一条新 thread,
+新 thread 拷贝了那一刻的 state(messages),后续在新 thread 上聊不会影响原 thread。
 ```
 
-Phase 9 的 Time-travel 完成后,会有一个"自然的 demo":用户可以长按对话中的任意一条 AI 消息,**从那个时刻分叉出一条新对话**,试不同的回答路径。这是 LangGraph checkpointer 持久化的杀手锏 — 一旦图的每一步都存盘,就能像 git checkout 一样"回到过去"。
+### 13.2 它为什么"凭空"就能做出来
+
+完全靠 Phase 5 引入的 **SqliteCheckpointer** 的副作用:LangGraph 每个节点跑完都自动存一个 checkpoint(state 快照),时间一长,一个 thread 在 SQLite 里就是一串完整的 checkpoint 链。这意味着:
+
+- **任何历史时刻的 state 都还在**(messages、modelCallCount、toolCallCount 等)
+- **拿任何一个 checkpoint_id 都能 `getState(...)` 把那一刻还原回来**
+- **写到新 thread_id 就完成"分叉"**
+
+Phase 9 #7-#8 没"新增"什么能力,只是**给本来就存在的数据加了入口**。
+
+### 13.3 后端两个接口
+
+```text
+GET  /api/threads/:id/checkpoints
+  → 200 + { checkpoints: [{ checkpoint_id, step, created_at, message_count, preview }, ...] }
+
+POST /api/threads/:id/fork    body: { checkpoint_id, title? }
+  → 201 + ThreadSummary  (新建的 thread)
+  → 404 checkpoint 不存在
+  → 503 USE_LANGGRAPH=false
+```
+
+`/checkpoints` 接口做了一层**过滤**:LangGraph 实际上每个节点跑完都存,5-10 步对话能产生 30+ 个 checkpoint。我们只暴露 "AI 说完完整回答 + 没在调工具" 的那些时刻给用户挑选,中间态(tool 跑完但 agent 还没消化、HITL 挂起态等)对用户没意义,过滤掉。
+
+`/fork` 接口的实现走 LangGraph 原生 API:
+
+```ts
+// 1. 从源 thread + checkpoint_id 取那一刻的 state
+const snapshot = await graph.getState({
+  configurable: { thread_id: sourceId, checkpoint_id: ckptId }
+});
+
+// 2. 用 updateState 把 messages 写到新 thread_id
+//    LangGraph 自动给新 thread 建第一个 checkpoint
+await graph.updateState(
+  { configurable: { thread_id: newId } },
+  { messages: snapshot.values.messages }
+);
+```
+
+**不直接复制 SQLite 行** — checkpoint 内部结构(channel_values / pending_writes / 父子链)版本敏感,手动复制容易踩坑。走框架 API,稳。
+
+### 13.4 iOS 端 UX
+
+```text
+1. 进入对话页面 → .task 静默拉一次 checkpoints 列表,缓存在 VM 里
+2. 用户**长按任意一条 AI 消息**
+   ↓
+3. 弹 iOS 原生 contextMenu(就像 iMessage 长按消息),一项:
+      [⎇] 从这里分叉
+   ↓
+4. 用户点[从这里分叉]
+   ↓
+5. VM 内部: 数"这是第几条 AI 消息" → 找对应 checkpoint → 调 /fork
+   ↓
+6. 弹 alert: "已分叉为新对话「分叉对话 · X 条消息」"
+   ↓
+7. 用户点[好的] → 返回对话列表
+   ↓
+8. 列表 .task 自动刷新 → 新 thread 出现在最上方 → 用户点进去就是
+```
+
+**为什么用 `.contextMenu` 而不是手势/底部 sheet?**
+- 不和气泡现有的 `.textSelection(.enabled)`(长按选文字)冲突
+- iOS 原生模式,用户一看就懂
+- 视觉上和系统其它 App(Messages / Notes)一致
+
+### 13.5 关键技巧:第 N 条 AI 消息 ↔ 第 N 个 checkpoint
+
+iOS 端不直接持有 checkpoint_id,长按消息时怎么知道对应哪个 checkpoint?用一个**位置对齐**的小技巧:
+
+```text
+iOS messages 数组:       [user1, ai1, user2, ai2, user3, ai3]
+                                  ↑          ↑          ↑
+                                第 0 条 AI 第 1 条 AI 第 2 条 AI
+
+后端 checkpoints 数组:   [ckpt0,    ckpt1,    ckpt2]
+                          ↑ AI 第一次说完完整回答的时刻
+                                    ↑ AI 第二次...
+                                              ↑ AI 第三次...
+```
+
+两边都按时间正序、都已经过滤掉了工具中间态,所以"第 N 条 AI 消息"和"第 N 个 checkpoint" **自然 1-to-1 对应**。
+
+```swift
+// VM.forkFromMessage(messageID: ai2.id)
+// 1. 在 messages 里数,被长按的消息是第几条 AI 消息 → foundIndex = 1
+// 2. 直接用 forkableCheckpoints[1].checkpointID 调 /fork
+```
+
+不需要后端给每条消息塞 checkpoint_id 字段,iOS 也不用做任何复杂映射。**纯粹靠"两边数据同序+同过滤规则" 保证的不变量。**
+
+### 13.6 一个"为什么有用"的场景
+
+```text
+你跟 AI 学 SwiftUI:
+  你: "讲讲 @State"
+  AI: "@State 是属性包装器,用来声明视图私有的可变状态..."   ← ckpt A
+
+  你: "讲讲 @Binding"
+  AI: "@Binding 是用来从父视图传引用的..."                  ← ckpt B
+
+  你: "举个例子"
+  AI: "比如做一个 toggle:"                                  ← ckpt C
+       (写了一个 toggle 例子,但其实是 @State 的例子,跑题了)
+
+  ★ 你想试试"如果在 B 的位置我换种问法,会不会更好"
+
+  → 长按 ckpt B 那条 AI 消息 → 从这里分叉
+  → 新 thread 里只到 ckpt B,后面没了
+  → 你在新 thread 里改问:"用 @Binding 写一个父子组件传值的例子"
+  → AI 重新基于"问得更具体"的上下文回答
+
+  原对话还在,你随时可以回去比较两种问法的效果。
+```
+
+这是 LangGraph 在生产里**最被低估**的能力之一 — agent 调试、prompt 调优、A/B 用户体验测试都能受益。
+
+### 13.7 关键文件
+
+```text
+backend-node/src/
+  langchain/agentGraph.ts          ★ listCheckpointsForThread + forkThreadFromCheckpoint
+                                     + 共享 dummy graph 工厂(缓存)
+  db/threadsRepository.ts          createThread 加可选 id 参数(fork 用)
+  server.ts                        新增 GET /checkpoints + POST /fork 两个路由
+
+ios/ChatAI-iOS/ChatAI-iOS/
+  Models/Checkpoint.swift          ★ Checkpoint + CheckpointsResponse 模型
+  Services/ChatAPIClient.swift     listCheckpoints + forkThread 方法
+  ViewModels/ChatViewModel.swift   forkableCheckpoints 缓存 + forkFromMessage 方法
+  Views/MessageBubbleView.swift    AI 气泡挂 .contextMenu + onForkRequested 回调
+  Views/ChatView.swift             .task 拉 checkpoints + .alert 显示 fork 结果
+```
+
+---
+
+## 14. 后续规划
+
+```text
+✅ Phase 9   高级 LangGraph(全部完成 — 8/8 任务)
+   ✅ #1-#3  HITL 人工审核(interrupt + /resume + iOS 审批卡片)
+   ✅ #5-#6  Subgraph 子图(evaluateAnswer 重构 + 主图集成)
+   ✅ #7-#8  Time-travel 时光机(checkpoints + fork API + iOS 长按分叉)
+
+⏳ Phase 8   Multi-Agent 协作(Router + 子 Agent)
+   - 概念:一个"总控 Agent"按用户意图把请求路由给不同的"专家 Agent"
+     (代码 Agent / 学习 Agent / 总结 Agent...)
+   - 复用 Phase 9 的子图 pattern:每个专家就是一个独立子图
+   - 复用 Phase 5 的 checkpointer:子图自己的 state 也能持久化
+```
+
+Phase 9 已经把 LangGraph 的三大杀手锏(挂起恢复 / 子图组合 / 时光回溯)都接上了。Phase 8 的多 Agent 协作只是在这套基础上多加一层"路由 Agent",难度反而比 Phase 9 低。

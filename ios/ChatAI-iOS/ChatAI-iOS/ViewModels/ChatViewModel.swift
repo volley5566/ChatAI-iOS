@@ -117,6 +117,29 @@ final class ChatViewModel: ObservableObject {
     /// resume 流结束(done with pending: nil)时清空,避免污染后续会话。
     private var justResumedToolCallID: String?
 
+    // ─── Phase 9 #8 — Time-travel(时光机)─────────────────────
+
+    /// 当前 thread 的 "可分叉时刻"列表,按时间正序。
+    ///
+    /// 生命周期:
+    ///   - ChatView 进入时 .task 里调 loadCheckpoints() 拉一次
+    ///   - 每次 sendMessage() / resolvePending() 完成后再拉一次刷新
+    ///   - 用户长按某条 AI 消息时,根据"这是第几条 AI 消息"找对应 checkpoint
+    ///
+    /// 为什么不用 @Published?
+    /// 现在 UI 不需要直接观察这个数组(没有"checkpoints 列表"页面),
+    /// 只在长按动作里用一下,private 即可。将来如果加"时光机面板"再升级。
+    private var forkableCheckpoints: [Checkpoint] = []
+
+    /// Time-travel 操作结果。ChatView 监听这个值在 toast / alert 里告诉用户。
+    /// nil = 没动作,String = 成功提示 / 错误提示。
+    @Published var forkResultMessage: String?
+
+    /// fork 成功后新建的 thread 的 id,iOS 端可以拿来跳转或显示在 toast。
+    /// 目前 UI 选择不直接跳转(让用户 dismiss 回列表自己点),
+    /// 字段保留是为了将来要做"分叉后自动跳过去"的扩展。
+    @Published var forkedNewThreadID: String?
+
     // 这个是网络层接口：
     //
     // View
@@ -263,6 +286,11 @@ final class ChatViewModel: ObservableObject {
         // defer：不管这个函数后面怎么结束，离开函数前都执行这段代码。
         defer {
             isSending = false
+            // Phase 9 #8 — 发完消息刷新一下 checkpoints 列表,
+            // 这样用户立刻长按新出的 AI 消息也能分叉。
+            // Task 包一下是因为 defer 块不支持 async,
+            // 起一个后台任务静默拉就行,不卡 UI。
+            Task { await loadCheckpoints() }
         }
 
         // 两个临时变量
@@ -511,7 +539,11 @@ final class ChatViewModel: ObservableObject {
         errorMessage = nil
         isSending = true
 
-        defer { isSending = false }
+        defer {
+            isSending = false
+            // Phase 9 #8 — resume 完一样刷新 checkpoints(新 AI 答案产生了新 checkpoint)
+            Task { await loadCheckpoints() }
+        }
 
         // 复用挂起前已经累积的文本 + 气泡 id
         // 这样 resume 后的新 delta 会接到**同一个气泡**上,
@@ -634,6 +666,108 @@ final class ChatViewModel: ObservableObject {
         } catch {
             errorMessage = error.localizedDescription
         }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 9 #8 — Time-travel(时光机)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 从后端拉一次 checkpoints 列表,缓存到 forkableCheckpoints。
+    ///
+    /// 时机:
+    ///   - ChatView 进入时(只有当 threadID 非 nil,新对话不需要)
+    ///   - 每次发完消息后(让"可分叉点"和最新消息同步)
+    ///
+    /// 失败处理:静默吞掉错误,只在 console 打一行。
+    /// Time-travel 是辅助功能,网络挂了不该让用户看到红色 banner —— 至多
+    /// 长按分叉时发现"找不到对应 checkpoint",到那时再提示。
+    func loadCheckpoints() async {
+        guard let threadID = currentThreadID else {
+            forkableCheckpoints = []
+            return
+        }
+
+        do {
+            let result = try await chatAPI.listCheckpoints(threadID: threadID)
+            forkableCheckpoints = result
+        } catch {
+            // Time-travel 是 nice-to-have,失败不影响主流程,只打日志
+            print("[Time-travel] loadCheckpoints failed: \(error.localizedDescription)")
+            forkableCheckpoints = []
+        }
+    }
+
+    /// 用户长按一条 AI 消息点了"分叉"。
+    ///
+    /// # 怎么找到对应的 checkpoint?
+    ///
+    /// iOS 端 messages 数组是顺序的,后端 forkableCheckpoints 也是按时间正序。
+    /// 两边都过滤掉了 ToolMessage / pending 工具中间态,
+    /// 所以"第 N 条 visible AI 消息" ↔ "第 N 个 checkpoint" 是 1-to-1 对应。
+    ///
+    /// 这里计算"被长按的 AI 消息是第几条 AI 消息"(0-indexed),
+    /// 拿那个 index 去 forkableCheckpoints 里找。
+    ///
+    /// # 防御性处理
+    ///
+    /// 极端情况下后端 checkpoint 数 < iOS 看到的 AI 消息数(网络延迟、
+    /// fork 路径上有过期数据等),会找不到对应 checkpoint。这种情况:
+    ///   - 在 forkResultMessage 里给一个提示
+    ///   - 调用方(ChatView)用 alert 展示
+    func forkFromMessage(messageID: UUID) async {
+        guard currentThreadID != nil else {
+            forkResultMessage = "当前对话还没保存,无法分叉。"
+            return
+        }
+        guard let threadID = currentThreadID else { return }
+
+        // 在 messages 数组里数:被长按的消息是第几条 AI 消息?
+        var aiMessageIndex = -1
+        var foundIndex = -1
+        for message in messages {
+            if message.role == .assistant {
+                aiMessageIndex += 1
+                if message.id == messageID {
+                    foundIndex = aiMessageIndex
+                    break
+                }
+            }
+        }
+
+        guard foundIndex >= 0 else {
+            forkResultMessage = "找不到这条 AI 消息,无法分叉。"
+            return
+        }
+
+        // 找到对应 checkpoint(可能数据还没刷新)。
+        // 第一次找不到就重拉一次再试,还找不到就提示用户稍后重试。
+        if foundIndex >= forkableCheckpoints.count {
+            await loadCheckpoints()
+        }
+        guard foundIndex < forkableCheckpoints.count else {
+            forkResultMessage = "可分叉时刻数据未同步,稍后再试。"
+            return
+        }
+
+        let checkpoint = forkableCheckpoints[foundIndex]
+
+        do {
+            let newThread = try await chatAPI.forkThread(
+                threadID: threadID,
+                checkpointID: checkpoint.checkpointID,
+                title: nil  // 让后端自动生成"分叉对话 · N 条消息"
+            )
+            forkedNewThreadID = newThread.id
+            forkResultMessage = "已分叉为新对话「\(newThread.title ?? newThread.id)」"
+        } catch {
+            forkResultMessage = "分叉失败:\(error.localizedDescription)"
+        }
+    }
+
+    /// 清空 fork 操作的提示和结果,通常在用户关掉 alert 后调用。
+    func clearForkResult() {
+        forkResultMessage = nil
+        forkedNewThreadID = nil
     }
 
     /// 清空聊天记录，保留一条欢迎语。

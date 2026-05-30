@@ -196,6 +196,32 @@ protocol ChatAPI {
         approved: Bool,
         editedArgs: [String: JSONValue]?
     ) throws -> AsyncThrowingStream<ChatStreamUpdate, Error>
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 9 #7-#8 — Time-travel(时光机)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 列出某个 thread 的所有"用户可分叉时刻"。
+    ///
+    /// 对应后端 GET /api/threads/:id/checkpoints。
+    /// 返回的 checkpoints 按时间正序(最早的在前面),长度等于 thread 中
+    /// "AI 说完完整回答"的次数 —— 也就是 iOS 端可见 AI 消息的条数。
+    ///
+    /// 调用时机:ChatView 出现时 .task 里调一次,把结果缓存到 VM。
+    /// 后续用户长按 AI 消息时,直接用"第 N 条 AI 消息" → 第 N 个 checkpoint。
+    func listCheckpoints(threadID: String) async throws -> [Checkpoint]
+
+    /// 从某个 checkpoint 分叉出一个新 thread。
+    ///
+    /// 对应后端 POST /api/threads/:id/fork。
+    /// title 可选;不传后端会自动生成默认标题("分叉对话 · N 条消息")。
+    ///
+    /// 返回新建 thread 的 summary,iOS 拿到 id 后用户可以选择跳转过去。
+    func forkThread(
+        threadID: String,
+        checkpointID: String,
+        title: String?
+    ) async throws -> ThreadSummary
 }
 
 /// iOS 调用 Node.js 后端时可能遇到的错误。
@@ -741,6 +767,51 @@ final class ChatAPIClient: ChatAPI {
          * performJSONRequest 会拿到一个空 Data,这里直接丢掉就行。
          */
         _ = try await performJSONRequest(method: "DELETE", path: "api/threads/\(encodedID)", body: nil)
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 9 #7-#8 — Time-travel(时光机)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 列 checkpoints。GET /api/threads/:id/checkpoints
+    func listCheckpoints(threadID: String) async throws -> [Checkpoint] {
+        let encodedID =
+            threadID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? threadID
+        let data = try await performJSONRequest(
+            method: "GET",
+            path: "api/threads/\(encodedID)/checkpoints",
+            body: nil
+        )
+        let response = try JSONDecoder().decode(CheckpointsResponse.self, from: data)
+        return response.checkpoints
+    }
+
+    /// 从 checkpoint 分叉。POST /api/threads/:id/fork
+    ///
+    /// 请求体:{ checkpoint_id: ..., title?: ... }
+    /// 后端返回新创建 thread 的 ThreadSummary。
+    func forkThread(
+        threadID: String,
+        checkpointID: String,
+        title: String?
+    ) async throws -> ThreadSummary {
+        let encodedID =
+            threadID.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? threadID
+
+        var bodyDict: [String: Any] = ["checkpoint_id": checkpointID]
+        if let title, !title.isEmpty {
+            bodyDict["title"] = title
+        }
+        let bodyData = try JSONSerialization.data(withJSONObject: bodyDict)
+
+        let data = try await performJSONRequest(
+            method: "POST",
+            path: "api/threads/\(encodedID)/fork",
+            body: bodyData
+        )
+
+        // ThreadSummary 有 ISO 8601 带毫秒的时间字段,用专用 decoder
+        return try ChatAPIClient.makeThreadDecoder().decode(ThreadSummary.self, from: data)
     }
 
     /// Phase 10.1 #4 — 提交用户反馈。POST /api/feedback

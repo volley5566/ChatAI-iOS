@@ -61,14 +61,21 @@ export type ThreadMessage = {
  *
  * 此时只在 Prisma threads 表里插一行——checkpointer 那边还没任何快照,
  * 等用户发第一条消息触发 /api/agent/stream 时,LangGraph 才会写第一条 checkpoint。
+ *
+ * Phase 9 #7 加了可选的 id 参数:
+ *   - 不传 → Prisma 自动生成 UUID(老行为)
+ *   - 传 → 用调用方指定的 id(Time-travel fork 时需要先在 LangGraph
+ *          那边算好新 thread_id,再用同一个 id 在 Prisma 这边建行)
  */
 export async function createThread(options: {
+  id?: string;
   title?: string;
 }): Promise<ThreadSummary> {
   const thread = await prisma.thread.create({
     data: {
+      ...(options.id ? { id: options.id } : {}),
       title: options.title?.trim() || null,
-      // id / createdAt / updatedAt 都让 Prisma 自动填(见 schema.prisma)
+      // id / createdAt / updatedAt 默认让 Prisma 自动填(见 schema.prisma)
     },
   });
 

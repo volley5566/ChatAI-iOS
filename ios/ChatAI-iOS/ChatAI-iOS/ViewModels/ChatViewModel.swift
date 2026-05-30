@@ -79,6 +79,44 @@ final class ChatViewModel: ObservableObject {
     /// @Published：这个变量一变化，就通知 SwiftUI 页面刷新。
     @Published var errorMessage: String?
 
+    /// Phase 9 #3 — HITL: 当前挂起的工具批准请求。
+    ///
+    /// 生命周期:
+    ///   - 收到 .toolPending 或 .done(pending: 非 nil) → 设上
+    ///   - 用户点[批准]/[拒绝] → resumeApproval(...) 把它清空,开始续跑
+    ///   - 续跑流到 done(pending: 非 nil) → 再次设上(模型连环挂起的情况)
+    ///
+    /// ChatView 用 .sheet(item:) 监听这个值:非 nil 时弹卡片,nil 时关闭。
+    /// Identifiable 让 sheet(item:) 能正确识别"新的 pending"——
+    /// 同一 thread 连续挂起两次时,sheet 会被重新弹出。
+    @Published var pendingApproval: PendingApproval?
+
+    /// Phase 9 #3 — 挂起期间记住对应的 assistant 消息 id。
+    ///
+    /// resume 续跑后,新的 SSE delta 应该追加到**同一条**气泡上,
+    /// 而不是新开一条。这个 id 在 sendMessage() 第一次挂起时记下,
+    /// resumeApproval() 时复用,直到 done(pending: nil) 才清掉。
+    private var suspendedMessageID: UUID?
+
+    /// Phase 9 #3 — 挂起期间累积的部分回答文本。
+    /// resume 后从这个值继续 += delta,避免 UI 上文本被截断。
+    private var suspendedStreamedAnswer: String = ""
+
+    /// Phase 9 #3 — 刚 resume 过的 tool_call_id,用来过滤"回声 tool_pending"。
+    ///
+    /// 为什么需要?
+    /// LangGraph 的 interrupt() 语义是:resume 时**节点函数从头重跑**,
+    /// interrupt 之前的代码(包括后端 onToolEvent 发出的 tool_pending SSE)
+    /// 会再次执行,iOS 端会收到同一个 tool_call_id 的第二条 tool_pending。
+    ///
+    /// 如果不去重,sheet 会被重新弹出 → 用户再点批准 → /resume 又发一次 →
+    /// 工具被执行两次。
+    ///
+    /// 解决:resolvePending 进入时记下当前的 tool_call_id,
+    /// 在 resume 流里收到的 tool_pending 如果 id 相同,就直接忽略。
+    /// resume 流结束(done with pending: nil)时清空,避免污染后续会话。
+    private var justResumedToolCallID: String?
+
     // 这个是网络层接口：
     //
     // View
@@ -326,7 +364,16 @@ final class ChatViewModel: ObservableObject {
                         )
                     }
 
-                case .done(let runID):
+                case .toolPending(let pending):
+                    // Phase 9 #3 — HITL: 工具调用挂起,等用户审批。
+                    // 1. 记下当前气泡 id 和已累积文本,resume 后续接
+                    // 2. 把 pending 暴露给 UI,触发 sheet 弹出
+                    // 后端会紧接着发 done 事件(pending 也会再带一份双保险)。
+                    suspendedMessageID = assistantMessageID
+                    suspendedStreamedAnswer = streamedAnswer
+                    pendingApproval = pending
+
+                case .done(let runID, let pending):
                     // Phase 10.1 #4 — 把 LangSmith 根 run id 写到这条 AI 消息上。
                     //
                     // runID 可能为 nil(后端没启用 LangSmith / 没拿到根 run id)——
@@ -335,13 +382,28 @@ final class ChatViewModel: ObservableObject {
                     if let runID, let assistantMessageID {
                         updateMessageRunId(id: assistantMessageID, runId: runID)
                     }
+
+                    // Phase 9 #3 — done.pending 是双保险:如果 tool_pending SSE
+                    // 由于网络抖动丢了,这里也能让 UI 知道挂起。
+                    // 已经设过就不重复设(避免 sheet 被同一个 id 重弹)。
+                    if let pending, pendingApproval?.toolCallID != pending.toolCallID {
+                        suspendedMessageID = assistantMessageID
+                        suspendedStreamedAnswer = streamedAnswer
+                        pendingApproval = pending
+                    }
                 }
             }
 
             // 如果后端正常结束，但没有任何文本片段，
             // 这通常表示模型返回异常或上游没有输出内容。
             // 这里复用已有 emptyAnswer 错误，给用户一个明确提示。
-            if streamedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty {
+            //
+            // Phase 9 #3 — HITL 挂起场景例外:模型可能直接 tool_call 不发任何 delta,
+            // 然后流就因为 interrupt 自然结束。pendingApproval 非 nil 说明
+            // 我们在等用户审批,**不是**模型异常,跳过这个检查。
+            if pendingApproval == nil
+                && streamedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+            {
                 throw ChatAPIError.emptyAnswer
             }
         } catch {
@@ -351,12 +413,127 @@ final class ChatViewModel: ObservableObject {
             //
             // 如果已经收到部分内容，则保留 partial answer，
             // 同时显示错误提示，方便用户知道回答中途断了。
-            if streamedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
+            //
+            // Phase 9 #3 — 挂起态下也保留空气泡:resume 续跑后会往里填内容,
+            // 如果这里移掉了,用户审批完会看到一条"凭空冒出来的"新气泡。
+            if pendingApproval == nil
+                && streamedAnswer.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty,
                let assistantMessageID {
                 messages.removeAll { $0.id == assistantMessageID }
             }
 
             // 出错时不崩溃，而是把错误显示在页面上。
+            errorMessage = error.localizedDescription
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 9 #3 — HITL Approve / Reject
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 用户在审批卡片上点[批准]。
+    /// editedArgs == nil 表示用原参数;非 nil 表示用编辑过的参数。
+    func approvePending(editedArgs: [String: JSONValue]? = nil) async {
+        await resolvePending(approved: true, editedArgs: editedArgs)
+    }
+
+    /// 用户在审批卡片上点[拒绝]。
+    /// 后端会把 "user denied" 包成 ToolMessage 给模型,让模型基于这个反馈改口。
+    func rejectPending() async {
+        await resolvePending(approved: false, editedArgs: nil)
+    }
+
+    /// 共用的 resume 实现 —— 批准 / 拒绝路径只差 approved 一个布尔值。
+    private func resolvePending(
+        approved: Bool,
+        editedArgs: [String: JSONValue]?
+    ) async {
+        // 防御:没有挂起态就不该走到这里(UI 已经把卡片关掉了)
+        guard let currentPending = pendingApproval,
+              let threadID = currentThreadID else {
+            return
+        }
+
+        // 记下"刚批准的 tool_call_id" — resume 流里再收到同 id 的 tool_pending
+        // 是后端 toolNode 重跑的回声,要忽略,否则 sheet 会重弹。
+        justResumedToolCallID = currentPending.toolCallID
+
+        // 立刻把 pendingApproval 清空,卡片消失,UI 进入"AI 正在回复"态
+        pendingApproval = nil
+        errorMessage = nil
+        isSending = true
+
+        defer { isSending = false }
+
+        // 复用挂起前已经累积的文本 + 气泡 id
+        var streamedAnswer = suspendedStreamedAnswer
+        let assistantMessageID = suspendedMessageID
+
+        do {
+            let stream = try chatAPI.resumeThread(
+                threadID: threadID,
+                approved: approved,
+                editedArgs: editedArgs
+            )
+
+            for try await update in stream {
+                switch update {
+                case .delta(let delta):
+                    streamedAnswer += delta
+                    if let assistantMessageID {
+                        updateMessageContent(id: assistantMessageID, content: streamedAnswer)
+                    }
+
+                case .toolStart(let toolUpdate):
+                    if let assistantMessageID {
+                        updateAgentToolStep(
+                            messageID: assistantMessageID,
+                            update: toolUpdate,
+                            status: .running
+                        )
+                    }
+
+                case .toolDone(let toolUpdate):
+                    if let assistantMessageID {
+                        updateAgentToolStep(
+                            messageID: assistantMessageID,
+                            update: toolUpdate,
+                            status: toolUpdate.ok == false ? .failed : .completed
+                        )
+                    }
+
+                case .toolPending(let pending):
+                    // 关键去重:resume 时后端 toolNode 会从头重跑,
+                    // interrupt 之前的代码(包括 onToolEvent)会再次执行,
+                    // iOS 会收到同一个 tool_call_id 的第二条 tool_pending。
+                    // 这是回声,不是真正的新挂起,直接忽略。
+                    if pending.toolCallID == justResumedToolCallID {
+                        break
+                    }
+                    // 真正的新挂起:模型批准了 A 工具,又决定调 B 工具(需审批)
+                    suspendedStreamedAnswer = streamedAnswer
+                    // suspendedMessageID 保持不变(还是同一个气泡)
+                    pendingApproval = pending
+
+                case .done(let runID, let pending):
+                    if let runID, let assistantMessageID {
+                        updateMessageRunId(id: assistantMessageID, runId: runID)
+                    }
+                    if let pending,
+                       pending.toolCallID != justResumedToolCallID,
+                       pendingApproval?.toolCallID != pending.toolCallID {
+                        // 真正的新挂起(同样要排除回声)
+                        suspendedStreamedAnswer = streamedAnswer
+                        pendingApproval = pending
+                    } else if pending == nil {
+                        // 真正结束了,清掉挂起痕迹和回声去重 id
+                        suspendedMessageID = nil
+                        suspendedStreamedAnswer = ""
+                        justResumedToolCallID = nil
+                    }
+                }
+            }
+        } catch {
             errorMessage = error.localizedDescription
         }
     }

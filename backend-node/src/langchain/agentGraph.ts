@@ -47,8 +47,9 @@ import {
   HumanMessage,
 } from "@langchain/core/messages";
 import type { ClientTool } from "@langchain/core/tools";
-import { END, START, StateGraph } from "@langchain/langgraph";
+import { Command, END, START, StateGraph } from "@langchain/langgraph";
 import { buildAgentInstructions } from "../chat/prompts";
+import type { ToolApprovalResponse } from "./agentGraphNodes";
 import {
   getDurationMs,
   logAgentError,
@@ -114,6 +115,16 @@ type RunLangGraphAgentStreamOptions = {
   systemPrompt: string | undefined;
   history: NormalizedChatHistoryItem[];
   /**
+   * HITL 续跑参数。
+   *
+   * 不传(undefined)→ 正常首跑:把 message + history 包成 initialMessages 喂图
+   * 传了        → 续跑:streamEvents 第一个参数改用 new Command({ resume })
+   *                  忽略 message / history(图自动从 checkpointer 加载上次的 state)
+   *
+   * 只在 threadId 路径下有意义(没有 checkpointer 无法恢复)。
+   */
+  resumePayload?: ToolApprovalResponse;
+  /**
    * 对话 ID。
    *
    * 传了 → 启用 checkpointer 持久化:
@@ -141,10 +152,18 @@ export async function runLangGraphAgentStream({
   systemPrompt,
   history,
   threadId,
+  resumePayload,
   onToolEvent,
   onDelta,
   shouldStop,
 }: RunLangGraphAgentStreamOptions): Promise<LangGraphAgentRunResult> {
+  // HITL 续跑必须有 threadId(没有 checkpointer 就没东西可恢复)
+  if (resumePayload && !threadId) {
+    throw new Error(
+      "HITL resume requires a thread_id (no checkpointer means no state to resume)."
+    );
+  }
+
   const startedAt = Date.now();
   let toolCallCount = 0;
   let outputText = "";
@@ -229,54 +248,68 @@ export async function runLangGraphAgentStream({
     //   - START 必须能到 END
     .compile({ checkpointer });
 
-  // ─── 第三步:构造初始 messages ──────────────────────────────
+  // ─── 第三步:构造 streamEvents 入参 + 调用 ────────────────────
   //
-  // 根据是否启用 checkpointer 分两种构造方式:
+  // 三种入参形态(按互斥优先级):
   //
-  // - 有 threadId(走 checkpointer):
-  //     state.messages 已经在数据库里,LangGraph 自动加载。
-  //     只塞新消息,messagesStateReducer 自动追加。
-  //     再传一遍 history 会和数据库里的重复!
+  // 1. resumePayload(HITL 续跑):
+  //      input = new Command({ resume: resumePayload })
+  //      图从挂起的 toolNode 继续跑,resumePayload 作为 interrupt() 的返回值
+  //      message / history 都被忽略(LangGraph 从 checkpoint 加载之前的 state)
   //
-  // - 无 threadId(无持久化):
-  //     state 从默认值 [] 开始,所以要把 history + 当前消息一起塞进去。
-  const initialMessages = threadId
-    ? [new HumanMessage(message)]
-    : buildInitialMessages(message, history);
+  // 2. 有 threadId(普通持久化首跑):
+  //      input = { messages: [new HumanMessage(message)] }
+  //      history 在 checkpointer 里,只追加当前消息
+  //
+  // 3. 无 threadId(无持久化):
+  //      input = { messages: [...history, new HumanMessage(message)] }
+  //      state 是空的,history 必须一起塞进去
+  //
+  // 为什么分两个 if 分支调 streamEvents 而不是构造统一的 graphInput 变量:
+  // TypeScript 在联合类型 `{messages} | Command` 上会挑错 streamEvents
+  // 重载(把它当成 v3 二进制流),所以分开调让类型推导走对路径。
+  //
+  // configurable.thread_id 是 LangGraph 的"特殊配置入口",
+  // 所有 checkpointer 都靠它隔离不同对话。
+  // metadata + tags 给 LangSmith trace 加业务标签(没接 LangSmith 也无影响)。
+  const streamConfig = {
+    version: "v2" as const,
+    recursionLimit: agentRecursionLimit,
+    configurable: threadId ? { thread_id: threadId } : undefined,
+    metadata: {
+      request_id: requestId,
+      thread_id: threadId ?? null,
+      route: resumePayload ? "/api/threads/:id/resume" : "/api/agent/stream",
+      runner: "langgraph-stategraph",
+      use_langgraph: true,
+      history_count: history.length,
+      hitl_resume: Boolean(resumePayload),
+    },
+    tags: [
+      "agent",
+      "phase-4",
+      threadId ? "persistent" : "stateless",
+      ...(resumePayload ? ["hitl-resume"] : []),
+    ],
+  };
+
+  const initialMessages = resumePayload
+    ? []
+    : threadId
+      ? [new HumanMessage(message)]
+      : buildInitialMessages(message, history);
 
   logAgentInfo(requestId, "langgraph_agent", "started", {
+    mode: resumePayload ? "resume" : "fresh",
     messageCount: initialMessages.length,
     toolCount: tools.length,
     recursionLimit: agentRecursionLimit,
     threadId: threadId ?? "(none, no persistence)",
   });
 
-  // ─── 第四步:streamEvents 跑图,边产边推 ─────────────────────
-  //
-  // configurable.thread_id 是 LangGraph 的"特殊配置入口",
-  // 所有 checkpointer 都靠它隔离不同对话。
-  //
-  // metadata + tags 是给 LangSmith trace 加的业务标签:
-  //   - metadata 在 trace 详情的 Metadata 区,可以按它过滤
-  //   - tags 在 LangSmith 网页可以快速筛选(如 phase-4 区分 Phase 3 路径)
-  // 没接 LangSmith 也不会出错,LangChain 会静默忽略。
-  const eventStream = graph.streamEvents(
-    { messages: initialMessages },
-    {
-      version: "v2",
-      recursionLimit: agentRecursionLimit,
-      configurable: threadId ? { thread_id: threadId } : undefined,
-      metadata: {
-        request_id: requestId,
-        thread_id: threadId ?? null,
-        route: "/api/agent/stream",
-        runner: "langgraph-stategraph",
-        use_langgraph: true,
-        history_count: history.length,
-      },
-      tags: ["agent", "phase-4", threadId ? "persistent" : "stateless"],
-    }
-  );
+  const eventStream = resumePayload
+    ? graph.streamEvents(new Command({ resume: resumePayload }), streamConfig)
+    : graph.streamEvents({ messages: initialMessages }, streamConfig);
 
   try {
     for await (const event of eventStream) {
@@ -419,6 +452,75 @@ export async function runLangGraphAgentStream({
     rootRunId,
     usage,
     pending,
+  };
+}
+
+// ─── HITL 查询接口 ────────────────────────────────────────────
+
+/**
+ * 查询某个 thread 当前是否有挂起的工具批准请求。
+ *
+ * 用法: GET /api/threads/:id/pending 路由调它,iOS 重连后通过这个接口
+ * 知道"有个工具调用还在等用户决策"。
+ *
+ * # 怎么读 checkpointer 里的挂起态
+ *
+ * graph.getState(config) 返回当前 thread 的 state snapshot,
+ * 里面有 `tasks` 数组:每个 task 代表"待执行/未完成的图任务"。
+ * 任务的 `interrupts` 字段就是 interrupt() 抛出的 payload 列表。
+ *
+ * # 为什么用 dummy graph
+ *
+ * getState 只读 state(channels),不执行任何节点 — 所以节点用空函数也行。
+ * 这样我们不需要加载 MCP tools / 拼 agentNode,极轻量。
+ * state schema 必须和真图一致(都用 AgentState),否则 LangGraph 反序列化
+ * 会报错。
+ *
+ * @returns 有挂起 → PendingToolApproval;没有 / thread 不存在 → null
+ */
+export async function getPendingApprovalForThread(
+  threadId: string
+): Promise<PendingToolApproval | null> {
+  const checkpointer = getSqliteCheckpointer();
+
+  // 最小图:节点函数不会被执行,所以用 no-op 就行。
+  // 关键点是**拓扑结构必须和真图一致**(节点名 agent/tools + 条件边),
+  // 否则:
+  //   1. LangGraph 编译期校验会拒绝(unreachable nodes)
+  //   2. checkpoint 里记录的 task 名字("tools")在这里找不到对应节点
+  // 节点函数体可以是空的,因为我们只调 getState,不调 invoke/stream。
+  const dummyGraph = new StateGraph(AgentState)
+    .addNode("agent", async () => ({}))
+    .addNode("tools", async () => ({}))
+    .addEdge(START, "agent")
+    .addConditionalEdges("agent", () => END, ["tools", END])
+    .addEdge("tools", "agent")
+    .compile({ checkpointer });
+
+  const snapshot = await dummyGraph.getState({
+    configurable: { thread_id: threadId },
+  });
+
+  // tasks 数组在"图刚 interrupt 还没 resume"时有内容;正常跑完后是空
+  const pendingInterrupt = snapshot.tasks
+    ?.flatMap((task) => task.interrupts ?? [])
+    .find((it) => it && typeof it.value === "object");
+
+  if (!pendingInterrupt) {
+    return null;
+  }
+
+  const approvalReq = pendingInterrupt.value as {
+    tool_call_id?: string;
+    tool_name?: string;
+    args?: Record<string, unknown>;
+  };
+
+  return {
+    tool_call_id: approvalReq.tool_call_id ?? "",
+    tool_name: approvalReq.tool_name ?? "",
+    display_name: getDisplayNameForTool(approvalReq.tool_name ?? ""),
+    args: approvalReq.args ?? {},
   };
 }
 

@@ -377,15 +377,31 @@ export function createToolNode(options: {
         });
 
         if (!decision.approved) {
-          // 用户拒绝:不调用工具,直接给模型一条 "user denied" 的 ToolMessage,
-          // 让模型基于这个反馈改口(通常会道歉并尝试用其他方式回答)。
+          // 用户拒绝:不调用工具,塞一条**强约束**的 ToolMessage 给模型。
+          //
+          // 早期版本只说"Please answer without using this tool"——
+          // 这给模型留了"那我自己手写一份吧"的空间。
+          // 比如用户拒绝 generateQuiz 后,模型会自己拼一份题目回答用户,
+          // 用户看到结果会困惑"我不是说不要了吗"。
+          //
+          // 现在的措辞要做到三点:
+          //   1. 明确说"用户拒绝了" + "你也不要自己做这件事"
+          //   2. 告诉模型"用户改主意了,问他想干嘛"
+          //   3. 用 status: "user_rejected" 这种结构化字段,
+          //      配合 prompts.ts 里的 agentOutputGuide 让模型稳定识别这种情况
           toolMessages.push(
             new ToolMessage({
               tool_call_id: toolCall.id || "",
               name: toolCall.name,
               content: JSON.stringify({
                 ok: false,
-                error: "User denied this tool call. Please answer without using this tool, or ask the user for clarification.",
+                status: "user_rejected",
+                error:
+                  "The user explicitly REJECTED this tool call. " +
+                  "DO NOT call this tool again. " +
+                  "DO NOT attempt to produce the equivalent output yourself (e.g., do NOT write quiz questions, evaluations, or recommendations manually). " +
+                  "Briefly acknowledge that you won't proceed with this action, and ask the user what they'd like to do instead. " +
+                  "Keep the response short (1-2 sentences).",
               }),
             })
           );

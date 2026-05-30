@@ -16,6 +16,7 @@ import type { ChatStreamEvent } from "../shared/types";
 import type { AgentStateType, AgentStateUpdate } from "./agentGraphState";
 import { createLangChainChatModel } from "./chatModel";
 import { messageContentToString } from "./chatPrompt";
+import { runEvaluateAnswerSubgraph } from "./subgraphs/evaluateAnswerGraph";
 
 // ─── HITL (Human-in-the-Loop) 区 ──────────────────────────────
 //
@@ -118,6 +119,107 @@ function getToolDisplayName(toolName: string): string {
     default:
       return toolName;
   }
+}
+
+// ─── HITL 共享 helper(toolNode 和 evaluateAnswerNode 都用)─────
+
+/**
+ * HITL 审批 helper —— 处理一个 tool_call 的"等用户决策"过程。
+ *
+ * Phase 9 #6 加这个 helper 的背景:
+ *   #1-#5 时 HITL 只在 toolNode 里;#6 引入了独立的 evaluateAnswerNode,
+ *   也需要 HITL,直接 copy-paste 会有两份 interrupt 逻辑很难维护。
+ *   抽出来后,两个节点都调这一个函数,行为一致。
+ *
+ * # 返回值含义
+ *
+ *   { kind: "skip" }           → 工具不在审核名单,直接走原路径执行
+ *   { kind: "approved", args } → 用户批准了,args 可能是编辑过的
+ *   { kind: "rejected", msg }  → 用户拒绝了,带一条 ToolMessage 让模型改口
+ *
+ * # interrupt() 抛错的传播
+ *
+ * 这个函数内部调 interrupt(),首跑会抛 GraphInterrupt。错误**不要**
+ * 在这里 try/catch,要让它自然向上传播,直到 LangGraph 运行时接住。
+ *
+ * 调用方(toolNode / evaluateAnswerNode)也不应该 try/catch 这个函数。
+ * 同样的,resume 重跑时整个函数会从头执行一次,SSE / 日志的副作用要心里有数。
+ */
+type ApprovalOutcome =
+  | { kind: "skip" }
+  | { kind: "approved"; args: Record<string, unknown> }
+  | { kind: "rejected"; deniedMessage: ToolMessage };
+
+function processHumanApproval(
+  toolCall: ToolCall,
+  requestId: string,
+  onToolEvent?: (event: ChatStreamEvent) => void
+): ApprovalOutcome {
+  // 不在审核名单 → 跳过整个 HITL 流程
+  if (!TOOLS_REQUIRING_APPROVAL.has(toolCall.name)) {
+    return { kind: "skip" };
+  }
+
+  const approvalRequest: ToolApprovalRequest = {
+    tool_call_id: toolCall.id || "",
+    tool_name: toolCall.name,
+    args: toolCall.args as Record<string, unknown>,
+  };
+
+  // 在 interrupt 之前发 SSE — iOS 端收到这个事件会弹审批卡片。
+  // 注意:resume 重跑时这一行**也会再执行一次**,iOS 端按 tool_call_id 去重。
+  onToolEvent?.({
+    type: "tool_pending",
+    tool_call_id: approvalRequest.tool_call_id,
+    tool_name: approvalRequest.tool_name,
+    display_name: getToolDisplayName(approvalRequest.tool_name),
+    args: approvalRequest.args,
+  });
+
+  logAgentInfo(requestId, "hitl", "tool_approval_requested", {
+    toolName: toolCall.name,
+    toolCallId: toolCall.id,
+  });
+
+  // ★ interrupt():首跑抛 GraphInterrupt → 图挂起 → 等 /resume
+  //   resume 重跑:直接返回 decision,代码继续往下走
+  const decision = interrupt<ToolApprovalRequest, ToolApprovalResponse>(
+    approvalRequest
+  );
+
+  // 走到这里说明已 resume
+  logAgentInfo(requestId, "hitl", "tool_approval_resolved", {
+    toolName: toolCall.name,
+    toolCallId: toolCall.id,
+    approved: decision.approved,
+    edited: Boolean(decision.edited_args),
+  });
+
+  if (!decision.approved) {
+    return {
+      kind: "rejected",
+      deniedMessage: new ToolMessage({
+        tool_call_id: toolCall.id || "",
+        name: toolCall.name,
+        content: JSON.stringify({
+          ok: false,
+          status: "user_rejected",
+          error:
+            "The user explicitly REJECTED this tool call. " +
+            "DO NOT call this tool again. " +
+            "DO NOT attempt to produce the equivalent output yourself (e.g., do NOT write quiz questions, evaluations, or recommendations manually). " +
+            "Briefly acknowledge that you won't proceed with this action, and ask the user what they'd like to do instead. " +
+            "Keep the response short (1-2 sentences).",
+        }),
+      }),
+    };
+  }
+
+  // 用户批准:如果传了编辑过的参数就用编辑版,否则用原参数
+  return {
+    kind: "approved",
+    args: decision.edited_args ?? approvalRequest.args,
+  };
 }
 
 /**
@@ -379,124 +481,33 @@ export function createToolNode(options: {
       }
 
       /**
-       * # HITL: 如果是审核名单里的工具,先 interrupt() 等用户批准。
+       * # HITL 审批 — 抽到 processHumanApproval helper
        *
-       * ## interrupt() 的语义(LangGraph 1.x 的怪异之处)
+       * helper 内部 if (TOOLS_REQUIRING_APPROVAL) → interrupt()。
+       * 不在审核名单的工具 helper 返回 { kind: "skip" },行为完全不变。
        *
-       *   第一次跑到 interrupt(payload):
-       *      抛 GraphInterrupt(payload) → 图挂起 → state 进 checkpointer
-       *      streamEvents 自然结束,server 知道"我在等审批"
+       * ⚠️ 不要把这一行包进 try/catch — helper 里的 interrupt() 抛的
+       *    GraphInterrupt 必须冒到 LangGraph 运行时,被 try/catch 接住
+       *    就没法挂起了。
        *
-       *   外部用 Command(resume=decision) 续跑:
-       *      LangGraph **从节点头部重新执行**这个函数
-      *      interrupt() 这次不抛错,**同步返回 decision**
-       *
-       * ## "重跑两次"的视觉化
-       *
-       *      首跑:                       resume 重跑:
-       *      ─────────────                ─────────────
-       *      enter toolNode               enter toolNode
-       *      ...loop pre-work             ...loop pre-work    ← 重复执行!
-       *      onToolEvent(tool_pending)    onToolEvent(tool_pending) ← SSE 又发一次
-       *      logAgentInfo("requested")    logAgentInfo("requested") ← 日志又记一次
-       *      interrupt() → ★抛错挂起      interrupt() → ★直接返回 decision
-       *      (永远不会跑到这里)            ↓
-       *                                    if (!decision.approved) ...
-       *                                    tool.invoke(...) → 工具真执行
-       *
-       * ## 重跑带来的麻烦
-       *
-       *   ⚠️  tool_pending SSE 在 resume 时**会被发第二次**,iOS 端按
-       *       tool_call_id 去重,见 ChatViewModel.justResumedToolCallID。
-       *
-       *   ⚠️  logAgentInfo("tool_approval_requested") 在 resume 时也会再写一条,
-       *       看后端日志会"莫名其妙多一行",不是 bug,是 LangGraph 设计如此。
-       *
-       *   ⚠️  pre-work 不能有副作用(写数据库、发邮件等),否则会执行两次。
-       *       这里 pre-work 只发 SSE 和写日志,SSE 已经做了 iOS 端去重,日志多一条无所谓。
-       *
-       * ## 为什么 LangGraph 这么设计
-       *
-       *   它没办法存"代码跑到第几行" — 那需要保存 JavaScript 调用栈快照。
-       *   它只能存 state(数据)。所以 resume 时必须从函数头部重跑,
-       *   靠 interrupt() 直接返回 resume 值来"快进"到挂起前的位置。
-       *
-       * 不在审核名单的工具直接跳过整个 if,走原路径,行为完全不变。
+       * 关于 "interrupt 重跑两次" 的语义,详见 processHumanApproval 的注释。
        */
+      const approval = processHumanApproval(
+        toolCall,
+        options.requestId,
+        options.onToolEvent
+      );
+
       let toolCallArgs = toolCall.args as Record<string, unknown>;
 
-      if (TOOLS_REQUIRING_APPROVAL.has(toolCall.name)) {
-        const approvalRequest: ToolApprovalRequest = {
-          tool_call_id: toolCall.id || "",
-          tool_name: toolCall.name,
-          args: toolCallArgs,
-        };
-
-        // 在 interrupt 之前发 SSE 通知 iOS。
-        // 不要把这行包进 try/catch — interrupt 抛的 GraphInterrupt 必须冒出去。
-        options.onToolEvent?.({
-          type: "tool_pending",
-          tool_call_id: approvalRequest.tool_call_id,
-          tool_name: approvalRequest.tool_name,
-          display_name: getToolDisplayName(approvalRequest.tool_name),
-          args: approvalRequest.args,
-        });
-
-        logAgentInfo(options.requestId, "hitl", "tool_approval_requested", {
-          toolName: toolCall.name,
-          toolCallId: toolCall.id,
-        });
-
-        // 关键:interrupt() 抛错 → 图挂起 → 等 /resume 接口续跑
-        const decision = interrupt<ToolApprovalRequest, ToolApprovalResponse>(
-          approvalRequest
-        );
-
-        // 走到这里说明已经 resume,decision 是 iOS 提交的批准/拒绝决定
-        logAgentInfo(options.requestId, "hitl", "tool_approval_resolved", {
-          toolName: toolCall.name,
-          toolCallId: toolCall.id,
-          approved: decision.approved,
-          edited: Boolean(decision.edited_args),
-        });
-
-        if (!decision.approved) {
-          // 用户拒绝:不调用工具,塞一条**强约束**的 ToolMessage 给模型。
-          //
-          // 早期版本只说"Please answer without using this tool"——
-          // 这给模型留了"那我自己手写一份吧"的空间。
-          // 比如用户拒绝 generateQuiz 后,模型会自己拼一份题目回答用户,
-          // 用户看到结果会困惑"我不是说不要了吗"。
-          //
-          // 现在的措辞要做到三点:
-          //   1. 明确说"用户拒绝了" + "你也不要自己做这件事"
-          //   2. 告诉模型"用户改主意了,问他想干嘛"
-          //   3. 用 status: "user_rejected" 这种结构化字段,
-          //      配合 prompts.ts 里的 agentOutputGuide 让模型稳定识别这种情况
-          toolMessages.push(
-            new ToolMessage({
-              tool_call_id: toolCall.id || "",
-              name: toolCall.name,
-              content: JSON.stringify({
-                ok: false,
-                status: "user_rejected",
-                error:
-                  "The user explicitly REJECTED this tool call. " +
-                  "DO NOT call this tool again. " +
-                  "DO NOT attempt to produce the equivalent output yourself (e.g., do NOT write quiz questions, evaluations, or recommendations manually). " +
-                  "Briefly acknowledge that you won't proceed with this action, and ask the user what they'd like to do instead. " +
-                  "Keep the response short (1-2 sentences).",
-              }),
-            })
-          );
-          continue;
-        }
-
-        // 用户批准:如果传了编辑过的参数,用编辑版;否则用原参数
-        if (decision.edited_args) {
-          toolCallArgs = decision.edited_args;
-        }
+      if (approval.kind === "rejected") {
+        toolMessages.push(approval.deniedMessage);
+        continue;
       }
+      if (approval.kind === "approved") {
+        toolCallArgs = approval.args;
+      }
+      // approval.kind === "skip" 时,沿用原 toolCall.args,直接往下跑
 
       /**
        * 调用 LangChain Tool。
@@ -540,6 +551,209 @@ export function createToolNode(options: {
   };
 }
 
+// ─── 子图节点:evaluateAnswerNode ─────────────────────────────
+
+/**
+ * 创建 evaluateAnswerNode 工厂函数(Phase 9 #6 新增)。
+ *
+ * # 这个节点干什么
+ *
+ * 当模型 tool_call: evaluateAnswer 时,**主图直接路由到这个节点**,
+ * 跳过原本的 MCP 路径(LangChain Tool wrapper → MCP client → MCP server →
+ * mcpToolHandlers → 子图)。这个节点内部:
+ *
+ *   1. 找到 AIMessage 里 name=evaluateAnswer 的 tool_call
+ *   2. 走 HITL 审批(和 toolNode 共用 processHumanApproval helper)
+ *   3. 直接 invoke 子图:runEvaluateAnswerSubgraph(args)
+ *   4. 把子图返回的 evaluation 包成 ToolMessage,加入主图 state
+ *
+ * # 为什么这样设计
+ *
+ * #5 时子图是"被 MCP 工具调用",绕一大圈才能到 — MCP 那一层增加 RPC 跳数
+ * 和序列化开销。对于本来就跑在同进程的子图,完全可以直接 invoke。
+ *
+ * 这个节点演示了 LangGraph 的一个重要 pattern: **subgraph as graph node**。
+ * 主图把子图当成一个普通节点用,子图自己有独立 state schema,通过这个 adapter
+ * 节点完成"主图 state ↔ 子图 state"的转换。
+ *
+ * # 和 toolNode 的关系
+ *
+ *   shouldContinue 看 AI 消息的 tool_calls:
+ *     ├─ 第一个 tool_call 是 evaluateAnswer    → 路由到这个节点
+ *     ├─ 其它工具(searchKnowledge / generateQuiz / recommendNextTopic) → 路由到 toolNode
+ *     └─ 没有 tool_calls                       → 路由到 END
+ *
+ *   两个节点都把结果包成 ToolMessage 加进 state.messages,
+ *   模型从 messages 看不出"这条 ToolMessage 是从哪个节点来的",
+ *   ReAct 循环逻辑保持一致。
+ *
+ * # state 隔离
+ *
+ *   子图的 state schema (EvaluateAnswerState) 和主图 (AgentState) 完全独立。
+ *   子图运行时**不会**也**没法**写主图的 messages / modelCallCount / toolCallCount。
+ *   主图通过这个节点显式把"子图返回值 → ToolMessage"翻译过去,
+ *   保证 state 边界清晰。
+ */
+export function createEvaluateAnswerNode(options: {
+  requestId: string;
+  onToolEvent?: (event: ChatStreamEvent) => void;
+}) {
+  return async function evaluateAnswerNode(
+    state: AgentStateType
+  ): Promise<AgentStateUpdate> {
+    // 1. 找到上一条 AIMessage
+    let lastAiMessage: AIMessage | undefined;
+    for (let i = state.messages.length - 1; i >= 0; i -= 1) {
+      const message = state.messages[i];
+      if (isAIMessage(message)) {
+        lastAiMessage = message;
+        break;
+      }
+    }
+
+    if (!lastAiMessage || !lastAiMessage.tool_calls?.length) {
+      return {};
+    }
+
+    // 2. 找到 name=evaluateAnswer 的 tool_call
+    //    用 find 而不是 filter 是因为 disableParallelToolCalls=true,一轮里
+    //    最多一个 evaluateAnswer 调用。即使万一并发,也只处理第一个。
+    const evaluateCall = lastAiMessage.tool_calls.find(
+      (tc) => tc.name === "evaluateAnswer"
+    );
+
+    if (!evaluateCall) {
+      // shouldContinue 配错了才会进到这里 — 防御性返回空更新
+      return {};
+    }
+
+    const toolMessages: ToolMessage[] = [];
+
+    // 3. HITL 审批(和 toolNode 共用 helper)
+    const approval = processHumanApproval(
+      evaluateCall,
+      options.requestId,
+      options.onToolEvent
+    );
+
+    if (approval.kind === "rejected") {
+      // 用户拒绝 → 同样塞 "user_rejected" ToolMessage 给模型,行为和 toolNode 一致
+      toolMessages.push(approval.deniedMessage);
+      return {
+        messages: toolMessages,
+        toolCallCount: 1,
+      };
+    }
+
+    // approval.kind 是 "approved" 或 "skip" (evaluateAnswer 在审核名单里所以
+    // 实际上不会出现 skip,但写完整保险)
+    const finalArgs =
+      approval.kind === "approved"
+        ? approval.args
+        : (evaluateCall.args as Record<string, unknown>);
+
+    // 4. 发 tool_start SSE(toolNode 路径里这一步由 LangChain Tool wrapper 做,
+    //    我们这里直连子图,wrapper 不参与,所以要自己发)
+    options.onToolEvent?.({
+      type: "tool_start",
+      tool_call_id: evaluateCall.id || "",
+      tool_name: evaluateCall.name,
+      display_name: getToolDisplayName(evaluateCall.name),
+      message: `正在${getToolDisplayName(evaluateCall.name)}`,
+    });
+
+    logAgentInfo(options.requestId, "tool_execution", "started", {
+      runId: evaluateCall.id,
+      toolName: evaluateCall.name,
+      source: "evaluateAnswerNode",
+    });
+
+    const startedAt = Date.now();
+    let resultMessage: ToolMessage;
+    let resultOk = true;
+    let resultSummary = "已批改答题";
+
+    try {
+      // 5. ★ 直接 invoke 子图 ★
+      //    这是这个节点的核心 — 不走 MCP,直接调子图的对外入口函数。
+      //    runEvaluateAnswerSubgraph 内部会编译图(已缓存)+ invoke,
+      //    返回 EvaluateAnswerOutput。
+      const evaluation = await runEvaluateAnswerSubgraph({
+        question: typeof finalArgs.question === "string" ? finalArgs.question : "",
+        userAnswer:
+          typeof finalArgs.userAnswer === "string" ? finalArgs.userAnswer : "",
+        topic: typeof finalArgs.topic === "string" ? finalArgs.topic : undefined,
+        expectedConcepts: Array.isArray(finalArgs.expectedConcepts)
+          ? (finalArgs.expectedConcepts as string[])
+          : undefined,
+      });
+
+      // 6. 包成 ToolMessage,格式和 toolNode 走 MCP 时一致
+      //    (上层模型看到的 ToolMessage 长得跟 MCP 路径一模一样)
+      resultMessage = new ToolMessage({
+        tool_call_id: evaluateCall.id || "",
+        name: evaluateCall.name,
+        content: JSON.stringify({
+          toolName: "evaluateAnswer",
+          ok: true,
+          result: {
+            question: finalArgs.question,
+            topic: finalArgs.topic,
+            ...evaluation,
+          },
+        }),
+      });
+
+      if (typeof evaluation.score === "number") {
+        resultSummary = `已批改:${evaluation.scoreLabel} (${evaluation.score}/3)`;
+      }
+    } catch (error) {
+      // 子图执行失败(LLM 超时 / 网络挂)→ 包成 ok=false 给模型
+      resultOk = false;
+      resultSummary = "批改失败,模型暂时不可用";
+      resultMessage = new ToolMessage({
+        tool_call_id: evaluateCall.id || "",
+        name: evaluateCall.name,
+        content: JSON.stringify({
+          toolName: "evaluateAnswer",
+          ok: false,
+          error: `Evaluation subgraph failed: ${
+            error instanceof Error ? error.message : String(error)
+          }`,
+        }),
+      });
+    }
+
+    // 7. 发 tool_done SSE + 写日志
+    const durationMs = Date.now() - startedAt;
+    options.onToolEvent?.({
+      type: "tool_done",
+      tool_call_id: evaluateCall.id || "",
+      tool_name: evaluateCall.name,
+      display_name: getToolDisplayName(evaluateCall.name),
+      ok: resultOk,
+      message: resultSummary,
+    });
+
+    logAgentInfo(options.requestId, "tool_execution", "completed", {
+      runId: evaluateCall.id,
+      toolName: evaluateCall.name,
+      source: "evaluateAnswerNode",
+      durationMs,
+      ok: resultOk,
+    });
+
+    toolMessages.push(resultMessage);
+
+    return {
+      messages: toolMessages,
+      toolCallCount: 1,
+    };
+  };
+}
+
+// ─── 条件边 shouldContinue ────────────────────────────────────
+
 /**
  * 条件边函数 shouldContinue。
  *
@@ -548,29 +762,42 @@ export function createToolNode(options: {
  * 在 agentGraph.ts 里图的连法是:
  *
  *   START → agentNode → (条件)
- *                         ├─── "tools" → toolNode → agentNode (回头)
+ *                         ├─── "evaluateAnswer" → 子图直连 → agentNode (回头)
+ *                         ├─── "tools"          → toolNode  → agentNode (回头)
  *                         └─── END
  *
- * 条件边的判断逻辑就是这个函数:**看 agentNode 刚产生的 AIMessage 有没有 tool_calls**。
- * 有就去 toolNode 执行工具,没有就结束图。
- *
+ * 这个函数看 agentNode 刚产生的 AIMessage:
+ *   - 有 tool_call.name === "evaluateAnswer" → 路由到 evaluateAnswerNode(直接走子图)
+ *   - 有其它 tool_calls                      → 路由到 toolNode(走 MCP)
+ *   - 没 tool_calls                          → END
  *
  * # 等价物
  *
  * LangGraph 预设里有 `toolsCondition`(在 prebuilt/tool_node.ts),
- * 实现几乎一模一样。我们手写是为了你能亲眼看到这个判断有多简单——
- * 这就是 ReAct 循环里"该停了吗?"的整个判断逻辑。
+ * 实现是"有 tool_calls → tools / 无 → END"的简单版。
+ * 我们手写并扩展成"按 tool name 分流",展示条件边的实际灵活性。
+ *
+ * # 为什么 evaluateAnswer 单挑出来
+ *
+ * 它是项目里唯一被重构成"子图"的工具。其它 3 个工具(searchKnowledge /
+ * generateQuiz / recommendNextTopic)还是走 MCP 路径,因为:
+ *   - searchKnowledge 是纯本地 RAG,简单一步搞定,没必要拆子图
+ *   - generateQuiz / recommendNextTopic 内部也是单 LLM 调用,
+ *     拆子图的收益(可测试性)边际很低
+ *
+ * 把 evaluateAnswer 拆成子图最值得是因为它的 3 步(prepareContext / grade /
+ * validate)各自独立,有清晰的"prompt 构造 → LLM 调用 → 结果解析"边界。
  */
-export function shouldContinue(state: AgentStateType): "tools" | typeof END {
+export function shouldContinue(
+  state: AgentStateType
+): "tools" | "evaluateAnswer" | typeof END {
   const messages = state.messages;
   const lastMessage = messages[messages.length - 1];
 
-  /**
-   * 三种情况返回 END:
-   * 1. 没有任何消息(理论上不会,起码有用户消息)
-   * 2. 最后一条不是 AIMessage(说明 agent 还没决策,逻辑错乱)
-   * 3. AIMessage 没有 tool_calls(模型决定直接回答,不调工具)
-   */
+  // 三种情况返回 END:
+  //   1. 没有任何消息(理论上不会,起码有用户消息)
+  //   2. 最后一条不是 AIMessage(agent 还没决策,逻辑错乱)
+  //   3. AIMessage 没有 tool_calls(模型决定直接回答)
   if (!lastMessage || !isAIMessage(lastMessage)) {
     return END;
   }
@@ -581,10 +808,13 @@ export function shouldContinue(state: AgentStateType): "tools" | typeof END {
     return END;
   }
 
-  /**
-   * 有 tool_calls,说明模型要调工具,路由到 "tools" 节点。
-   * "tools" 是我们在 agentGraph.ts 里给 toolNode 起的名字。
-   */
+  // evaluateAnswer 单独路由到子图节点
+  // (disableParallelToolCalls=true 保证一轮只有一个 tool_call,所以 some 等价于 only)
+  if (toolCalls.some((tc) => tc.name === "evaluateAnswer")) {
+    return "evaluateAnswer";
+  }
+
+  // 其它工具走 toolNode(MCP 路径)
   return "tools";
 }
 

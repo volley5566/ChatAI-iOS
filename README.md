@@ -233,8 +233,11 @@ sequenceDiagram
 | Phase 6 | Ollama 真实 Embedding + 向量缓存 | `langchain/embeddings.ts` `langchain/ragCache.ts` |
 | Phase 7 | 工具集扩展到 4 个（LLM-as-judge + 学习规划） | `mcp/mcpToolHandlers.ts` |
 | Phase 10 | 生产化：LangSmith trace + Eval + CI/CD + 安全加固 + Docker | `langsmithClient.ts` `evals/` `Dockerfile` |
+| Phase 9 (进行中) | 高级 LangGraph：HITL 人工审核 ✅ + Subgraph 子图 ✅ + Time-travel ⏳ | `agentGraphNodes.ts` `subgraphs/evaluateAnswerGraph.ts` |
 
-Phase 3 和 Phase 4 通过 `USE_LANGGRAPH` 环境变量灰度切换，行为完全等价。
+Phase 3 和 Phase 4 通过 `USE_LANGGRAPH` 环境变量灰度切换,行为完全等价。
+**注意 Phase 9 (HITL + Subgraph) 只在 USE_LANGGRAPH=true 路径生效**——
+createAgent 路径不接 checkpointer,无法挂起也无法续跑。
 
 ---
 
@@ -1187,11 +1190,269 @@ docker compose logs -f        # 看日志
 
 ---
 
-## 11. 后续规划
+## 11. HITL — 人工审核(Phase 9 #1-#3)
+
+HITL 全称 **Human-in-the-Loop**,核心一句话:**"AI 想用某个工具之前,先暂停问用户同不同意。"**
+
+### 11.1 解决什么问题
 
 ```text
-Phase 9   高级 LangGraph（HITL 人工审核 + Subgraph 子图 + Time-travel 时光机）
-Phase 8   Multi-Agent 协作（Router + 子 Agent）
+没有 HITL:
+  用户问"出 3 道题" → Agent 直接调 generateQuiz → 烧掉 token、几秒等待 → 出题
+  用户问"评估我的答案" → Agent 直接调 evaluateAnswer → 又烧 token → 出评分
+
+  问题:这 3 个 LLM-as-tool 都有真实成本 + 输出会影响用户(评分有主观性 / 推荐影响学习路径)。
+       用户没有任何"喊停"的机会。
+
+有了 HITL:
+  Agent 决定调 generateQuiz → 暂停 → iOS 弹审批卡片(显示参数)
+                                    ├ 用户点[批准] → 工具执行
+                                    ├ 用户点[拒绝] → AI 道歉并问"想干啥"
+                                    └ (将来支持)编辑参数后批准
 ```
 
-推荐推进顺序: **先做 Phase 9 HITL**（给后续多 Agent 加安全带），再做 Phase 8 多 Agent。
+**审核名单**(`agentGraphNodes.ts:TOOLS_REQUIRING_APPROVAL`):
+- ✅ `generateQuiz` / `evaluateAnswer` / `recommendNextTopic`(LLM-as-tool,有成本)
+- ❌ `searchKnowledge`(纯本地 RAG,无成本不审)
+
+### 11.2 LangGraph `interrupt()` 的"魔法"
+
+HITL 靠 LangGraph 的 `interrupt()` 原语实现。它的语义有点反直觉:
+
+```text
+首跑 toolNode 跑到 interrupt(approvalRequest):
+  抛 GraphInterrupt 异常 → 整张图挂起 → state 写进 SQLite checkpointer
+  streamEvents 自然结束 → server 知道"我在等审批"
+
+外部用 Command(resume=decision) 续跑:
+  LangGraph **从节点头部重新执行整个函数**
+  interrupt() 这次不抛错,**直接同步返回 decision**
+
+⚠️ "重跑两次"的坑:
+  interrupt 之前的代码(发 SSE / 写日志)会**执行两次**,
+  iOS 端要按 tool_call_id 去重(见 ChatViewModel.justResumedToolCallID)。
+```
+
+为什么 LangGraph 这么设计?**它没法保存 JavaScript 调用栈快照**,只能存 state。所以 resume 时必须从函数头部重跑,靠 interrupt() 直接返回值来"快进"。
+
+### 11.3 完整时序图
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant iOS
+    participant Exp as Express
+    participant G as StateGraph
+    participant Ck as SqliteSaver
+    participant T as toolNode
+
+    iOS->>Exp: POST /api/agent/stream
+    Exp->>G: streamEvents(message)
+    G->>G: agentNode 决定 tool_call:generateQuiz
+    G->>T: 路由到 toolNode
+
+    rect rgba(255,200,100,0.25)
+    note over T,Ck: HITL 挂起
+    T->>iOS: SSE tool_pending(args)
+    T->>T: interrupt(approvalRequest) → ★抛异常
+    G->>Ck: state 写进 SQLite
+    G-->>Exp: stream 结束
+    Exp-->>iOS: SSE done(pending: {...})
+    iOS->>iOS: 展示审批卡片
+    end
+
+    iOS->>Exp: POST /api/threads/:id/resume<br/>{approved: true}
+    Exp->>G: streamEvents(Command({resume: ...}))
+    G->>Ck: 加载挂起的 state
+    G->>T: 从 toolNode 头部重跑
+
+    rect rgba(180,255,180,0.25)
+    note over T: resume 重跑
+    T->>iOS: SSE tool_pending(回声) ← iOS 按 toolCallID 去重忽略
+    T->>T: interrupt() 直接返回 decision
+    T->>T: tool.invoke(args) 工具真执行
+    end
+
+    G->>G: 模型基于结果继续生成
+    G-->>Exp: SSE delta...
+    Exp-->>iOS: SSE delta + done(pending: nil)
+```
+
+### 11.4 HTTP 接口
+
+| Endpoint | 用途 |
+|---|---|
+| `GET /api/threads/:id/pending` | 查 thread 当前是不是在等审批(iOS 重新打开 app 时用) |
+| `POST /api/threads/:id/resume` | 提交 `{approved: bool, edited_args?: ...}`,SSE 流式响应 |
+
+### 11.5 iOS 端要点
+
+```text
+ChatViewModel:
+  @Published pendingApproval: PendingApproval?    ← SwiftUI .sheet(item:) 监听它弹卡片
+  suspendedMessageID + suspendedStreamedAnswer    ← 挂起期间保留气泡,resume 后接着填
+  justResumedToolCallID                            ← 防"重跑回声"的疫苗字段
+
+JSONValue (Models/PendingApproval.swift):
+  自己写的 Codable enum(string/number/bool/null/array/object),
+  用来接收任意 shape 的 args (Swift Codable 默认不支持 [String: Any])
+```
+
+### 11.6 手动验证
+
+```bash
+# 1. 启 backend(USE_LANGGRAPH=true 默认)
+cd backend-node && npm run dev
+
+# 2. 建 thread + 发"出题"请求
+THREAD_ID=$(curl -s -X POST http://127.0.0.1:8000/api/threads \
+  -H "Content-Type: application/json" -d '{}' | jq -r .id)
+
+curl -N -X POST http://127.0.0.1:8000/api/agent/stream \
+  -H "Content-Type: application/json" \
+  -d "{\"message\":\"出 3 道 SwiftUI @State 的练习题\",\"thread_id\":\"$THREAD_ID\"}"
+# 预期: SSE 收到 tool_pending + done(pending: {...})
+
+# 3. 查挂起状态
+curl http://127.0.0.1:8000/api/threads/$THREAD_ID/pending | jq
+
+# 4a. 批准 → 题目流式输出
+curl -N -X POST http://127.0.0.1:8000/api/threads/$THREAD_ID/resume \
+  -H "Content-Type: application/json" -d '{"approved":true}'
+
+# 4b. 或拒绝 → AI 道歉并问想干啥(不会自己手写题目)
+curl -N -X POST http://127.0.0.1:8000/api/threads/$THREAD_ID/resume \
+  -H "Content-Type: application/json" -d '{"approved":false}'
+```
+
+关键文件:
+- `langchain/agentGraphNodes.ts`(`processHumanApproval` helper + interrupt 调用)
+- `langchain/agentGraph.ts`(`getPendingApprovalForThread` 查 checkpointer 用 dummy graph 的技巧)
+- `server.ts`(`/api/threads/:id/pending` 和 `/resume` 两个路由)
+- `ChatViewModel.swift`(`pendingApproval` 状态机 + 回声去重)
+- `ToolApprovalCard.swift`(SwiftUI 卡片 UI)
+
+---
+
+## 12. Subgraph — 子图(Phase 9 #5-#6)
+
+**核心一句话**:把复杂工具的内部流程,从"一坨大函数"重构成"一张可视化的小图",再让主图把这张小图当成普通节点用。
+
+### 12.1 用银行办事打比方
+
+```text
+#5 之前的"评估答案"流程(走柜台):
+  主 Agent
+    ↓
+  LangChain Tool wrapper       ← 大堂经理
+    ↓
+  MCP client                    ← 取号机
+    ↓
+  stdio 跨进程通信               ← 跨部门快递员
+    ↓
+  MCP server                    ← 后台柜台
+    ↓
+  mcpToolHandlers.runEvaluateAnswerTool  ← 业务办理员
+    ↓
+  一段 80 行的大函数:          ← 实际干活
+    构造 prompt → 调 LLM → 解析 JSON → 兜底
+
+  6 道手才到干活的地方。还不可单元测试,加阶段要重写整段。
+
+#6 之后(开通 VIP 直通车 + 把大函数拆成 3 个步骤):
+  主 Agent
+    ↓
+  shouldContinue 看到 "evaluateAnswer" → 路由到 VIP 通道
+    ↓
+  evaluateAnswerNode                                ← 一个适配节点
+    └─→ runEvaluateAnswerSubgraph(args)            ← 1 行代码调子图
+          ↓
+        子图 (langchain/subgraphs/evaluateAnswerGraph.ts):
+          START
+            ↓
+          prepareContext       ← 构造 prompt(纯逻辑,可单测)
+            ↓
+          gradeWithLLM         ← 唯一调 LLM 的节点
+            ↓
+          validateAndNormalize ← 解析 + 兜底(纯逻辑,可单测)
+            ↓
+           END
+```
+
+### 12.2 这两步分别学到什么
+
+**#5 — 把工具拆成子图:**
+- 子图有**自己的 state schema**(`EvaluateAnswerState`,7 个 channel,和主图 `AgentState` 完全独立)
+- 每个节点只关心自己的输入和输出,用 state 通道传数据
+- 纯逻辑节点(prepareContext / validateAndNormalize)可以**单独单测**,不依赖模型
+- 暴露 `runEvaluateAnswerSubgraph(args)` 函数,调用方完全不知道里面是图
+
+**#6 — 主图直接用子图:**
+- `shouldContinue` 升级成"按 tool name 多向路由"(`"tools"` / `"evaluateAnswer"` / `END`)
+- 新建 `evaluateAnswerNode` 作为 **adapter 节点** — 主图 state ↔ 子图 state 的翻译层
+- HITL `processHumanApproval` 抽成共享 helper,两个节点(toolNode 和 evaluateAnswerNode)都能用
+- 其它 3 个工具仍走原 MCP 路径,**两条路径并存**
+
+### 12.3 主图最终形态
+
+```mermaid
+flowchart TD
+    START([START])
+    AGENT[agent<br/>模型推理]
+    TOOLS[tools<br/>走 MCP 路径]
+    EVAL[evaluateAnswer<br/>★ 直连子图 ★]
+    SUB[(evaluateAnswerSubgraph<br/>prepareContext → gradeWithLLM<br/>→ validateAndNormalize)]
+    END_([END])
+
+    START --> AGENT
+    AGENT -.shouldContinue<br/>按 tool name 分流.-> TOOLS
+    AGENT -.-> EVAL
+    AGENT -.无 tool_call.-> END_
+    TOOLS --> AGENT
+    EVAL -- invoke --> SUB
+    SUB -- 返回 evaluation --> EVAL
+    EVAL --> AGENT
+
+    style EVAL fill:#fff4cc
+    style SUB fill:#e6f4ff
+```
+
+### 12.4 这次没动的(故意保留)
+
+- `searchKnowledge` / `generateQuiz` / `recommendNextTopic` 仍走 MCP 路径——它们没必要拆子图,跑一遍 MCP 简单清晰
+- MCP 这一套保留作为"标准工具协议",将来想接外部 MCP server 时不用改 Agent
+
+### 12.5 为什么这样设计有意义
+
+| 维度 | 走 MCP 路径(老) | 走 Subgraph 路径(新) |
+|---|---|---|
+| 跳数 | 6 跳(主图 → wrapper → MCP → ...) | 2 跳(主图 → 子图) |
+| 可测性 | 工具逻辑只能在线集成测 | 子图每个纯节点都可单独单测 |
+| 可观测 | LangSmith trace 看到 1 个 "evaluateAnswer" span | 看到 3 个 sub-span(prepareContext/gradeWithLLM/validateAndNormalize) |
+| 可扩展 | 加阶段要重写函数 | 加 node + edge,其它节点不动 |
+| 状态隔离 | MCP 进程隔离(强) | LangGraph state schema 隔离(强,同进程) |
+
+### 12.6 关键文件
+
+```text
+backend-node/src/langchain/
+  subgraphs/evaluateAnswerGraph.ts     ★ 子图实现(3 节点 + 入口函数)
+  agentGraphNodes.ts                    ★ processHumanApproval helper + createEvaluateAnswerNode
+  agentGraph.ts                         ★ 主图 .addNode("evaluateAnswer", ...) + 条件边数组扩展
+  mcp/mcpToolHandlers.ts                runEvaluateAnswerTool 从 80 行缩成 25 行 adapter
+```
+
+---
+
+## 13. 后续规划
+
+```text
+Phase 9   高级 LangGraph
+  ✅ #1-#3  HITL 人工审核
+  ✅ #5-#6  Subgraph 子图(evaluateAnswer 重构)
+  ⏳ #7-#8  Time-travel 时光机(checkpoints 列表 + iOS 长按分叉)
+
+Phase 8   Multi-Agent 协作(Router + 子 Agent)
+```
+
+Phase 9 的 Time-travel 完成后,会有一个"自然的 demo":用户可以长按对话中的任意一条 AI 消息,**从那个时刻分叉出一条新对话**,试不同的回答路径。这是 LangGraph checkpointer 持久化的杀手锏 — 一旦图的每一步都存盘,就能像 git checkout 一样"回到过去"。

@@ -65,6 +65,7 @@ import { createLangChainAgentTools } from "./agentTools";
 import { AgentState } from "./agentGraphState";
 import {
   createAgentNode,
+  createEvaluateAnswerNode,
   createToolNode,
   extractFinalAssistantText,
   shouldContinue,
@@ -220,6 +221,13 @@ export async function runLangGraphAgentStream({
     onToolEvent,
   });
 
+  // Phase 9 #6 — 独立的 evaluateAnswer 节点,绕过 MCP 直连子图
+  // 详见 agentGraphNodes.ts:createEvaluateAnswerNode 的注释
+  const evaluateAnswerNode = createEvaluateAnswerNode({
+    requestId,
+    onToolEvent,
+  });
+
   /**
    * checkpointer 决定图要不要做"对话持久化":
    *   - 有 threadId → 用 SqliteCheckpointer,每次节点跑完自动存 state
@@ -229,19 +237,40 @@ export async function runLangGraphAgentStream({
    */
   const checkpointer = threadId ? getSqliteCheckpointer() : undefined;
 
+  /**
+   * # 图的拓扑(Phase 9 #6 后)
+   *
+   *   START
+   *     ↓
+   *   agent ─── shouldContinue ──┬─→ "evaluateAnswer" ─→ agent (loop)
+   *                              ├─→ "tools"           ─→ agent (loop)
+   *                              └─→ END
+   *
+   *   evaluateAnswer 节点内部直接 invoke 子图(EvaluateAnswerState schema),
+   *   不走 LangChain Tool wrapper / MCP server。
+   *   tools 节点处理其它 3 个工具(searchKnowledge / generateQuiz /
+   *   recommendNextTopic),仍然走 MCP 路径。
+   */
   const graph = new StateGraph(AgentState)
     // addNode 把节点函数注册到图里,起一个名字(后面 addEdge 要用)。
     // 名字是字符串,但 LangGraph 类型系统会收集起来,addEdge 时类型检查
     // 会报"不存在的节点名"——LangGraph 类型安全的亮点之一。
     .addNode("agent", agentNode)
     .addNode("tools", toolNode)
+    .addNode("evaluateAnswer", evaluateAnswerNode)
     // addEdge 加"必然走"的边:START → agent
     .addEdge(START, "agent")
-    // addConditionalEdges:根据 state 决定下一个节点(返回节点名 or END)。
-    // 第三个参数是"可能的返回值列表",帮助 LangGraph 做静态分析、类型推导、画图。
-    .addConditionalEdges("agent", shouldContinue, ["tools", END])
-    // tools 跑完一定回 agent,让模型基于工具结果继续推理
+    // addConditionalEdges:shouldContinue 返回节点名,框架按名查找下一个节点。
+    // 第三个参数是"可能的返回值列表",帮 LangGraph 做静态分析 + 画图 + 类型推导。
+    // Phase 9 #6 加了 "evaluateAnswer" 这个分支(原来只有 "tools" / END)。
+    .addConditionalEdges("agent", shouldContinue, [
+      "tools",
+      "evaluateAnswer",
+      END,
+    ])
+    // 两条工具路径跑完都回 agent 让模型基于结果继续推理
     .addEdge("tools", "agent")
+    .addEdge("evaluateAnswer", "agent")
     // compile 编译成可运行的图,编译期检查:
     //   - 所有 edge 端点都已 addNode
     //   - 没有死节点
@@ -526,12 +555,17 @@ export async function getPendingApprovalForThread(
   //   1. LangGraph 编译期校验会拒绝(unreachable nodes)
   //   2. checkpoint 里记录的 task 名字("tools")在这里找不到对应节点
   // 节点函数体可以是空的,因为我们只调 getState,不调 invoke/stream。
+  // Phase 9 #6 — dummy graph 拓扑要和真图保持一致(包括 evaluateAnswer 节点),
+  // 否则 checkpointer 里记录的 task 名 "evaluateAnswer" 在这里找不到对应节点,
+  // LangGraph 编译期会拒绝。
   const dummyGraph = new StateGraph(AgentState)
     .addNode("agent", async () => ({}))
     .addNode("tools", async () => ({}))
+    .addNode("evaluateAnswer", async () => ({}))
     .addEdge(START, "agent")
-    .addConditionalEdges("agent", () => END, ["tools", END])
+    .addConditionalEdges("agent", () => END, ["tools", "evaluateAnswer", END])
     .addEdge("tools", "agent")
+    .addEdge("evaluateAnswer", "agent")
     .compile({ checkpointer });
 
   const snapshot = await dummyGraph.getState({

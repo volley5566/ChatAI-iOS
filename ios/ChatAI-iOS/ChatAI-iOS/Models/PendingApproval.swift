@@ -43,10 +43,24 @@ struct PendingApproval: Equatable, Identifiable {
 
 /// 通用 JSON 值,递归覆盖 JSON Spec 的所有形态。
 ///
-/// 为什么要自己写?
-///   Swift 的 Codable 默认不支持 Any —— `[String: Any]` 没法 Decodable。
-///   开源 AnyCodable 库可以用,但学习项目里不想引一个 dependency 就为这一个类型。
-///   30 行代码自己写一个,顺便理解 Codable 的 singleValueContainer 玩法。
+/// # 为什么要自己写?
+///
+/// Swift 的 Codable 默认不支持 `Any`,所以 `[String: Any]` 不能直接 Decode。
+/// 工具的 args 是异构 JSON(generateQuiz 是 `{topic, count}`,
+/// recommendNextTopic 是 `{recentTopics: [...]}`),没法预定义一个 struct。
+/// 开源 AnyCodable 库能解决,但学习项目里不想引 dependency,就自己写 30 行。
+///
+/// 顺便能学到 Codable 的两个核心 API:
+///   - `singleValueContainer()` 拿到"裸值"容器,可以反复 try? decode 不同类型
+///   - 递归 Decodable: `[JSONValue]` 和 `[String: JSONValue]` 自然嵌套
+///
+/// # 实际 args 长什么样
+///
+///   generateQuiz:        `{"topic": "SwiftUI @State", "count": 3}`
+///   evaluateAnswer:      `{"question": "...", "userAnswer": "...", "expectedConcepts": ["@State", "binding"]}`
+///   recommendNextTopic:  `{"recentTopics": ["@State"], "focusArea": "SwiftUI", "count": 3}`
+///
+/// 都能用 JSONValue 完整解出来。
 enum JSONValue: Codable, Equatable {
     case string(String)
     case number(Double)
@@ -58,8 +72,19 @@ enum JSONValue: Codable, Equatable {
     init(from decoder: Decoder) throws {
         let container = try decoder.singleValueContainer()
 
-        // 顺序: 先试 null → bool → number → string → array → object
-        // 注意 bool 必须排在 number 前面,否则 true/false 会被当成 1/0 解码进 number 分支。
+        // ★ 解码顺序很重要 ★
+        //
+        // singleValueContainer 让你"试探"每种类型,试不到就抛错,我们 try? 接住继续试下一种。
+        // 顺序错了会有微妙 bug:
+        //
+        //   1. null  → 单独 API decodeNil(),必须第一个,因为 nil 不能被 decode 成具体类型
+        //   2. Bool  → ★ 必须在 Double 之前!★
+        //              Swift 的 JSONDecoder 在某些版本会把 true/false 解析成 1.0/0.0,
+        //              如果先试 Double 成功了,就拿不到正确的 .bool 分支了。
+        //   3. Double → 数字(整数 / 小数都用 Double 接,encode 时再判断是否要写成 Int)
+        //   4. String → 字符串
+        //   5. Array  → 递归:[JSONValue]
+        //   6. Object → 递归:[String: JSONValue]
         if container.decodeNil() {
             self = .null
             return

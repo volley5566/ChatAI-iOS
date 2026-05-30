@@ -7,6 +7,7 @@ import {
 } from "../agent/agentToolTypes";
 import { invokeLangChainChat } from "../langchain/chatModel";
 import { loadKnowledgeDocuments } from "../langchain/documentLoader";
+import { runEvaluateAnswerSubgraph } from "../langchain/subgraphs/evaluateAnswerGraph";
 
 export type SearchKnowledgeArguments = {
   query: string;
@@ -437,53 +438,14 @@ export function normalizeEvaluateAnswerArguments(
 }
 
 /**
- * LLM-as-judge 评分提示词。
- *
- * 设计要点:
- * 1. 角色明确——"你是一位 iOS 教学老师",把模型锚定到教学语境,
- *    而不是默认的"AI 助手"语气。
- * 2. rubric 显式——4 档分数 + 每档的语义描述,让评分稳定。
- * 3. JSON-only 严格输出——和项目原有结构化接口同款约束,
- *    便于上层用 extractJsonText 解析。
- * 4. 字段顺序固定——strengths 放在 weaknesses 前面,
- *    评判时先看亮点再看不足,语气更建设性。
- */
-const evaluateAnswerSystemPrompt = `
-You are an iOS / Swift / mobile development tutor. You grade a student's answer.
-
-Output ONLY valid JSON. No Markdown. No code fences. No surrounding text.
-
-JSON shape (use exactly these keys, in this order):
-{
-  "score": 0 | 1 | 2 | 3,
-  "scoreLabel": "需要加油" | "及格" | "良好" | "优秀",
-  "strengths": ["..."],
-  "weaknesses": ["..."],
-  "suggestedAnswer": "..."
-}
-
-Scoring rubric:
-- 3 / 优秀: covers all key concepts, accurate, uses correct terminology, mentions edge cases or trade-offs.
-- 2 / 良好: covers main concept correctly with minor gaps or imprecise terms.
-- 1 / 及格: partially correct but misses important concepts or contains a notable misunderstanding.
-- 0 / 需要加油: largely incorrect, off-topic, or empty.
-
-Rules:
-- Write strengths / weaknesses in the same language as the user's answer.
-- strengths: 1-3 short bullets (each under 40 chars).
-- weaknesses: 0-3 short bullets, empty array if no obvious gap.
-- suggestedAnswer: 1-3 sentences, beginner-friendly, written in the user's language.
-- Be fair and constructive. Encourage learning.
-- Never include the rubric or your reasoning in the output — only the JSON.
-`.trim();
-
-/**
  * 从 LLM 返回文本中提取首尾 {} 之间的 JSON。
  *
  * 模型偶尔会包 \`\`\`json ... \`\`\` 或前后多写几个字。
  * 这里和 structuredAnswer.ts 的 extractJsonText 是同一思路。
- * 没复用是因为这是不同领域的工具,各自的失败兜底语义不同,
- * 抽公共反而要写参数。后续如果再加第 3 处 JSON 解析,可以统一抽。
+ * generateQuiz 和 recommendNextTopic 都在用,所以保留在这里。
+ *
+ * (evaluateAnswer 用的版本搬去了 subgraphs/evaluateAnswerGraph.ts,
+ *  保持子图自包含。后续如果再加第 4 处 JSON 解析,可以统一抽到 shared/)
  */
 function extractJsonFromLlmOutput(rawText: string): string | undefined {
   const startIndex = rawText.indexOf("{");
@@ -496,122 +458,46 @@ function extractJsonFromLlmOutput(rawText: string): string | undefined {
   return rawText.slice(startIndex, endIndex + 1);
 }
 
-type RawEvaluation = {
-  score?: unknown;
-  scoreLabel?: unknown;
-  strengths?: unknown;
-  weaknesses?: unknown;
-  suggestedAnswer?: unknown;
-};
-
-function normalizeEvaluationOutput(rawText: string): {
-  score: 0 | 1 | 2 | 3;
-  scoreLabel: string;
-  strengths: string[];
-  weaknesses: string[];
-  suggestedAnswer: string;
-} {
-  const jsonText = extractJsonFromLlmOutput(rawText);
-
-  if (!jsonText) {
-    throw new Error("Evaluation model did not return JSON.");
-  }
-
-  const parsed = JSON.parse(jsonText) as RawEvaluation;
-
-  /**
-   * 防御性 normalize:模型偶尔会返回 "2" 这种字符串,或者把分数写到 99。
-   * 这里夹紧到 0-3,保证下游 iOS 不需要再做 fallback。
-   */
-  const rawScore =
-    typeof parsed.score === "number"
-      ? parsed.score
-      : Number(parsed.score);
-  const safeScore = Number.isFinite(rawScore)
-    ? Math.min(Math.max(Math.round(rawScore), 0), 3)
-    : 0;
-  const score = safeScore as 0 | 1 | 2 | 3;
-
-  const labelFallback = ["需要加油", "及格", "良好", "优秀"][score];
-  const scoreLabel =
-    typeof parsed.scoreLabel === "string" && parsed.scoreLabel.trim()
-      ? parsed.scoreLabel.trim()
-      : labelFallback;
-
-  const toStringArray = (value: unknown, maxItems: number): string[] => {
-    if (!Array.isArray(value)) {
-      return [];
-    }
-    return value
-      .filter((item): item is string => typeof item === "string")
-      .map((item) => item.trim())
-      .filter(Boolean)
-      .slice(0, maxItems);
-  };
-
-  return {
-    score,
-    scoreLabel,
-    strengths: toStringArray(parsed.strengths, 3),
-    weaknesses: toStringArray(parsed.weaknesses, 3),
-    suggestedAnswer:
-      typeof parsed.suggestedAnswer === "string"
-        ? parsed.suggestedAnswer.trim()
-        : "",
-  };
-}
-
 export async function runEvaluateAnswerTool(
   args: EvaluateAnswerArguments
 ): Promise<AgentToolExecutionResult> {
   /**
-   * LLM-as-judge 模式:
-   * 工具不再是纯函数,而是工具内部再发一次 DeepSeek 请求,让模型自己评分。
+   * Phase 9 #5 — 工具实现已重构成子图。
    *
-   * 设计要点:
-   * - system prompt 严格固定 rubric 和输出格式
-   * - user 部分组装上下文(题目、用户答案、可选的 topic 和要点)
-   * - 解析 JSON 时做防御性 normalize,失败兜底也要给出可用结果
+   * 历史: 这个函数之前是一段 80 行的"大杂烩"——
+   *   构造 prompt → 调 LLM → 解析 JSON → 兜底
+   * 全在一个函数里。
    *
-   * 不直接复用外层 agent 的 chat model 实例,而是新建一个——
-   * 原因是这个调用要求 streaming=false(评分需要拿到完整 JSON),
-   * 而 Agent 主流程通常开 streaming。
+   * 现在: 把那 80 行抽成了 3 节点 StateGraph,放在
+   *   langchain/subgraphs/evaluateAnswerGraph.ts
+   *
+   *   START → prepareContext → gradeWithLLM → validateAndNormalize → END
+   *
+   * 这个工具 handler 退化成一层薄薄的 adapter:
+   *   - 把 MCP args 转给子图的输入类型
+   *   - 调 subgraph 拿结果
+   *   - 把结果包成 AgentToolExecutionResult 返回(MCP 协议要求的格式)
+   *
+   * # 为什么不直接让 MCP 工具暴露子图?
+   *
+   * 因为 MCP 协议有自己的"工具结果"形态 (AgentToolExecutionResult,
+   * 含 toolName/ok/result/error),子图返回的是裸 EvaluateAnswerOutput。
+   * 这一层 adapter 负责协议转换,职责单一。
+   *
+   * # 失败处理
+   *
+   * 两类失败:
+   *   1. 子图抛异常(LLM 网络挂了 / 超时)→ catch 后包成 ok=false
+   *   2. 子图返回 evaluation.parseError 非空(JSON 解析失败但有 fallback)
+   *      → 仍然 ok=true,iOS 通过 parseError 字段感知降级
    */
-  const contextParts: string[] = [];
-
-  if (args.topic) {
-    contextParts.push(`Topic: ${args.topic}`);
-  }
-
-  if (args.expectedConcepts && args.expectedConcepts.length > 0) {
-    contextParts.push(
-      `Expected concepts to mention: ${args.expectedConcepts.join(", ")}`
-    );
-  }
-
-  contextParts.push(`Question:\n${args.question}`);
-  contextParts.push(`Student answer:\n${args.userAnswer}`);
-
-  const userPrompt = contextParts.join("\n\n");
-
-  let rawText: string;
-
   try {
-    rawText = await invokeLangChainChat([
-      new SystemMessage(evaluateAnswerSystemPrompt),
-      new HumanMessage(userPrompt),
-    ]);
-  } catch (error) {
-    return buildToolErrorResult(
-      "evaluateAnswer",
-      `Evaluation model call failed: ${
-        error instanceof Error ? error.message : String(error)
-      }`
-    );
-  }
-
-  try {
-    const evaluation = normalizeEvaluationOutput(rawText);
+    const evaluation = await runEvaluateAnswerSubgraph({
+      question: args.question,
+      userAnswer: args.userAnswer,
+      topic: args.topic,
+      expectedConcepts: args.expectedConcepts,
+    });
 
     return {
       toolName: "evaluateAnswer",
@@ -623,27 +509,12 @@ export async function runEvaluateAnswerTool(
       },
     };
   } catch (error) {
-    /**
-     * 模型偶尔会把 JSON 写坏(尤其是 suggestedAnswer 里夹带未转义引号)。
-     * 不直接抛错——给前端一个降级结果,让对话还能继续。
-     *
-     * 这里把 raw text 截短塞到 suggestedAnswer 里,至少用户能看到模型说了什么。
-     */
-    return {
-      toolName: "evaluateAnswer",
-      ok: true,
-      result: {
-        question: args.question,
-        topic: args.topic,
-        score: 1,
-        scoreLabel: "及格",
-        strengths: [],
-        weaknesses: ["评分模型输出格式异常,以下内容为原始回答"],
-        suggestedAnswer: truncateText(rawText, 600),
-        parseError:
-          error instanceof Error ? error.message : "Unknown parse error",
-      },
-    };
+    return buildToolErrorResult(
+      "evaluateAnswer",
+      `Evaluation subgraph failed: ${
+        error instanceof Error ? error.message : String(error)
+      }`
+    );
   }
 }
 

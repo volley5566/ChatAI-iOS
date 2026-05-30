@@ -17,13 +17,67 @@ import type { AgentStateType, AgentStateUpdate } from "./agentGraphState";
 import { createLangChainChatModel } from "./chatModel";
 import { messageContentToString } from "./chatPrompt";
 
+// ─── HITL (Human-in-the-Loop) 区 ──────────────────────────────
+//
+// # HITL 是什么
+//   "AI 想调一个工具 → 暂停 → 问用户同不同意 → 用户同意才执行"
+//   核心机制: LangGraph 的 interrupt() 把图"按暂停键",state 进 SQLite,
+//   等外部用 Command(resume=...) 续跑。
+//
+// # 完整调用时序(从用户点发送到 iOS 看到工具结果)
+//
+//   t0  iOS 发 POST /api/agent/stream(message + thread_id)
+//        │
+//        ▼
+//   t1  server.ts → runLangGraphAgentStream → streamEvents 跑图
+//        │
+//        ▼
+//   t2  agentNode 调模型 → 模型决定 tool_call: generateQuiz
+//        │
+//        ▼
+//   t3  toolNode 进入 → 发现工具在审核名单
+//        ├─ 发 SSE tool_pending(让 iOS 弹卡片)
+//        └─ 调 interrupt(approvalRequest) → 抛 GraphInterrupt
+//        │
+//        ▼
+//   t4  图挂起,state 自动存进 checkpointer(SQLite)
+//        streamEvents 自然结束,server 发 SSE done(pending: {...})
+//        │
+//        ▼
+//   t5  iOS 收到 done.pending → ChatViewModel.pendingApproval = pending
+//        → SwiftUI .sheet(item:) 弹审批卡片
+//        │
+//        ▼  (用户点[批准]或[拒绝])
+//        ▼
+//   t6  iOS 发 POST /api/threads/:id/resume {approved: true/false}
+//        │
+//        ▼
+//   t7  server → runLangGraphAgentStream(resumePayload={approved}) →
+//        streamEvents(new Command({resume: payload}))
+//        │
+//        ▼
+//   t8  ★ LangGraph 从挂起的 toolNode **重新执行**(从节点头部),
+//        但 interrupt() 这次不抛错,**同步返回 resume 值**
+//        ⚠️  interrupt 之前的代码(包括 SSE tool_pending)会再执行一次!
+//            iOS 端要按 tool_call_id 去重(VM.justResumedToolCallID)。
+//        │
+//        ▼
+//   t9  approved=true → tool.invoke() 真正执行 → ToolMessage 入 state
+//       approved=false → 塞 "user_rejected" ToolMessage,不调工具
+//        │
+//        ▼
+//   t10 图回到 agentNode → 模型基于工具结果(或拒绝)生成最终回答
+//        │
+//        ▼
+//   t11 SSE delta 流式吐文本 → done(pending: nil)→ iOS 收尾
+//
+// # 审核名单:哪些工具进 HITL
+//   - LLM-as-tool(工具内部会调 DeepSeek): evaluateAnswer / generateQuiz / recommendNextTopic
+//     → 有真实成本(token + 时间) + 输出会影响用户后续动作(评分/推荐)
+//   - searchKnowledge: 纯本地 RAG,无成本无副作用 → 不审核
+
 /**
- * HITL 审核名单:这些工具在执行前会 interrupt(),等用户在 iOS 上点批准。
- *
- * 为什么是这 3 个?
- *   - LLM-as-tool: 工具内部会再发一次 DeepSeek 请求,有真实成本(token + 时间)
- *   - 输出影响用户后续动作(评分会影响信心,推荐会影响学习路径)
- * searchKnowledge 是只读 RAG,无成本无副作用,不进审核名单。
+ * HITL 审核名单 —— 工具名命中就 interrupt(),等用户点批准。
  */
 const TOOLS_REQUIRING_APPROVAL = new Set<string>([
   "evaluateAnswer",
@@ -327,17 +381,47 @@ export function createToolNode(options: {
       /**
        * # HITL: 如果是审核名单里的工具,先 interrupt() 等用户批准。
        *
-       * interrupt() 的语义(LangGraph 1.x):
-       *   - 第一次执行到这里 → 抛 GraphInterrupt,图挂起,state 存进 checkpointer
-       *   - 后续用 Command(resume=...) 续跑 → interrupt() 同步返回 resume 值
+       * ## interrupt() 的语义(LangGraph 1.x 的怪异之处)
        *
-       * 关键: 同一个节点函数会被"重跑两次":
-       *   1. 第一次跑到 interrupt 抛错,前面的代码(包括 SSE 事件发送)已经执行
-       *   2. resume 后从节点头部重新执行,interrupt 这次直接返回 resume 值
-       *   所以下面的 tool_pending SSE 事件,在 resume 后会被发第二次——
-       *   iOS 端需要按 tool_call_id 去重,或者把"已审批"状态记下来。
+       *   第一次跑到 interrupt(payload):
+       *      抛 GraphInterrupt(payload) → 图挂起 → state 进 checkpointer
+       *      streamEvents 自然结束,server 知道"我在等审批"
        *
-       * 不需要审核的工具直接走原路径,行为完全不变。
+       *   外部用 Command(resume=decision) 续跑:
+       *      LangGraph **从节点头部重新执行**这个函数
+      *      interrupt() 这次不抛错,**同步返回 decision**
+       *
+       * ## "重跑两次"的视觉化
+       *
+       *      首跑:                       resume 重跑:
+       *      ─────────────                ─────────────
+       *      enter toolNode               enter toolNode
+       *      ...loop pre-work             ...loop pre-work    ← 重复执行!
+       *      onToolEvent(tool_pending)    onToolEvent(tool_pending) ← SSE 又发一次
+       *      logAgentInfo("requested")    logAgentInfo("requested") ← 日志又记一次
+       *      interrupt() → ★抛错挂起      interrupt() → ★直接返回 decision
+       *      (永远不会跑到这里)            ↓
+       *                                    if (!decision.approved) ...
+       *                                    tool.invoke(...) → 工具真执行
+       *
+       * ## 重跑带来的麻烦
+       *
+       *   ⚠️  tool_pending SSE 在 resume 时**会被发第二次**,iOS 端按
+       *       tool_call_id 去重,见 ChatViewModel.justResumedToolCallID。
+       *
+       *   ⚠️  logAgentInfo("tool_approval_requested") 在 resume 时也会再写一条,
+       *       看后端日志会"莫名其妙多一行",不是 bug,是 LangGraph 设计如此。
+       *
+       *   ⚠️  pre-work 不能有副作用(写数据库、发邮件等),否则会执行两次。
+       *       这里 pre-work 只发 SSE 和写日志,SSE 已经做了 iOS 端去重,日志多一条无所谓。
+       *
+       * ## 为什么 LangGraph 这么设计
+       *
+       *   它没办法存"代码跑到第几行" — 那需要保存 JavaScript 调用栈快照。
+       *   它只能存 state(数据)。所以 resume 时必须从函数头部重跑,
+       *   靠 interrupt() 直接返回 resume 值来"快进"到挂起前的位置。
+       *
+       * 不在审核名单的工具直接跳过整个 if,走原路径,行为完全不变。
        */
       let toolCallArgs = toolCall.args as Record<string, unknown>;
 

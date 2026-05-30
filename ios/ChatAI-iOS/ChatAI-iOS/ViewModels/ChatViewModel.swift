@@ -430,20 +430,65 @@ final class ChatViewModel: ObservableObject {
     // ─────────────────────────────────────────────────────────────────────
     // Phase 9 #3 — HITL Approve / Reject
     // ─────────────────────────────────────────────────────────────────────
+    //
+    // # 完整时序(用户在卡片上点完按钮之后)
+    //
+    //   t0  用户点[批准]或[拒绝]
+    //        ↓
+    //   t1  ChatView 闭包: Task { await viewModel.approvePending() }
+    //        ↓                              (或 rejectPending)
+    //   t2  approvePending → resolvePending(approved: true, editedArgs: nil)
+    //        ↓
+    //   t3  ★ pendingApproval = nil
+    //         → SwiftUI .sheet(item:) 检测到 binding 变 nil,sheet 关闭
+    //        ↓
+    //   t4  发 POST /api/threads/:id/resume → 后端用 Command(resume) 续跑图
+    //        ↓
+    //   t5  for try await update in stream { ... }
+    //         ├ .delta       → append 到原气泡(suspendedMessageID)
+    //         ├ .toolStart/Done → 展示新一轮工具进度
+    //         ├ .toolPending → 去重判断,可能弹新 sheet(模型连环挂起)
+    //         └ .done        → 写 runId,清挂起状态
+    //
+    // # 为什么把 pendingApproval 清空放在 resolvePending 第一行
+    //
+    // 卡片关闭由 SwiftUI 的 `.sheet(item: $pendingApproval)` 驱动:
+    // binding 变 nil → sheet 自动 dismiss。
+    //
+    // 我们 **不在** ToolApprovalCard 里直接调 dismiss(),因为:
+    //   - dismiss() 是 SwiftUI 的环境 action,运行时机不确定
+    //   - 如果 dismiss 比 Task 里的 resolvePending 先跑,binding 已 nil,
+    //     guard 失败 → resume 永远不发(这就是历史上踩过的 bug)
+    //
+    // 让 VM 当 pendingApproval 的唯一控制者,行为可预测。
 
     /// 用户在审批卡片上点[批准]。
     /// editedArgs == nil 表示用原参数;非 nil 表示用编辑过的参数。
+    /// (当前 UI 还不支持编辑,但 API 留好了口子。)
     func approvePending(editedArgs: [String: JSONValue]? = nil) async {
         await resolvePending(approved: true, editedArgs: editedArgs)
     }
 
     /// 用户在审批卡片上点[拒绝]。
-    /// 后端会把 "user denied" 包成 ToolMessage 给模型,让模型基于这个反馈改口。
+    ///
+    /// 后端收到 approved=false 后,会在 toolNode 里塞一条
+    /// `{ ok: false, status: "user_rejected" }` 的 ToolMessage 给模型,
+    /// 配合 agentOutputGuide 里的指令,模型会简短道歉并问"想干啥",
+    /// **不会再尝试调同一个工具**,也**不会自己手写答案**。
     func rejectPending() async {
         await resolvePending(approved: false, editedArgs: nil)
     }
 
     /// 共用的 resume 实现 —— 批准 / 拒绝路径只差 approved 一个布尔值。
+    ///
+    /// 关键步骤(按顺序):
+    ///   1. 校验有挂起态 + 有 thread id(防御性)
+    ///   2. 记下 justResumedToolCallID(用于回声去重,见上面字段注释)
+    ///   3. **立刻清空 pendingApproval** → sheet 自动关闭
+    ///   4. 发 /resume 拿到新 SSE 流
+    ///   5. 在循环里复用 sendMessage 的逻辑(同样的 update case 分发)
+    ///   6. 流里收到 toolPending 时按 toolCallID 去重
+    ///   7. 流到 done(pending: nil) 时清挂起痕迹
     private func resolvePending(
         approved: Bool,
         editedArgs: [String: JSONValue]?
@@ -454,11 +499,14 @@ final class ChatViewModel: ObservableObject {
             return
         }
 
-        // 记下"刚批准的 tool_call_id" — resume 流里再收到同 id 的 tool_pending
-        // 是后端 toolNode 重跑的回声,要忽略,否则 sheet 会重弹。
+        // ★ 关键 1: 记下"刚批准的 tool_call_id"
+        // resume 流里再收到同 id 的 tool_pending 是后端 toolNode 重跑的回声,
+        // 要忽略;否则 sheet 会重弹,用户再点一次批准 → /resume 又发一次 →
+        // 工具被执行两次。这是历史上踩过的 bug,这一行就是它的疫苗。
         justResumedToolCallID = currentPending.toolCallID
 
-        // 立刻把 pendingApproval 清空,卡片消失,UI 进入"AI 正在回复"态
+        // ★ 关键 2: 立刻把 pendingApproval 清空,卡片消失,UI 进入"AI 正在回复"态
+        // (见上面"为什么把 pendingApproval 清空放在 resolvePending 第一行"那段)
         pendingApproval = nil
         errorMessage = nil
         isSending = true
@@ -466,6 +514,8 @@ final class ChatViewModel: ObservableObject {
         defer { isSending = false }
 
         // 复用挂起前已经累积的文本 + 气泡 id
+        // 这样 resume 后的新 delta 会接到**同一个气泡**上,
+        // 视觉上是"思考被中断审批了一下,继续回答",而不是两条消息。
         var streamedAnswer = suspendedStreamedAnswer
         let assistantMessageID = suspendedMessageID
 

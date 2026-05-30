@@ -250,28 +250,44 @@ export async function runLangGraphAgentStream({
 
   // ─── 第三步:构造 streamEvents 入参 + 调用 ────────────────────
   //
-  // 三种入参形态(按互斥优先级):
+  // streamEvents 的第一个参数有三种合法形态,按互斥优先级判断:
   //
-  // 1. resumePayload(HITL 续跑):
-  //      input = new Command({ resume: resumePayload })
-  //      图从挂起的 toolNode 继续跑,resumePayload 作为 interrupt() 的返回值
-  //      message / history 都被忽略(LangGraph 从 checkpoint 加载之前的 state)
+  // ┌──────────────────────┬────────────────────────────────────────────────────┐
+  // │ 1. HITL 续跑          │  new Command({ resume: resumePayload })            │
+  // │  (有 resumePayload)   │  图从挂起的 toolNode **接着跑**,                  │
+  // │                       │  resumePayload 会成为 interrupt() 的返回值。       │
+  // │                       │  state 自动从 checkpointer 加载,                  │
+  // │                       │  message / history 字段被忽略。                    │
+  // ├──────────────────────┼────────────────────────────────────────────────────┤
+  // │ 2. 普通持久化首跑      │  { messages: [new HumanMessage(message)] }         │
+  // │  (有 threadId         │  历史已经在 checkpointer 里,只追加新消息,        │
+  // │   无 resumePayload)   │  messagesStateReducer 会自动 append。              │
+  // │                       │  如果再传一遍 history 会重复!                     │
+  // ├──────────────────────┼────────────────────────────────────────────────────┤
+  // │ 3. 无持久化           │  { messages: [...history, new HumanMessage] }      │
+  // │  (无 threadId)        │  state 从空 [] 开始,history 必须一起塞进去,      │
+  // │                       │  否则模型看不到之前的对话。                        │
+  // └──────────────────────┴────────────────────────────────────────────────────┘
   //
-  // 2. 有 threadId(普通持久化首跑):
-  //      input = { messages: [new HumanMessage(message)] }
-  //      history 在 checkpointer 里,只追加当前消息
+  // ## 为什么分两个 if 分支调 streamEvents,不是统一构造 graphInput 变量?
   //
-  // 3. 无 threadId(无持久化):
-  //      input = { messages: [...history, new HumanMessage(message)] }
-  //      state 是空的,history 必须一起塞进去
+  // 写成
+  //   const input: {messages} | Command = ...
+  //   streamEvents(input, options)
+  // 会让 TS 在重载里选错(把 Command 联合类型误判成 v3 二进制流),
+  // 编译报错。分支调用让类型推导走对路径。
   //
-  // 为什么分两个 if 分支调 streamEvents 而不是构造统一的 graphInput 变量:
-  // TypeScript 在联合类型 `{messages} | Command` 上会挑错 streamEvents
-  // 重载(把它当成 v3 二进制流),所以分开调让类型推导走对路径。
+  // ## configurable.thread_id 是什么
   //
-  // configurable.thread_id 是 LangGraph 的"特殊配置入口",
-  // 所有 checkpointer 都靠它隔离不同对话。
-  // metadata + tags 给 LangSmith trace 加业务标签(没接 LangSmith 也无影响)。
+  // LangGraph 给 RunnableConfig 留的"特殊配置入口"。
+  // 所有 checkpointer 都靠这个字段区分不同对话:
+  //   thread_id = "abc" → 读 abc 的 state、写回 abc 的 state
+  //   thread_id 不传    → 不走持久化,state 跑完即丢
+  //
+  // ## metadata + tags
+  //
+  // 纯给 LangSmith trace 加业务标签 — 网页上能按 metadata 过滤,按 tag 筛选。
+  // 没接 LangSmith 也不会出错,LangChain 静默忽略。
   const streamConfig = {
     version: "v2" as const,
     recursionLimit: agentRecursionLimit,
@@ -460,21 +476,42 @@ export async function runLangGraphAgentStream({
 /**
  * 查询某个 thread 当前是否有挂起的工具批准请求。
  *
- * 用法: GET /api/threads/:id/pending 路由调它,iOS 重连后通过这个接口
- * 知道"有个工具调用还在等用户决策"。
+ * 调用方: GET /api/threads/:id/pending 路由。
+ * 典型场景: iOS 退出 app 又重新进,需要查"上次的对话是不是停在等审批"。
  *
- * # 怎么读 checkpointer 里的挂起态
+ * # 关键技巧: dummy graph + getState
  *
- * graph.getState(config) 返回当前 thread 的 state snapshot,
- * 里面有 `tasks` 数组:每个 task 代表"待执行/未完成的图任务"。
- * 任务的 `interrupts` 字段就是 interrupt() 抛出的 payload 列表。
+ * 想读 checkpointer 里存的 state,LangGraph 要求你"拿一张编译过的图,
+ * 调它的 .getState(config)"。但本接口只想读 state,**不想真的跑图**——
+ * 真跑图需要重新加载 MCP tools / 编模型实例,代价大。
  *
- * # 为什么用 dummy graph
+ * 解决办法: 编一张"假图"(dummy graph),节点函数全是空操作。
+ * 因为我们只调 getState 不调 invoke/stream,假节点永远不会被执行。
  *
- * getState 只读 state(channels),不执行任何节点 — 所以节点用空函数也行。
- * 这样我们不需要加载 MCP tools / 拼 agentNode,极轻量。
- * state schema 必须和真图一致(都用 AgentState),否则 LangGraph 反序列化
- * 会报错。
+ * ## 假图的两个硬约束
+ *
+ *   1. **state schema 必须和真图一致**(都用 AgentState)
+ *      checkpointer 里的 state 是用 AgentState 的 channel reducers 序列化的,
+ *      读出来要用同一套 schema 反序列化,否则报"unknown channel"错误。
+ *
+ *   2. **节点名必须和真图一致**(agent / tools)
+ *      checkpointer 里的 `tasks` 用节点名标识"待执行的是谁"。
+ *      如果假图里没有名叫 "tools" 的节点,task 名找不到对应节点定义,
+ *      LangGraph 直接报"unreachable node"或类似的拒绝编译。
+ *
+ *   3. **拓扑也要对得上**(START → agent → tools → agent)
+ *      LangGraph 编译期会做"所有节点必须可达"检查。如果假图里 tools 是
+ *      孤儿节点(没人能到达),compile() 直接抛错。
+ *      所以即使节点函数是空的,边的连法也要跟真图一致。
+ *
+ * # 怎么从 snapshot 里读出"挂起"信息
+ *
+ * snapshot.tasks 数组里的每个 task 有 `interrupts` 字段:
+ *   - 空数组 → 这个 task 还没跑,但没被 interrupt 拦下
+ *   - 非空 → task 跑到一半被 interrupt(payload) 挂住,payload 在这里
+ *
+ * 我们只挂了一种 interrupt(在 toolNode 里),所以从所有 task 的所有
+ * interrupts 里找第一个 value 是对象的就行。
  *
  * @returns 有挂起 → PendingToolApproval;没有 / thread 不存在 → null
  */

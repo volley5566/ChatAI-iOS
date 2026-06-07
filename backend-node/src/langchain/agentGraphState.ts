@@ -104,6 +104,45 @@ export const AgentState = Annotation.Root({
     reducer: (current, update) => (current ?? 0) + (update ?? 0),
     default: () => 0,
   }),
+
+  /**
+   * 早期对话的浓缩摘要(Phase 11 对话压缩)。
+   *
+   * # 为什么需要这个字段
+   *
+   * 长对话场景下,state.messages 会一直增长。每次模型调用都把全部 messages
+   * 喂给 DeepSeek,会有两个问题:
+   *   1. token 成本随对话长度线性飙升
+   *   2. 超出模型上下文窗口直接报错
+   *
+   * 压缩思路:跑到一定长度时,启动一个 summarizeNode,
+   *   - 用 LLM 把"老消息"浓缩成一段 summary 文本
+   *   - 用 `RemoveMessage` 哨兵把那些老 messages 从 state 里删掉
+   *   - summary 存到这个字段,后续 agentNode 把它拼成 SystemMessage
+   *     塞在每轮模型调用的最前面,模型仍然"知道"早期发生过什么。
+   *
+   * # 为什么 reducer 是"覆盖式"(不是累加 / 追加)
+   *
+   * 每次 summarizeNode 跑完都生成一份**完整**的新 summary
+   * (它会把"旧 summary + 新消息"合并成新的"统一 summary"),
+   * 所以新值直接替换旧值就行,不需要拼接。
+   *
+   * # 默认值 ""
+   *
+   * 选空串而不是 undefined / null,好处是 agentNode 里判断很自然:
+   *   if (state.summary) { ... 拼成 SystemMessage ... }
+   * 不需要写一堆 ?? 兜底。
+   *
+   * # 向后兼容
+   *
+   * 老 thread 的 checkpoint 里没有这个 channel。LangGraph 反序列化时
+   * 找不到的 channel 会用 default() 初始化,等价于"老 thread 默认无 summary"。
+   * 所以这次改动**对老对话完全无感**,不会因为 schema 不匹配报错。
+   */
+  summary: Annotation<string>({
+    reducer: (_current, update) => update ?? "",
+    default: () => "",
+  }),
 });
 
 /**

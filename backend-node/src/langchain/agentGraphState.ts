@@ -89,7 +89,19 @@ export const AgentState = Annotation.Root({
    * 累加意味着图任何位置都能 += 1,不需要先读再写。
    */
   modelCallCount: Annotation<number>({
-    reducer: (current, update) => (current ?? 0) + (update ?? 0),
+    // Phase 11 fix — 支持"重置"协议:
+    //   update === 0  → 重置成 0(给 resetCountersNode 用,每次新请求开始时清零)
+    //   update 其它   → 老语义,累加 current + update
+    //
+    // 为什么 0 可以当 sentinel:
+    //   节点自然累加时只会返回 1(每次模型调用 += 1),永远不会显式 return 0。
+    //   不传该字段时 update 是 undefined,经过 ?? 兜底变 0... 但此时
+    //   严格相等 `update === 0` 是 false(undefined !== 0),所以会走累加分支,
+    //   等价于"不传 = 不动"的老行为,向后兼容。
+    reducer: (current, update) => {
+      if (update === 0) return 0;
+      return (current ?? 0) + (update ?? 0);
+    },
     default: () => 0,
   }),
 
@@ -99,9 +111,14 @@ export const AgentState = Annotation.Root({
    * 用法和 modelCallCount 一样,toolNode 完成一次就 += 1。
    * 跟 createAgent 路径里 `toolCallLimitMiddleware` 是同一概念,
    * 只是这里我们手写,所以暴露在 state 里、在 agentNode 里检查"是否超额"。
+   *
+   * Phase 11 fix — 同 modelCallCount,支持 update === 0 的重置协议。
    */
   toolCallCount: Annotation<number>({
-    reducer: (current, update) => (current ?? 0) + (update ?? 0),
+    reducer: (current, update) => {
+      if (update === 0) return 0;
+      return (current ?? 0) + (update ?? 0);
+    },
     default: () => 0,
   }),
 

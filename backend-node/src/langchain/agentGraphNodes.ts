@@ -781,6 +781,42 @@ export function createEvaluateAnswerNode(options: {
   };
 }
 
+// ─── 入口节点 resetCountersNode (Phase 11 fix) ────────────────
+
+/**
+ * 把 modelCallCount / toolCallCount 重置成 0 的入口节点。
+ *
+ * # 这个节点存在的原因(老 bug 修复)
+ *
+ * modelCallCount / toolCallCount 在 schema 里是为"per-request 成本兜底"
+ * 设计的(`agentModelCallLimit` 默认 6):一次 Agent 请求最多调几次模型。
+ *
+ * 但它们也被 SqliteCheckpointer 当成普通 state 一起持久化了。后果:
+ *   thread 第 1 次请求结束时 modelCallCount = 2
+ *   thread 第 2 次请求开始时 state.modelCallCount 仍然是 2
+ *   累加到第 3 次请求结束时 modelCallCount = 6 →
+ *   第 4 次请求 agentNode 一进来就触发 limit → "软退出"返回空消息 →
+ *   iOS 收到 SSE 全程零 delta → 报"AI 返回了空内容"
+ *
+ * 修复:每次新请求进 START 后立刻把计数器归零。
+ * 用 `update === 0` 触发 reducer 的"重置协议"(见 agentGraphState.ts)。
+ *
+ * # 为什么不放到 shouldSummarize 里一起做
+ *   shouldSummarize 是**条件边**,只能返回下一个节点名,不能返回 state 更新。
+ *   只能用一个正经节点来"产出" state 变更。
+ *
+ * # HITL 兼容
+ *   resume 时图从挂起节点(toolNode/evaluateAnswerNode)重跑,不经过 START →
+ *   不会触发这个 reset → 计数器从挂起前的累计值继续往上加 →
+ *   这是正确的(resume 是同一个 user request 的延续,total 成本要算到一起)。
+ */
+export async function resetCountersNode(): Promise<AgentStateUpdate> {
+  return {
+    modelCallCount: 0,
+    toolCallCount: 0,
+  };
+}
+
 // ─── 条件边 shouldContinue ────────────────────────────────────
 
 /**

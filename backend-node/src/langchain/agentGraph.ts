@@ -68,6 +68,7 @@ import {
   createEvaluateAnswerNode,
   createToolNode,
   extractFinalAssistantText,
+  resetCountersNode,
   shouldContinue,
 } from "./agentGraphNodes";
 import { messageContentToString } from "./chatPrompt";
@@ -250,9 +251,11 @@ export async function runLangGraphAgentStream({
   const checkpointer = threadId ? getSqliteCheckpointer() : undefined;
 
   /**
-   * # 图的拓扑(Phase 11 #3 后)
+   * # 图的拓扑(Phase 11 #5 fix 后)
    *
    *   START
+   *     ↓
+   *   reset ───────────────────────── (重置 modelCallCount/toolCallCount 为 0)
    *     ↓
    *   shouldSummarize ──┬─→ "summarize" ─→ agent → ... (压缩老消息后进推理)
    *                     └─→ "agent"      ─→ ...        (回合数没够,直接推理)
@@ -260,6 +263,13 @@ export async function runLangGraphAgentStream({
    *   agent ─── shouldContinue ──┬─→ "evaluateAnswer" ─→ agent (loop)
    *                              ├─→ "tools"           ─→ agent (loop)
    *                              └─→ END
+   *
+   * # reset 节点修了什么 bug
+   *
+   *   modelCallCount / toolCallCount 一直被 checkpointer 当普通 state 持久化,
+   *   导致同一 thread 跨请求累加(thread 第 4 轮就撞穿默认 limit=6 → 软退出)。
+   *   reset 在 START 之后第一个跑,把计数器归零,让 limit 真正按"per-request"工作。
+   *   详见 agentGraphNodes.ts:resetCountersNode 的注释。
    *
    * # 为什么 summarize 只在 START 之后判断,不在循环里
    *
@@ -276,8 +286,9 @@ export async function runLangGraphAgentStream({
    * # HITL 兼容
    *
    *   HITL resume 时,LangGraph 从挂起的节点(toolNode/evaluateAnswerNode)
-   *   重跑,**不经过 START**,所以 shouldSummarize 不会触发。
-   *   这是正确的——resume 时图状态可能在"工具序列中间",此时压缩会乱套。
+   *   重跑,**不经过 START**,所以 reset / shouldSummarize 都不会触发。
+   *   这是正确的:resume 是同一个 user request 的延续,计数器要继续算、
+   *   不要在工具序列中间压缩。
    */
   const graph = new StateGraph(AgentState)
     // addNode 把节点函数注册到图里,起一个名字(后面 addEdge 要用)。
@@ -287,9 +298,12 @@ export async function runLangGraphAgentStream({
     .addNode("tools", toolNode)
     .addNode("evaluateAnswer", evaluateAnswerNode)
     .addNode("summarize", summarizeNode)
-    // Phase 11 #3:START 不再直接 → agent,而是先走 shouldSummarize 条件边
+    // Phase 11 fix — 重置计数器节点(只是为 per-request limit 兜底)
+    .addNode("reset", resetCountersNode)
+    // Phase 11 fix:START 先去 reset 把计数器清零,再到 shouldSummarize 条件边
+    .addEdge(START, "reset")
     // 第三个参数 ["summarize", "agent"] 是"可能的返回值",LangGraph 编译期会校验
-    .addConditionalEdges(START, shouldSummarize, ["summarize", "agent"])
+    .addConditionalEdges("reset", shouldSummarize, ["summarize", "agent"])
     // 压缩完后必然进 agent(state.messages 已经短了 + state.summary 已经写好)
     .addEdge("summarize", "agent")
     // addConditionalEdges:shouldContinue 返回节点名,框架按名查找下一个节点。
@@ -647,8 +661,10 @@ function buildDummyStateGraph() {
     .addNode("tools", async () => ({}))
     .addNode("evaluateAnswer", async () => ({}))
     .addNode("summarize", async () => ({}))
+    .addNode("reset", async () => ({}))
+    .addEdge(START, "reset")
     // 假图条件边返回值无所谓,但 third arg 要列全 — LangGraph 编译期会校验
-    .addConditionalEdges(START, () => END, ["summarize", "agent"])
+    .addConditionalEdges("reset", () => END, ["summarize", "agent"])
     .addEdge("summarize", "agent")
     .addConditionalEdges("agent", () => END, ["tools", "evaluateAnswer", END])
     .addEdge("tools", "agent")

@@ -350,9 +350,38 @@ export function createAgentNode(options: {
      *
      * 注意每轮都拼 system,但不存到 state.messages 里——
      * 避免 state.messages 越来越长(checkpointer 会把它持久化)。
+     *
+     * # Phase 11 #4 — 把 state.summary 拼进来
+     *
+     * 如果 state.summary 非空(说明之前 summarizeNode 跑过,把老对话压缩了),
+     * 这里要把摘要作为**第二条 SystemMessage** 塞进来,让模型"看见"早期对话的大意。
+     *
+     * 拼装顺序:
+     *   [system 原 prompt]        ← 角色/规则/工具说明
+     *   [system 早期对话摘要]      ← 只在 state.summary 非空时插
+     *   [state.messages 全文]     ← 最近 K 个回合的原文(没压缩的部分)
+     *
+     * 为什么选 SystemMessage 而不是 HumanMessage / AIMessage:
+     *   - SystemMessage 在模型眼里是"背景说明",不会被当成"某个角色说过的话"
+     *   - 防止模型把摘要误解为"用户上一句"或"我自己上一句",回复跑偏
+     *
+     * 为什么放在 system 原 prompt 之后、messages 之前:
+     *   - 时间线对齐:摘要描述的是"更早的事",自然在 state.messages 原文之前
+     *   - 前缀稳定:模型在每次模型调用看到的 system 段都是同样形状,降低混乱
+     *
+     * 注意这里的拼装**只影响本次模型调用**,不写回 state。
+     * state.summary 和 state.messages 仍由 summarizeNode / messagesStateReducer 维护。
      */
     const inputMessages = [
       { role: "system" as const, content: options.systemPrompt },
+      ...(state.summary
+        ? [
+            {
+              role: "system" as const,
+              content: `以下是更早之前对话的摘要(为节省 token 已压缩,后续 messages 是最近的原文对话):\n\n${state.summary}`,
+            },
+          ]
+        : []),
       ...state.messages,
     ];
 

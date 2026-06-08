@@ -548,8 +548,10 @@ app.get("/api/threads/:id/messages", async (req: Request, res: Response) => {
   }
 
   try {
-    const messages = await getThreadMessages(threadId);
-    res.json({ messages });
+    // Phase 11 #5 — payload 现在带 { messages, summary } 两个字段。
+    // summary 为空串 = 还没压缩过 / 老对话没这个 channel,iOS 不显示压缩提示。
+    const payload = await getThreadMessages(threadId);
+    res.json(payload);
   } catch (error) {
     console.error(`[Threads] get messages failed for ${threadId}:`, error);
     res.status(500).json({ error: "Failed to load thread messages." });

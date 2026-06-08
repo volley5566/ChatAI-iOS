@@ -57,6 +57,24 @@ export type ThreadMessage = {
 };
 
 /**
+ * Phase 11 #5 — 一个 thread 的对话历史 + 早期对话摘要。
+ *
+ * # 为什么把 summary 一起返回
+ *
+ * Phase 11 之后 state.messages 可能被 summarizeNode 真删掉了一部分,
+ * 那部分内容的"大意"留在 state.summary 里。iOS 拉历史时如果只拿 messages,
+ * 用户会困惑"我明明聊了 20 轮怎么只剩 6 条?"
+ *
+ * 把 summary 一起返回,iOS 就能在消息列表顶部展示"📋 早期 N 条对话已压缩"
+ * 的提示条,让用户知道"老消息没丢,只是浓缩了"。
+ */
+export type ThreadMessagesPayload = {
+  messages: ThreadMessage[];
+  /** 早期对话的浓缩摘要;空串表示没压缩过 */
+  summary: string;
+};
+
+/**
  * 创建新对话。
  *
  * 此时只在 Prisma threads 表里插一行——checkpointer 那边还没任何快照,
@@ -117,7 +135,9 @@ export async function listThreads(): Promise<ThreadSummary[]> {
  *
  * 如果 thread 在 Prisma 表里没有,直接返回空数组(让上层决定要不要报 404)。
  */
-export async function getThreadMessages(threadId: string): Promise<ThreadMessage[]> {
+export async function getThreadMessages(
+  threadId: string
+): Promise<ThreadMessagesPayload> {
   const checkpointer = getSqliteCheckpointer();
 
   /**
@@ -129,21 +149,28 @@ export async function getThreadMessages(threadId: string): Promise<ThreadMessage
   });
 
   if (!tuple) {
-    return [];
+    return { messages: [], summary: "" };
   }
 
   /**
    * checkpoint.channel_values 是个对象,key 是 state 字段名,value 是当前值。
-   * 我们 state schema 里有 messages / modelCallCount / toolCallCount,
-   * 这里只关心 messages。
+   * 我们 state schema 里有 messages / modelCallCount / toolCallCount / summary。
    *
-   * 类型断言成 BaseMessage[] 是因为 checkpoint 序列化时类型信息被丢失了,
+   * 类型断言成具体类型是因为 checkpoint 序列化时类型信息被丢失了,
    * channel_values 实际类型是 Record<string, unknown>。
    */
   const channelValues = tuple.checkpoint.channel_values as Record<string, unknown>;
   const messages = (channelValues?.messages as BaseMessage[]) || [];
 
-  return messagesToThreadMessages(messages);
+  // Phase 11 #5 — 同时取 summary。
+  // 老对话(Phase 11 之前的 checkpoint)没有 summary 这个 channel,
+  // 这里读出来会是 undefined,用 "" 兜底 → iOS 看到空串就不显示压缩提示。
+  const summary = (channelValues?.summary as string | undefined) ?? "";
+
+  return {
+    messages: messagesToThreadMessages(messages),
+    summary,
+  };
 }
 
 /**

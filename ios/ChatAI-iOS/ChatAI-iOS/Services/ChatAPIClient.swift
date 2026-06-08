@@ -154,14 +154,16 @@ protocol ChatAPI {
     /// 给"对话列表页"(5.6 才会做的 UI)使用。
     func listThreads() async throws -> [ThreadSummary]
 
-    /// 拉某个对话的全部可展示消息。
+    /// 拉某个对话的全部可展示消息 + 早期对话摘要(Phase 11 #5)。
     ///
-    /// 对应后端 GET /api/threads/:id/messages。
-    /// 切换到历史对话时调一次,把消息填回聊天界面。
+    /// 对应后端 GET /api/threads/:id/messages,返回 { messages, summary }。
+    /// 切换到历史对话时调一次,把消息填回聊天界面;
+    /// VM 也会在 sendMessage 完成后只取 summary 来刷新顶部 chip。
     ///
-    /// 返回的是 ThreadMessage(role + content),
+    /// 返回的是 (ThreadMessage[], String) tuple,
     /// 不是 ChatMessage——ViewModel 自己负责转换。
-    func getThreadMessages(threadID: String) async throws -> [ThreadMessage]
+    /// summary 为空串表示 thread 还没触发过压缩。
+    func getThreadMessages(threadID: String) async throws -> (messages: [ThreadMessage], summary: String)
 
     /// 删除一个对话(同时清掉后端 checkpointer 里的 state 快照)。
     ///
@@ -742,7 +744,14 @@ final class ChatAPIClient: ChatAPI {
     }
 
     /// 拉某个对话的消息历史。GET /api/threads/:id/messages
-    func getThreadMessages(threadID: String) async throws -> [ThreadMessage] {
+    ///
+    /// Phase 11 #5 — 返回值改成 tuple `(messages, summary)`:
+    ///   - messages:可显示的对话消息(过滤掉 ToolMessage 等内部消息)
+    ///   - summary:早期对话的浓缩摘要;空串表示这个 thread 还没触发压缩
+    ///
+    /// 用 tuple 而不是新建一个 struct,是因为调用方(VM)只在 loadThread 里用一次,
+    /// 拆开赋给两个 @Published 属性,struct 反而多套一层壳。
+    func getThreadMessages(threadID: String) async throws -> (messages: [ThreadMessage], summary: String) {
         /**
          * URL 路径里的 :id 用 ID 替换,记得做 URL 安全转义——
          * 虽然后端用 uuid(只含 0-9a-f-),正常不会出问题,
@@ -752,11 +761,12 @@ final class ChatAPIClient: ChatAPI {
         let data = try await performJSONRequest(method: "GET", path: "api/threads/\(encodedID)/messages", body: nil)
 
         /**
-         * 同 listThreads,后端用 { "messages": [...] } 包了一层。
-         * 这里也用 wrapper struct 接住。
+         * 后端用 { "messages": [...], "summary": "..." } 包了一层。
+         * summary 在老对话(Phase 11 之前的 checkpoint)里可能没这个字段,
+         * Decodable 的 Optional 让它解出来是 nil,后面用 ?? "" 兜底。
          */
         let wrapper = try Self.makeThreadDecoder().decode(ThreadMessagesResponseBody.self, from: data)
-        return wrapper.messages
+        return (messages: wrapper.messages, summary: wrapper.summary ?? "")
     }
 
     /// 删除一个对话。DELETE /api/threads/:id
@@ -1084,10 +1094,14 @@ private struct ThreadListResponseBody: Decodable {
     let threads: [ThreadSummary]
 }
 
-/// 对应后端 GET /api/threads/:id/messages 的 { "messages": [...] } 包装层。
+/// 对应后端 GET /api/threads/:id/messages 的 { "messages": [...], "summary": "..." } 包装层。
 /// 同理,private 收在网络层内部。
+///
+/// Phase 11 #5 — summary 是 Optional,因为老对话(Phase 11 之前的 checkpoint)
+/// JSON 里不会有这个字段,Decodable 解出来 nil,VM 那一层用 ?? "" 兜底。
 private struct ThreadMessagesResponseBody: Decodable {
     let messages: [ThreadMessage]
+    let summary: String?
 }
 
 /// iOS 发给 Node.js 的 JSON 请求体。

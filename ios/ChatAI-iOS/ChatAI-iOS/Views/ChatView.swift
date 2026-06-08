@@ -152,6 +152,13 @@ struct ChatView: View {
         ScrollViewReader { proxy in
             ScrollView {
                 LazyVStack(spacing: 12) {
+                    // Phase 11 #5 — 早期对话压缩提示。
+                    // 只在 earlySummary 非空时显示(空串 = 没压缩过)。
+                    // 放在所有消息上方,符合"时间线最早 → 最晚"的语义。
+                    if !viewModel.earlySummary.isEmpty {
+                        earlySummaryChip(summary: viewModel.earlySummary)
+                    }
+
                     ForEach(viewModel.messages) { message in
                         MessageBubbleView(
                             message: message,
@@ -197,6 +204,43 @@ struct ChatView: View {
                 scrollToBottom(messages: messages, proxy: proxy)
             }
         }
+    }
+
+    /// Phase 11 #5 — 早期对话已压缩 chip。
+    ///
+    /// 显示时机:viewModel.earlySummary 非空(后端 summarizeNode 跑过一次以上)。
+    ///
+    /// 视觉设计:
+    ///   - 左边一个文档图标 + "早期对话已压缩" 文字
+    ///   - 第二行用更小的字体显示摘要内容(最多 3 行,超出截断)
+    ///   - 浅蓝/灰色背景,跟错误条的红色风格区分开(不是错误,是辅助信息)
+    ///
+    /// 不做点击展开/详情页,因为 summary 本身就只有 200 字符以内,
+    /// 3 行足够展示完整,过度交互反而干扰阅读对话。
+    private func earlySummaryChip(summary: String) -> some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack(spacing: 6) {
+                Image(systemName: "doc.text.magnifyingglass")
+                    .foregroundStyle(.blue)
+                    .imageScale(.small)
+                Text("早期对话已压缩")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Text(summary)
+                .font(.footnote)
+                .foregroundStyle(.primary)
+                .lineLimit(3)
+                .frame(maxWidth: .infinity, alignment: .leading)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 10)
+        .background(Color.blue.opacity(0.08))
+        .clipShape(RoundedRectangle(cornerRadius: 10))
+        // 动画:从无到有时淡入,空了 chip 消失也淡出
+        .transition(.opacity)
+        .animation(.easeOut(duration: 0.2), value: summary)
     }
 
     /// 顶部错误条。

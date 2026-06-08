@@ -17,11 +17,12 @@ import { Annotation, MessagesAnnotation } from "@langchain/langgraph";
  * 修改后的状态。这个共享对象就叫 State。
  *
  * 你可以把 State 想成"一张运行中不断更新的小白板":
- *   ┌──────────────────────────────────┐
- *   │ messages:        [...所有对话]    │
- *   │ modelCallCount:  3                │
- *   │ toolCallCount:   1                │
- *   └──────────────────────────────────┘
+ *   ┌──────────────────────────────────────────┐
+ *   │ messages:        [...所有对话]            │
+ *   │ modelCallCount:  3                        │
+ *   │ toolCallCount:   1                        │
+ *   │ summary:         "用户在学 SwiftUI..."    │ ← Phase 11 加的
+ *   └──────────────────────────────────────────┘
  * 节点 A 读它、写它,节点 B 接力读它、写它,直到图跑完。
  *
  *
@@ -89,7 +90,19 @@ export const AgentState = Annotation.Root({
    * 累加意味着图任何位置都能 += 1,不需要先读再写。
    */
   modelCallCount: Annotation<number>({
-    reducer: (current, update) => (current ?? 0) + (update ?? 0),
+    // Phase 11 hotfix — 支持"重置"协议:
+    //   update === 0  → 重置成 0(给 resetCountersNode 用,每次新请求开始时清零)
+    //   update 其它   → 老语义,累加 current + update
+    //
+    // 为什么 0 可以当 sentinel:
+    //   节点自然累加时只会返回 1(每次模型调用 += 1),永远不会显式 return 0。
+    //   不传该字段时 update 是 undefined,经过 ?? 兜底变 0... 但此时
+    //   严格相等 `update === 0` 是 false(undefined !== 0),所以会走累加分支,
+    //   等价于"不传 = 不动"的老行为,向后兼容。
+    reducer: (current, update) => {
+      if (update === 0) return 0;
+      return (current ?? 0) + (update ?? 0);
+    },
     default: () => 0,
   }),
 
@@ -99,10 +112,44 @@ export const AgentState = Annotation.Root({
    * 用法和 modelCallCount 一样,toolNode 完成一次就 += 1。
    * 跟 createAgent 路径里 `toolCallLimitMiddleware` 是同一概念,
    * 只是这里我们手写,所以暴露在 state 里、在 agentNode 里检查"是否超额"。
+   *
+   * Phase 11 hotfix — 同 modelCallCount,支持 update === 0 的重置协议。
    */
   toolCallCount: Annotation<number>({
-    reducer: (current, update) => (current ?? 0) + (update ?? 0),
+    reducer: (current, update) => {
+      if (update === 0) return 0;
+      return (current ?? 0) + (update ?? 0);
+    },
     default: () => 0,
+  }),
+
+  /**
+   * 早期对话的浓缩摘要(Phase 11 #1)。
+   *
+   * 整个对话压缩机制的设计详见 langchain/summarizeNode.ts 的文件头。
+   * 这里只说本 schema 层的两个决定:
+   *
+   * # 为什么 reducer 是"覆盖式"
+   *
+   *   summarizeNode 每次跑都生成一份**完整**的新 summary
+   *   (会把"旧 summary + 这次新压缩的对话"合并成统一新摘要),
+   *   所以新值直接替换旧值即可,不需要拼接。
+   *
+   * # 默认值是空串 ""
+   *
+   *   选空串而不是 undefined / null,agentNode 里判断写起来更自然:
+   *     if (state.summary) { 拼成 SystemMessage }
+   *   不必到处写 ?? 兜底。
+   *
+   * # 向后兼容
+   *
+   *   Phase 11 之前的 thread checkpoint 里没有这个 channel。
+   *   LangGraph 反序列化时找不到的 channel 会用 default() 初始化,
+   *   等价于"老 thread 默认无 summary"——老对话**完全无感**。
+   */
+  summary: Annotation<string>({
+    reducer: (_current, update) => update ?? "",
+    default: () => "",
   }),
 });
 
@@ -117,6 +164,7 @@ export const AgentState = Annotation.Root({
  *     messages: BaseMessage[];
  *     modelCallCount: number;
  *     toolCallCount: number;
+ *     summary: string;
  *   }
  *
  * 好处:state schema 改字段时,所有用到 AgentStateType 的地方自动跟着变,

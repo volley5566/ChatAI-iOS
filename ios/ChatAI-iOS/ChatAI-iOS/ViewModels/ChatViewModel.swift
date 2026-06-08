@@ -74,6 +74,19 @@ final class ChatViewModel: ObservableObject {
     /// UI 可以分别给出不同的 loading 视觉(整页 spinner vs 输入条 disabled)。
     @Published var isLoadingHistory = false
 
+    /// Phase 11 #5 — 早期对话的浓缩摘要(后端 summarizeNode 压缩后留下的)。
+    ///
+    /// 空串 = 这个 thread 还没被压缩过(全部消息原文都在 messages 数组里)
+    /// 非空 = 老的 N 条消息已经被压成这段文字,messages 数组里只剩最近几条原文
+    ///
+    /// ChatView 会在消息列表顶部根据这个值决定要不要显示"📋 早期对话已压缩"chip。
+    ///
+    /// 何时更新:
+    ///   - loadThread() 进入已有对话时,从 GET /messages 一起拉回来
+    ///   - sendMessage() 完成后,再调一次 GET /messages 只取 summary(messages 不动)
+    ///     → 这是为了用户在同一会话里聊到触发压缩时,chip 能即时出现
+    @Published var earlySummary: String = ""
+
     /// 当前错误提示。
     /// 有值时，页面会显示一条红色提示。
     /// @Published：这个变量一变化，就通知 SwiftUI 页面刷新。
@@ -291,6 +304,10 @@ final class ChatViewModel: ObservableObject {
             // Task 包一下是因为 defer 块不支持 async,
             // 起一个后台任务静默拉就行,不卡 UI。
             Task { await loadCheckpoints() }
+            // Phase 11 #5 — 同步刷新 earlySummary。
+            // 本次请求可能在后端触发了 summarizeNode(对话刚好长到阈值),
+            // 拉一次让顶部"已压缩"chip 即时出现/更新。
+            Task { await refreshEarlySummary() }
         }
 
         // 两个临时变量
@@ -543,6 +560,11 @@ final class ChatViewModel: ObservableObject {
             isSending = false
             // Phase 9 #8 — resume 完一样刷新 checkpoints(新 AI 答案产生了新 checkpoint)
             Task { await loadCheckpoints() }
+            // Phase 11 #5 — resume 完也刷新一下 summary。
+            // 虽然 HITL resume 路径不经过 START → shouldSummarize,
+            // 不会触发新一次压缩,但拉一下也无害(只读一次 SQLite)。
+            // 加上这行让两个 defer 行为对称,以后不容易遗漏。
+            Task { await refreshEarlySummary() }
         }
 
         // 复用挂起前已经累积的文本 + 气泡 id
@@ -647,7 +669,8 @@ final class ChatViewModel: ObservableObject {
         defer { isLoadingHistory = false }
 
         do {
-            let threadMessages = try await chatAPI.getThreadMessages(threadID: threadID)
+            // Phase 11 #5 — 返回值现在是 (messages, summary) tuple
+            let (threadMessages, summary) = try await chatAPI.getThreadMessages(threadID: threadID)
 
             // compactMap:过滤 + 转换二合一。
             // ThreadMessage.role 是 String("user" / "assistant"),
@@ -661,10 +684,41 @@ final class ChatViewModel: ObservableObject {
                 return ChatMessage(role: role, content: threadMessage.content)
             }
 
+            // Phase 11 #5 — summary 设进 @Published,ChatView 顶部 chip 根据它显示/隐藏
+            earlySummary = summary
+
             // 只有加载成功才设 currentThreadID。见 init 注释里说的 invariant。
             currentThreadID = threadID
         } catch {
             errorMessage = error.localizedDescription
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 11 #5 — 单独刷新 summary(不动 messages)
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 发完消息后调一次,把后端最新的 summary 拉过来更新 chip。
+    ///
+    /// # 为什么不复用 loadThread
+    ///
+    /// loadThread 会把本地 messages 整个替换成后端版本。
+    /// 但发消息时 messages 是 iOS 这边边接 SSE delta 边构造的,
+    /// 替换会让"刚才那条 AI 回答"的 id 跳变,影响滚动锚点、反馈按钮等。
+    ///
+    /// 这里只拿 summary,messages 那部分丢弃。代价是多一次 HTTP,
+    /// 后端 SQLite 读 checkpoint 是常数时间,可以接受。
+    ///
+    /// 失败处理:静默吞掉。chip 是辅助信息,网络抖动不该弹红 banner。
+    func refreshEarlySummary() async {
+        guard let threadID = currentThreadID else { return }
+
+        do {
+            let (_, summary) = try await chatAPI.getThreadMessages(threadID: threadID)
+            earlySummary = summary
+        } catch {
+            // chip 是 nice-to-have,失败只打日志不打扰用户
+            print("[Summary] refreshEarlySummary failed: \(error.localizedDescription)")
         }
     }
 

@@ -350,9 +350,38 @@ export function createAgentNode(options: {
      *
      * 注意每轮都拼 system,但不存到 state.messages 里——
      * 避免 state.messages 越来越长(checkpointer 会把它持久化)。
+     *
+     * # Phase 11 #4 — 把 state.summary 拼进来
+     *
+     * 如果 state.summary 非空(说明之前 summarizeNode 跑过,把老对话压缩了),
+     * 这里要把摘要作为**第二条 SystemMessage** 塞进来,让模型"看见"早期对话的大意。
+     *
+     * 拼装顺序:
+     *   [system 原 prompt]        ← 角色/规则/工具说明
+     *   [system 早期对话摘要]      ← 只在 state.summary 非空时插
+     *   [state.messages 全文]     ← 最近 K 个回合的原文(没压缩的部分)
+     *
+     * 为什么选 SystemMessage 而不是 HumanMessage / AIMessage:
+     *   - SystemMessage 在模型眼里是"背景说明",不会被当成"某个角色说过的话"
+     *   - 防止模型把摘要误解为"用户上一句"或"我自己上一句",回复跑偏
+     *
+     * 为什么放在 system 原 prompt 之后、messages 之前:
+     *   - 时间线对齐:摘要描述的是"更早的事",自然在 state.messages 原文之前
+     *   - 前缀稳定:模型在每次模型调用看到的 system 段都是同样形状,降低混乱
+     *
+     * 注意这里的拼装**只影响本次模型调用**,不写回 state。
+     * state.summary 和 state.messages 仍由 summarizeNode / messagesStateReducer 维护。
      */
     const inputMessages = [
       { role: "system" as const, content: options.systemPrompt },
+      ...(state.summary
+        ? [
+            {
+              role: "system" as const,
+              content: `以下是更早之前对话的摘要(为节省 token 已压缩,后续 messages 是最近的原文对话):\n\n${state.summary}`,
+            },
+          ]
+        : []),
       ...state.messages,
     ];
 
@@ -749,6 +778,42 @@ export function createEvaluateAnswerNode(options: {
       messages: toolMessages,
       toolCallCount: 1,
     };
+  };
+}
+
+// ─── 入口节点 resetCountersNode (Phase 11 hotfix) ────────────────
+
+/**
+ * 把 modelCallCount / toolCallCount 重置成 0 的入口节点。
+ *
+ * # 这个节点存在的原因(老 bug 修复)
+ *
+ * modelCallCount / toolCallCount 在 schema 里是为"per-request 成本兜底"
+ * 设计的(`agentModelCallLimit` 默认 6):一次 Agent 请求最多调几次模型。
+ *
+ * 但它们也被 SqliteCheckpointer 当成普通 state 一起持久化了。后果:
+ *   thread 第 1 次请求结束时 modelCallCount = 2
+ *   thread 第 2 次请求开始时 state.modelCallCount 仍然是 2
+ *   累加到第 3 次请求结束时 modelCallCount = 6 →
+ *   第 4 次请求 agentNode 一进来就触发 limit → "软退出"返回空消息 →
+ *   iOS 收到 SSE 全程零 delta → 报"AI 返回了空内容"
+ *
+ * 修复:每次新请求进 START 后立刻把计数器归零。
+ * 用 `update === 0` 触发 reducer 的"重置协议"(见 agentGraphState.ts)。
+ *
+ * # 为什么不放到 shouldSummarize 里一起做
+ *   shouldSummarize 是**条件边**,只能返回下一个节点名,不能返回 state 更新。
+ *   只能用一个正经节点来"产出" state 变更。
+ *
+ * # HITL 兼容
+ *   resume 时图从挂起节点(toolNode/evaluateAnswerNode)重跑,不经过 START →
+ *   不会触发这个 reset → 计数器从挂起前的累计值继续往上加 →
+ *   这是正确的(resume 是同一个 user request 的延续,total 成本要算到一起)。
+ */
+export async function resetCountersNode(): Promise<AgentStateUpdate> {
+  return {
+    modelCallCount: 0,
+    toolCallCount: 0,
   };
 }
 

@@ -68,10 +68,16 @@ import {
   createEvaluateAnswerNode,
   createToolNode,
   extractFinalAssistantText,
+  resetCountersNode,
   shouldContinue,
 } from "./agentGraphNodes";
 import { messageContentToString } from "./chatPrompt";
 import { getSqliteCheckpointer } from "../db/sqliteCheckpointer";
+import {
+  createSummarizeNode,
+  defaultKeepLastTurns,
+  shouldSummarize,
+} from "./summarizeNode";
 
 // ─── 类型定义 ──────────────────────────────────────────────────
 
@@ -228,6 +234,13 @@ export async function runLangGraphAgentStream({
     onToolEvent,
   });
 
+  // Phase 11 #3 — 对话压缩节点
+  // shouldSummarize 条件边会在 START 之后判断要不要先跑这个节点
+  const summarizeNode = createSummarizeNode({
+    requestId,
+    keepLastTurns: defaultKeepLastTurns,
+  });
+
   /**
    * checkpointer 决定图要不要做"对话持久化":
    *   - 有 threadId → 用 SqliteCheckpointer,每次节点跑完自动存 state
@@ -238,18 +251,45 @@ export async function runLangGraphAgentStream({
   const checkpointer = threadId ? getSqliteCheckpointer() : undefined;
 
   /**
-   * # 图的拓扑(Phase 9 #6 后)
+   * # 图的拓扑(Phase 11 完整版)
    *
    *   START
    *     ↓
+   *   reset ───────────────────── (Phase 11 hotfix:每次请求把计数器清零)
+   *     ↓
+   *   shouldSummarize ──┬─→ "summarize" ─→ agent → ... (压缩老消息后进推理)
+   *                     └─→ "agent"      ─→ ...        (回合数没够,直接推理)
+   *
    *   agent ─── shouldContinue ──┬─→ "evaluateAnswer" ─→ agent (loop)
    *                              ├─→ "tools"           ─→ agent (loop)
    *                              └─→ END
    *
-   *   evaluateAnswer 节点内部直接 invoke 子图(EvaluateAnswerState schema),
-   *   不走 LangChain Tool wrapper / MCP server。
-   *   tools 节点处理其它 3 个工具(searchKnowledge / generateQuiz /
-   *   recommendNextTopic),仍然走 MCP 路径。
+   * # 节点职责速查(详细注释见各节点所在文件)
+   *
+   *   reset            agentGraphNodes.ts:resetCountersNode
+   *                    清零 modelCallCount/toolCallCount,让 per-request limit
+   *                    真正按"每次请求"工作。
+   *
+   *   summarize        langchain/summarizeNode.ts
+   *                    调 LLM 把老 messages 浓缩进 state.summary,
+   *                    用 RemoveMessage 哨兵把原文删掉。
+   *
+   *   agent            agentGraphNodes.ts:createAgentNode
+   *                    调模型决定下一步;把 state.summary 拼成
+   *                    SystemMessage 塞到 input 最前面。
+   *
+   * # 关键设计决定
+   *
+   *   reset / shouldSummarize 只放在 START 之后判断一次,不放在 agent ↔ tools
+   *   的循环里。否则会在 tool_calls / ToolMessage 配对中间切散,引发
+   *   invalid_request_error。详见 summarizeNode.ts:shouldSummarize 注释。
+   *
+   * # HITL 兼容
+   *
+   *   HITL resume 从挂起的工具节点重跑,**不经过 START** →
+   *   reset / shouldSummarize 自然跳过。这正是想要的:
+   *   resume 是同一个 user request 的延续,计数器要继续算,
+   *   也不该在工具序列中间压缩。
    */
   const graph = new StateGraph(AgentState)
     // addNode 把节点函数注册到图里,起一个名字(后面 addEdge 要用)。
@@ -258,8 +298,15 @@ export async function runLangGraphAgentStream({
     .addNode("agent", agentNode)
     .addNode("tools", toolNode)
     .addNode("evaluateAnswer", evaluateAnswerNode)
-    // addEdge 加"必然走"的边:START → agent
-    .addEdge(START, "agent")
+    .addNode("summarize", summarizeNode)
+    // Phase 11 hotfix — 重置计数器节点(只是为 per-request limit 兜底)
+    .addNode("reset", resetCountersNode)
+    // Phase 11 hotfix:START 先去 reset 把计数器清零,再到 shouldSummarize 条件边
+    .addEdge(START, "reset")
+    // 第三个参数 ["summarize", "agent"] 是"可能的返回值",LangGraph 编译期会校验
+    .addConditionalEdges("reset", shouldSummarize, ["summarize", "agent"])
+    // 压缩完后必然进 agent(state.messages 已经短了 + state.summary 已经写好)
+    .addEdge("summarize", "agent")
     // addConditionalEdges:shouldContinue 返回节点名,框架按名查找下一个节点。
     // 第三个参数是"可能的返回值列表",帮 LangGraph 做静态分析 + 画图 + 类型推导。
     // Phase 9 #6 加了 "evaluateAnswer" 这个分支(原来只有 "tools" / END)。
@@ -606,11 +653,20 @@ function getDummyStateGraph() {
 }
 
 function buildDummyStateGraph() {
+  // ⚠️ 节点 + 边的拓扑必须和真图(上面的 graph)完全一致,否则:
+  //   - 节点名不一致 → checkpoint 里记录的 task 名字找不到对应节点,getState 报错
+  //   - 边连法不一致 → compile() 期"unreachable node"检查失败
+  // 我们读 state 不调 invoke/stream,节点函数体可以全是空 noop。
   return new StateGraph(AgentState)
     .addNode("agent", async () => ({}))
     .addNode("tools", async () => ({}))
     .addNode("evaluateAnswer", async () => ({}))
-    .addEdge(START, "agent")
+    .addNode("summarize", async () => ({}))
+    .addNode("reset", async () => ({}))
+    .addEdge(START, "reset")
+    // 假图条件边返回值无所谓,但 third arg 要列全 — LangGraph 编译期会校验
+    .addConditionalEdges("reset", () => END, ["summarize", "agent"])
+    .addEdge("summarize", "agent")
     .addConditionalEdges("agent", () => END, ["tools", "evaluateAnswer", END])
     .addEdge("tools", "agent")
     .addEdge("evaluateAnswer", "agent")

@@ -11,6 +11,7 @@
     "evaluate:debug": "node -r ts-node/register/transpile-only src/mcp/evaluateAnswerDebug.ts",
     "recommend:debug": "node -r ts-node/register/transpile-only src/mcp/recommendNextTopicDebug.ts",
     "quiz:debug": "node -r ts-node/register/transpile-only src/mcp/generateQuizDebug.ts",
+    "summarize:debug": "node -r ts-node/register/transpile-only src/langchain/summarizeDebug.ts",
     "prisma:debug": "node -r ts-node/register/transpile-only src/db/prismaDebug.ts",
     "mcp:dev": "node -r ts-node/register/transpile-only src/mcp/mcpServer.ts",
     "mcp:start": "node dist/mcp/mcpServer.js",

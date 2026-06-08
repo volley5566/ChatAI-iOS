@@ -143,6 +143,54 @@ export const toolExecutionTimeoutMs = readIntegerEnv(
   1000
 );
 
+// ─── Phase 11 对话压缩 ───────────────────────────────────────
+
+/**
+ * 对话压缩功能总开关。
+ *
+ * true  → 每次新请求进 START 后会先判断"要不要压缩"
+ * false → 直接进 agent,跳过 shouldSummarize/summarizeNode,行为退回 Phase 10
+ *
+ * 默认 true(直接生效)。给一个开关是为了出问题时秒回滚,跟 USE_LANGGRAPH 同模式。
+ *
+ * 注意:这个开关只影响 LangGraph 路径(USE_LANGGRAPH=true)。
+ * createAgent 路径不接 checkpointer,本来就没必要压缩。
+ */
+const summarizeEnabledRaw = (process.env.AGENT_SUMMARIZE_ENABLED || "").trim().toLowerCase();
+export const agentSummarizeEnabled =
+  summarizeEnabledRaw !== "false" && summarizeEnabledRaw !== "0";
+
+/**
+ * 触发摘要的"用户回合数"阈值。
+ *
+ * 一个"回合" = 一条 HumanMessage + 它后面的所有 AI/Tool 消息直到下一条 HumanMessage。
+ * 当 state.messages 里 HumanMessage 数量 > 这个阈值时,shouldSummarize 路由到 summarizeNode。
+ *
+ * 默认 6:对应 6 轮"你问 AI 答"。一般这个量级的对话 token 在 2-4k 之间,
+ * 还没到必须压缩的程度,但已经够触发压缩学习这个机制。
+ * 生产环境可以调大(比如 20),纯学习场景可以调小(比如 3)方便观察。
+ */
+export const agentSummarizeTriggerTurns = readIntegerEnv(
+  "AGENT_SUMMARIZE_TRIGGER_TURNS",
+  6,
+  2
+);
+
+/**
+ * 摘要时保留最近多少个回合不压缩。
+ *
+ * keep < trigger 才有意义:trigger=6, keep=3 表示
+ *   "攒到 6 个回合 → 压缩最老的 3 个,保留最近 3 个"
+ *
+ * 默认 3:模型既能看到最近 3 轮原文(细节清晰),又能从 summary 拿到更早的大意。
+ * 这是 LangGraph 官方 summarization how-to 的常见参数。
+ */
+export const agentSummarizeKeepTurns = readIntegerEnv(
+  "AGENT_SUMMARIZE_KEEP_TURNS",
+  3,
+  1
+);
+
 // ─── LangGraph 切换开关 ──────────────────────────────────────
 
 /**

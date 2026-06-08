@@ -7,6 +7,11 @@ import {
   SystemMessage,
 } from "@langchain/core/messages";
 import { logAgentError, logAgentInfo } from "../agent/agentObservability";
+import {
+  agentSummarizeEnabled,
+  agentSummarizeKeepTurns,
+  agentSummarizeTriggerTurns,
+} from "../config/env";
 import type { AgentStateType, AgentStateUpdate } from "./agentGraphState";
 import { createLangChainChatModel } from "./chatModel";
 import { messageContentToString } from "./chatPrompt";
@@ -300,6 +305,68 @@ export function createSummarizeNode(options: {
     };
   };
 }
+
+// ─── 条件边 shouldSummarize ───────────────────────────────────
+
+/**
+ * 条件边函数 —— 决定每个新请求进 START 后是先压缩还是直接进 agent。
+ *
+ * # 它在主图里的位置
+ *
+ *   START → shouldSummarize ─┬─→ "summarize" → agent → ...
+ *                            └─→ "agent"      → ...
+ *
+ *   (注意:不放在 agent → ? 的循环边里,只在 START 之后判断一次。
+ *    原因见 agentGraph.ts 里图编排部分的注释。)
+ *
+ * # 触发逻辑
+ *
+ *   总开关 AGENT_SUMMARIZE_ENABLED:
+ *     false → 永远返回 "agent",等于功能关闭
+ *
+ *   HumanMessage 总数 > AGENT_SUMMARIZE_TRIGGER_TURNS:
+ *     true  → 返回 "summarize",让摘要节点先跑一次
+ *     false → 返回 "agent",回合数还没攒够,直接进推理
+ *
+ * # 为什么按 "HumanMessage 总数" 而不是 "messages 总数"
+ *
+ *   一个用户回合可能产生很多条 messages(AIMessage + 多条 ToolMessage)。
+ *   按 message 数判断会被工具调用的次数严重影响,
+ *   而按 HumanMessage 数能稳定反映"用户问过几轮"——这才是压缩的语义单位。
+ *
+ *   summarizeNode 内部的 keepLastTurns 也是按 HumanMessage 切的,两边对齐。
+ *
+ * # 返回值必须是字面量字符串
+ *
+ *   LangGraph 的条件边在编译期会对返回值做静态分析,确认每个返回值都对应
+ *   一个已 addNode 的节点。返回 "summarize" / "agent" 之外的字符串会让
+ *   compile() 报错或运行时找不到目标节点。
+ */
+export function shouldSummarize(state: AgentStateType): "summarize" | "agent" {
+  if (!agentSummarizeEnabled) {
+    return "agent";
+  }
+
+  const humanCount = state.messages.filter((m) => isHumanMessage(m)).length;
+
+  if (humanCount > agentSummarizeTriggerTurns) {
+    return "summarize";
+  }
+
+  return "agent";
+}
+
+// ─── 默认参数导出(给 agentGraph.ts 拼装节点用)───────────────
+
+/**
+ * 把 keepLastTurns 默认值从 env 读出来,
+ * agentGraph.ts 编节点时不用再 import env 模块。
+ *
+ * 单独导出是因为 createSummarizeNode 的 options.keepLastTurns
+ * 是可选参数,默认走的是 DEFAULT_KEEP_LAST_TURNS 常量(本文件顶部),
+ * 但我们希望生产路径用 env 配的值,所以编节点时显式传入。
+ */
+export const defaultKeepLastTurns = agentSummarizeKeepTurns;
 
 // ─── 调试用 standalone 入口 ───────────────────────────────────
 

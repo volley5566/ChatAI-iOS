@@ -72,6 +72,11 @@ import {
 } from "./agentGraphNodes";
 import { messageContentToString } from "./chatPrompt";
 import { getSqliteCheckpointer } from "../db/sqliteCheckpointer";
+import {
+  createSummarizeNode,
+  defaultKeepLastTurns,
+  shouldSummarize,
+} from "./summarizeNode";
 
 // ─── 类型定义 ──────────────────────────────────────────────────
 
@@ -228,6 +233,13 @@ export async function runLangGraphAgentStream({
     onToolEvent,
   });
 
+  // Phase 11 #3 — 对话压缩节点
+  // shouldSummarize 条件边会在 START 之后判断要不要先跑这个节点
+  const summarizeNode = createSummarizeNode({
+    requestId,
+    keepLastTurns: defaultKeepLastTurns,
+  });
+
   /**
    * checkpointer 决定图要不要做"对话持久化":
    *   - 有 threadId → 用 SqliteCheckpointer,每次节点跑完自动存 state
@@ -238,18 +250,34 @@ export async function runLangGraphAgentStream({
   const checkpointer = threadId ? getSqliteCheckpointer() : undefined;
 
   /**
-   * # 图的拓扑(Phase 9 #6 后)
+   * # 图的拓扑(Phase 11 #3 后)
    *
    *   START
    *     ↓
+   *   shouldSummarize ──┬─→ "summarize" ─→ agent → ... (压缩老消息后进推理)
+   *                     └─→ "agent"      ─→ ...        (回合数没够,直接推理)
+   *
    *   agent ─── shouldContinue ──┬─→ "evaluateAnswer" ─→ agent (loop)
    *                              ├─→ "tools"           ─→ agent (loop)
    *                              └─→ END
    *
-   *   evaluateAnswer 节点内部直接 invoke 子图(EvaluateAnswerState schema),
-   *   不走 LangChain Tool wrapper / MCP server。
-   *   tools 节点处理其它 3 个工具(searchKnowledge / generateQuiz /
-   *   recommendNextTopic),仍然走 MCP 路径。
+   * # 为什么 summarize 只在 START 之后判断,不在循环里
+   *
+   *   想象一次请求触发了 4 轮 ReAct 循环:
+   *     agent → tools → agent → tools → agent → END
+   *
+   *   如果在每次 agent 之前都判断 summarize,就可能在 tools 调用和 agent
+   *   消化结果之间插一刀,把 tool_calls / ToolMessage 的配对切散,
+   *   模型会看到"无主的 ToolMessage"直接报 invalid_request_error。
+   *
+   *   把判断放在 START 之后,只对应"一个新用户请求开始"这个时刻,
+   *   100% 安全(此时 state 永远停在"END 后的稳定态")。
+   *
+   * # HITL 兼容
+   *
+   *   HITL resume 时,LangGraph 从挂起的节点(toolNode/evaluateAnswerNode)
+   *   重跑,**不经过 START**,所以 shouldSummarize 不会触发。
+   *   这是正确的——resume 时图状态可能在"工具序列中间",此时压缩会乱套。
    */
   const graph = new StateGraph(AgentState)
     // addNode 把节点函数注册到图里,起一个名字(后面 addEdge 要用)。
@@ -258,8 +286,12 @@ export async function runLangGraphAgentStream({
     .addNode("agent", agentNode)
     .addNode("tools", toolNode)
     .addNode("evaluateAnswer", evaluateAnswerNode)
-    // addEdge 加"必然走"的边:START → agent
-    .addEdge(START, "agent")
+    .addNode("summarize", summarizeNode)
+    // Phase 11 #3:START 不再直接 → agent,而是先走 shouldSummarize 条件边
+    // 第三个参数 ["summarize", "agent"] 是"可能的返回值",LangGraph 编译期会校验
+    .addConditionalEdges(START, shouldSummarize, ["summarize", "agent"])
+    // 压缩完后必然进 agent(state.messages 已经短了 + state.summary 已经写好)
+    .addEdge("summarize", "agent")
     // addConditionalEdges:shouldContinue 返回节点名,框架按名查找下一个节点。
     // 第三个参数是"可能的返回值列表",帮 LangGraph 做静态分析 + 画图 + 类型推导。
     // Phase 9 #6 加了 "evaluateAnswer" 这个分支(原来只有 "tools" / END)。
@@ -606,11 +638,18 @@ function getDummyStateGraph() {
 }
 
 function buildDummyStateGraph() {
+  // ⚠️ 节点 + 边的拓扑必须和真图(上面的 graph)完全一致,否则:
+  //   - 节点名不一致 → checkpoint 里记录的 task 名字找不到对应节点,getState 报错
+  //   - 边连法不一致 → compile() 期"unreachable node"检查失败
+  // 我们读 state 不调 invoke/stream,节点函数体可以全是空 noop。
   return new StateGraph(AgentState)
     .addNode("agent", async () => ({}))
     .addNode("tools", async () => ({}))
     .addNode("evaluateAnswer", async () => ({}))
-    .addEdge(START, "agent")
+    .addNode("summarize", async () => ({}))
+    // 假图条件边返回值无所谓,但 third arg 要列全 — LangGraph 编译期会校验
+    .addConditionalEdges(START, () => END, ["summarize", "agent"])
+    .addEdge("summarize", "agent")
     .addConditionalEdges("agent", () => END, ["tools", "evaluateAnswer", END])
     .addEdge("tools", "agent")
     .addEdge("evaluateAnswer", "agent")

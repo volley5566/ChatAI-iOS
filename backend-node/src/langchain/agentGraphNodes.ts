@@ -781,7 +781,7 @@ export function createEvaluateAnswerNode(options: {
   };
 }
 
-// ─── 入口节点 resetCountersNode (Phase 11 fix) ────────────────
+// ─── 入口节点 resetCountersNode (Phase 11 hotfix) ────────────────
 
 /**
  * 把 modelCallCount / toolCallCount 重置成 0 的入口节点。

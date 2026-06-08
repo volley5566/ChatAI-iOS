@@ -17,11 +17,12 @@ import { Annotation, MessagesAnnotation } from "@langchain/langgraph";
  * 修改后的状态。这个共享对象就叫 State。
  *
  * 你可以把 State 想成"一张运行中不断更新的小白板":
- *   ┌──────────────────────────────────┐
- *   │ messages:        [...所有对话]    │
- *   │ modelCallCount:  3                │
- *   │ toolCallCount:   1                │
- *   └──────────────────────────────────┘
+ *   ┌──────────────────────────────────────────┐
+ *   │ messages:        [...所有对话]            │
+ *   │ modelCallCount:  3                        │
+ *   │ toolCallCount:   1                        │
+ *   │ summary:         "用户在学 SwiftUI..."    │ ← Phase 11 加的
+ *   └──────────────────────────────────────────┘
  * 节点 A 读它、写它,节点 B 接力读它、写它,直到图跑完。
  *
  *
@@ -89,7 +90,7 @@ export const AgentState = Annotation.Root({
    * 累加意味着图任何位置都能 += 1,不需要先读再写。
    */
   modelCallCount: Annotation<number>({
-    // Phase 11 fix — 支持"重置"协议:
+    // Phase 11 hotfix — 支持"重置"协议:
     //   update === 0  → 重置成 0(给 resetCountersNode 用,每次新请求开始时清零)
     //   update 其它   → 老语义,累加 current + update
     //
@@ -112,7 +113,7 @@ export const AgentState = Annotation.Root({
    * 跟 createAgent 路径里 `toolCallLimitMiddleware` 是同一概念,
    * 只是这里我们手写,所以暴露在 state 里、在 agentNode 里检查"是否超额"。
    *
-   * Phase 11 fix — 同 modelCallCount,支持 update === 0 的重置协议。
+   * Phase 11 hotfix — 同 modelCallCount,支持 update === 0 的重置协议。
    */
   toolCallCount: Annotation<number>({
     reducer: (current, update) => {
@@ -123,38 +124,28 @@ export const AgentState = Annotation.Root({
   }),
 
   /**
-   * 早期对话的浓缩摘要(Phase 11 对话压缩)。
+   * 早期对话的浓缩摘要(Phase 11 #1)。
    *
-   * # 为什么需要这个字段
+   * 整个对话压缩机制的设计详见 langchain/summarizeNode.ts 的文件头。
+   * 这里只说本 schema 层的两个决定:
    *
-   * 长对话场景下,state.messages 会一直增长。每次模型调用都把全部 messages
-   * 喂给 DeepSeek,会有两个问题:
-   *   1. token 成本随对话长度线性飙升
-   *   2. 超出模型上下文窗口直接报错
+   * # 为什么 reducer 是"覆盖式"
    *
-   * 压缩思路:跑到一定长度时,启动一个 summarizeNode,
-   *   - 用 LLM 把"老消息"浓缩成一段 summary 文本
-   *   - 用 `RemoveMessage` 哨兵把那些老 messages 从 state 里删掉
-   *   - summary 存到这个字段,后续 agentNode 把它拼成 SystemMessage
-   *     塞在每轮模型调用的最前面,模型仍然"知道"早期发生过什么。
+   *   summarizeNode 每次跑都生成一份**完整**的新 summary
+   *   (会把"旧 summary + 这次新压缩的对话"合并成统一新摘要),
+   *   所以新值直接替换旧值即可,不需要拼接。
    *
-   * # 为什么 reducer 是"覆盖式"(不是累加 / 追加)
+   * # 默认值是空串 ""
    *
-   * 每次 summarizeNode 跑完都生成一份**完整**的新 summary
-   * (它会把"旧 summary + 新消息"合并成新的"统一 summary"),
-   * 所以新值直接替换旧值就行,不需要拼接。
-   *
-   * # 默认值 ""
-   *
-   * 选空串而不是 undefined / null,好处是 agentNode 里判断很自然:
-   *   if (state.summary) { ... 拼成 SystemMessage ... }
-   * 不需要写一堆 ?? 兜底。
+   *   选空串而不是 undefined / null,agentNode 里判断写起来更自然:
+   *     if (state.summary) { 拼成 SystemMessage }
+   *   不必到处写 ?? 兜底。
    *
    * # 向后兼容
    *
-   * 老 thread 的 checkpoint 里没有这个 channel。LangGraph 反序列化时
-   * 找不到的 channel 会用 default() 初始化,等价于"老 thread 默认无 summary"。
-   * 所以这次改动**对老对话完全无感**,不会因为 schema 不匹配报错。
+   *   Phase 11 之前的 thread checkpoint 里没有这个 channel。
+   *   LangGraph 反序列化时找不到的 channel 会用 default() 初始化,
+   *   等价于"老 thread 默认无 summary"——老对话**完全无感**。
    */
   summary: Annotation<string>({
     reducer: (_current, update) => update ?? "",
@@ -173,6 +164,7 @@ export const AgentState = Annotation.Root({
  *     messages: BaseMessage[];
  *     modelCallCount: number;
  *     toolCallCount: number;
+ *     summary: string;
  *   }
  *
  * 好处:state schema 改字段时,所有用到 AgentStateType 的地方自动跟着变,

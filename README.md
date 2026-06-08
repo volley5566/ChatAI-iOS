@@ -197,6 +197,7 @@ sequenceDiagram
 | **HITL** (Phase 9) | Human-in-the-Loop:`interrupt()` 让图暂停,等用户在 iOS 上批准再执行工具 | §11 章节 |
 | **Subgraph** (Phase 9) | 把复杂工具的内部流程拆成"图中图",主图把子图当普通节点用 | §12 章节 |
 | **Time-travel** (Phase 9) | 从历史 checkpoint 分叉出新 thread,像 git checkout 一样回到过去 | §13 章节 |
+| **Summarization** (Phase 11) | 长对话时让 LLM 把老消息压成 summary,`RemoveMessage` 把原文删掉,token 成本从线性增长变有上限 | §14 章节 |
 
 ### 0.5 三个核心权衡
 
@@ -237,10 +238,12 @@ sequenceDiagram
 | Phase 7 | 工具集扩展到 4 个（LLM-as-judge + 学习规划） | `mcp/mcpToolHandlers.ts` |
 | Phase 10 | 生产化：LangSmith trace + Eval + CI/CD + 安全加固 + Docker | `langsmithClient.ts` `evals/` `Dockerfile` |
 | **Phase 9** | **高级 LangGraph:HITL 人工审核 + Subgraph 子图 + Time-travel 时光机** | `agentGraphNodes.ts` `subgraphs/evaluateAnswerGraph.ts` `ToolApprovalCard.swift` |
+| **Phase 11** | **对话压缩 + 顺手修了一个 per-request 计数器老 bug**(为 Phase 8 Multi-Agent 铺路) | `summarizeNode.ts` `agentGraphState.ts`(summary channel) `ChatView.swift`(chip) |
 
 Phase 3 和 Phase 4 通过 `USE_LANGGRAPH` 环境变量灰度切换,行为完全等价。
-**注意 Phase 9 整块(HITL + Subgraph + Time-travel)只在 USE_LANGGRAPH=true 路径生效**——
-createAgent 路径不接 checkpointer,这三个能力都依赖 checkpointer 持久化 state。
+**注意 Phase 9 / Phase 11 都只在 USE_LANGGRAPH=true 路径生效**——
+createAgent 路径不接 checkpointer,而 HITL / Subgraph / Time-travel / Summarization
+这几块全部依赖 checkpointer 持久化 state。
 
 ---
 
@@ -1603,7 +1606,244 @@ ios/ChatAI-iOS/ChatAI-iOS/
 
 ---
 
-## 14. 后续规划
+## 14. 对话压缩 — Summarization(Phase 11)
+
+**核心一句话**:长对话久了 `state.messages` 会无限增长 — 让 LLM 把"较早的消息"浓缩成一段 summary 文本,用 `RemoveMessage` 哨兵把原文从 state 里删掉,后续模型调用只看"summary + 最近 K 个回合",**token 成本从线性增长变成有上限**。
+
+### 14.1 解决什么问题
+
+```text
+不压缩:
+  thread 第 1 轮 → state.messages 4 条  → 每次调模型送 4 条
+  thread 第 2 轮 → state.messages 8 条  → 每次调模型送 8 条
+  thread 第 5 轮 → state.messages 22 条 → 每次调模型送 22 条
+                                              ↑
+                                           每多一轮,所有后续模型调用都更贵
+                                           + 早晚撑爆上下文窗口
+
+有压缩:
+  thread 第 1~3 轮: 同上(回合数 ≤ 阈值,不触发)
+  thread 第 4 轮 进 START → shouldSummarize 发现回合数 > 3 →
+                          路由到 summarize 节点 →
+                          调一次 LLM 把最老的 N 条压成一段 summary →
+                          return RemoveMessage(id1) ... RemoveMessage(idN) →
+                          reducer 把这 N 条从 messages 里**真删**,留 summary →
+                          agentNode 调模型时拼:
+                            [system, system(summary), 最近 K 个回合]
+  thread 第 5+ 轮: summary 迭代更新,messages 永远保持紧凑
+```
+
+为 **Phase 8(Multi-Agent)铺路**:多 Agent 场景下 messages 增长更快,而 Supervisor 调 Worker 时通常只需要"任务摘要"而不是完整历史。Phase 11 给后续的 multi-agent 提供了基础设施。
+
+### 14.2 新图拓扑
+
+```text
+START
+  ↓
+reset ────────────── (Phase 11 hotfix:把 modelCallCount/toolCallCount 清零)
+  ↓
+shouldSummarize ──┬─→ "summarize" ─→ agent → ... → END
+                  └─→ "agent"      ─→ ...        → END
+
+agent ─── shouldContinue ──┬─→ "evaluateAnswer" ─→ agent (loop)
+                           ├─→ "tools"           ─→ agent (loop)
+                           └─→ END
+```
+
+```mermaid
+flowchart TD
+    START([START])
+    RESET[reset<br/>清零计数器]
+    SHOULD{{shouldSummarize?<br/>HumanMessage 数 > 阈值?}}
+    SUMM[summarize<br/>调 LLM 压老消息]
+    AGENT[agent<br/>调模型推理]
+    TOOLS[tools<br/>MCP 工具]
+    EVAL[evaluateAnswer<br/>子图直连]
+    END_([END])
+
+    START --> RESET --> SHOULD
+    SHOULD -- 太长 --> SUMM --> AGENT
+    SHOULD -- 没事 --> AGENT
+    AGENT -.shouldContinue.-> TOOLS
+    AGENT -.-> EVAL
+    AGENT -.无 tool_call.-> END_
+    TOOLS --> AGENT
+    EVAL --> AGENT
+
+    style SUMM fill:#e6f4ff
+    style RESET fill:#fff4cc
+```
+
+### 14.3 三个关键设计决定
+
+```text
+1. 在 START 之后判断,不放循环里
+   - 放循环里(agent → ? 每次判断)→ 可能在 tool_calls / ToolMessage 配对
+     中间切散 → 模型看到孤儿 ToolMessage → invalid_request_error
+   - 放 START 之后 → 只对应"一个新用户请求开始",100% 安全
+
+2. 按 "HumanMessage 总数" 判断阈值,不按 "messages.length"
+   - 一个用户回合可能产生很多条 messages(AIMessage + 多条 ToolMessage)
+   - 按 messages 总数判断会被工具调用次数严重影响,抖动大
+   - 按用户回合数判断 = 真正的"对话长度"语义
+
+3. 从 HumanMessage 边界"切",不从中间随便切
+   - tool_calls(AIMessage)和对应 ToolMessage 是成对的
+   - 切点落中间 → 孤儿 ToolMessage → 模型报错
+   - 每个新回合一定从 HumanMessage 开始,从这里切 100% 安全
+```
+
+### 14.4 RemoveMessage 是什么 — LangGraph 删消息的协议
+
+LangGraph 节点不能直接修改 state,只能 `return` 一个 partial update,由框架的 reducer 动手改 state。问题:**reducer 默认是"追加"语义,怎么表达"删一条"?**
+
+LangGraph 的方案:发明一个**伪装成消息的"删除指令对象"** `RemoveMessage({id})`,跟普通消息走同一根传送带(messages channel),但 `messagesStateReducer` 看到它就反向操作 + 把指令本身扔了。
+
+```text
+节点 return:
+  {
+    summary: "用户在学 SwiftUI...",
+    messages: [
+      RemoveMessage({ id: "m1" }),   ← 4 张"撕单指令"
+      RemoveMessage({ id: "m2" }),
+      RemoveMessage({ id: "m3" }),
+      RemoveMessage({ id: "m4" }),
+    ]
+  }
+
+       ↓ messagesStateReducer 内部
+       
+  for (incoming of newMessages):
+    if (incoming instanceof RemoveMessage):
+      state.messages = state.messages.filter(m => m.id !== incoming.id)
+      # incoming 自己也不留下
+    else:
+      state.messages.push(incoming)
+
+新 state:
+  messages: [m5, m6, m7, ...] ← 从 N 条变成最近几条,且没有任何 RemoveMessage 残留
+  summary:  "用户在学 SwiftUI..."
+```
+
+**RemoveMessage 自己永远不会出现在 state.messages 里**——它的全部使命就是"传一句话:删 id=X",reducer 用完即扔。
+
+### 14.5 迭代式摘要
+
+如果 `state.summary` 已经有内容(之前压过一次),这次摘要不是只摘要新消息,而是把"旧 summary + 这次新要压的消息"喂给 LLM,要求合并成**一份新的完整摘要**:
+
+```text
+prompt:
+  下面是已有的对话摘要 + 这次要追加压缩的对话片段。
+  请合并生成一份完整的新摘要,保持 200 字以内。
+  
+  【已有摘要】
+  用户想学 SwiftUI,AI 已讲解 @State / @Binding...
+  
+  【要追加压缩的对话】
+  H: 出 3 道题  / A: tool_call(generateQuiz) / T: {...} / A: 题目已出
+  H: 我答错了  / A: tool_call(evaluateAnswer) / T: {...} / A: 评分...
+```
+
+类比 git rebase 的 squash —— 多次 squash 出来的还是一份完整提交。这保证长对话连续压缩,语义不丢。
+
+### 14.6 配置
+
+```text
+AGENT_SUMMARIZE_ENABLED       默认 true   总开关(false 等于关功能,行为退回 Phase 10)
+AGENT_SUMMARIZE_TRIGGER_TURNS 默认 6      HumanMessage 数 > 这个值就触发
+AGENT_SUMMARIZE_KEEP_TURNS    默认 3      保留最近几个回合不压缩
+```
+
+调试观察:把阈值调小到 `TRIGGER=3 / KEEP=2`,这样第 4 轮就能立刻看到压缩生效:
+
+```bash
+AGENT_SUMMARIZE_TRIGGER_TURNS=3 \
+AGENT_SUMMARIZE_KEEP_TURNS=2 \
+npm run dev
+```
+
+或者脱离整张图,只单测摘要节点:
+
+```bash
+npm run summarize:debug
+```
+
+### 14.7 iOS 端 UX
+
+后端 `GET /api/threads/:id/messages` 返回多了一个 `summary` 字段(空串 = 没压缩过)。iOS 在消息列表顶部根据这个字段决定要不要显示一个浅蓝 chip:
+
+```text
+┌─────────────────────────────────────────────────┐
+│ 🔍 早期对话已压缩                                │
+│ 用户在学 SwiftUI,AI 已讲解 @State 和 @Binding   │
+│ 的区别,并给过 toggle 例子,出过 3 道题...        │
+└─────────────────────────────────────────────────┘
+[最近几条原文气泡...]
+[最近几条原文气泡...]
+[输入框]
+```
+
+刷新时机:
+- 进入对话页时(`loadThread`)
+- 每次 `sendMessage` / `resumePending` 完成后(发完消息可能刚好触发新一次压缩 → chip 即时出现)
+
+iOS 本地 `messages` 数组**不会被替换**(否则流式气泡 id 会跳变,影响滚动锚点和反馈按钮)。刷新只取后端 payload 里的 `summary` 字段,丢弃 messages。
+
+### 14.8 Phase 11 hotfix:计数器 per-request 重置
+
+Phase 11 实测时暴露的一个 Phase 5 老 bug:
+
+```text
+state.modelCallCount / state.toolCallCount 设计初衷是"per-request 成本兜底"
+                                          (agentModelCallLimit 默认 6)
+但它们也被 SqliteCheckpointer 当普通 state 持久化了 →
+跨请求累加 →
+thread 聊到第 4 轮就把 limit 撞穿 →
+agentNode 立刻"软退出"返回空消息 → iOS 收到"AI 返回了空内容"报错。
+```
+
+修复:加一个 `reset` 节点放在 START 之后第一个跑,把两个计数器归零。reducer 配合改成"`update === 0` → 重置"协议(其它正整数维持原"累加"语义,向后兼容)。
+
+```text
+HITL 兼容:
+  resume 时图从挂起节点重跑,不经过 START → reset 不触发 →
+  计数器从挂起前继续累加(正确——resume 是同一个 user request 的延续,
+  total 成本要算到一起)
+```
+
+### 14.9 与其它 Phase 的协同
+
+| 跟谁 | 关系 |
+|---|---|
+| **Phase 5** (checkpointer) | summary / messages 改动都自动落进 SQLite,跨请求恢复 |
+| **Phase 9 HITL** | shouldSummarize 不在 resume 路径上,挂起态不会触发压缩,工具调用配对永远完整 |
+| **Phase 9 Subgraph** | evaluateAnswer 子图有自己独立的 state schema,不受主图压缩影响 |
+| **Phase 9 Time-travel** | fork 出来的新 thread 会带上当时的 summary(快照语义正确),后续新对话可能再次触发新压缩 |
+| **Phase 8 Multi-Agent** (未来) | 为 Supervisor → Worker 之间传"任务摘要"提供原语,避免每个 Worker 都接收完整主图 history |
+
+### 14.10 关键文件
+
+```text
+backend-node/src/
+  langchain/
+    agentGraphState.ts         ★ summary channel(覆盖式 reducer) + 计数器 reset 协议
+    summarizeNode.ts           ★ 主体:createSummarizeNode / shouldSummarize / runSummarizeStandalone
+    summarizeDebug.ts          ★ npm run summarize:debug 入口
+    agentGraphNodes.ts         ★ resetCountersNode + agentNode 拼 summary 作 SystemMessage
+    agentGraph.ts              ★ 主图 + dummy 图都加 reset + summarize 节点
+  config/env.ts                AGENT_SUMMARIZE_ENABLED/TRIGGER_TURNS/KEEP_TURNS
+  db/threadsRepository.ts      getThreadMessages 改成返回 {messages, summary}
+  server.ts                    /api/threads/:id/messages 端点透传 summary
+
+ios/ChatAI-iOS/ChatAI-iOS/
+  Services/ChatAPIClient.swift  getThreadMessages 返回 tuple (messages, summary)
+  ViewModels/ChatViewModel.swift earlySummary 状态 + refreshEarlySummary()
+  Views/ChatView.swift          earlySummaryChip 顶部显示
+```
+
+---
+
+## 15. 后续规划
 
 ```text
 ✅ Phase 9   高级 LangGraph(全部完成 — 8/8 任务)
@@ -1611,11 +1851,20 @@ ios/ChatAI-iOS/ChatAI-iOS/
    ✅ #5-#6  Subgraph 子图(evaluateAnswer 重构 + 主图集成)
    ✅ #7-#8  Time-travel 时光机(checkpoints + fork API + iOS 长按分叉)
 
-⏳ Phase 8   Multi-Agent 协作(Router + 子 Agent)
+✅ Phase 11  对话压缩 + 计数器 per-request 重置 hotfix(全部完成 — 5 个 substep + 1 hotfix)
+   ✅ #1     state schema 加 summary channel
+   ✅ #2     summarizeNode + debug 脚本
+   ✅ #3     接进主图(shouldSummarize 条件边)
+   ✅ #4     agentNode 把 summary 拼成 SystemMessage
+   ✅ #5     /messages 端点返回 summary + iOS chip
+   ✅ hotfix reset 节点 + reducer 重置协议(修 Phase 5 老 bug)
+
+⏳ Phase 8   Multi-Agent 协作(Supervisor + 子 Agent)
    - 概念:一个"总控 Agent"按用户意图把请求路由给不同的"专家 Agent"
      (代码 Agent / 学习 Agent / 总结 Agent...)
    - 复用 Phase 9 的子图 pattern:每个专家就是一个独立子图
    - 复用 Phase 5 的 checkpointer:子图自己的 state 也能持久化
+   - 复用 Phase 11 的 summary:Supervisor 调 Worker 时只传摘要,不传全 history
 ```
 
-Phase 9 已经把 LangGraph 的三大杀手锏(挂起恢复 / 子图组合 / 时光回溯)都接上了。Phase 8 的多 Agent 协作只是在这套基础上多加一层"路由 Agent",难度反而比 Phase 9 低。
+Phase 9 + Phase 11 已经把 LangGraph 的核心能力(挂起恢复 / 子图组合 / 时光回溯 / 上下文压缩)都接上了。Phase 8 的多 Agent 协作只是在这套基础上多加一层"路由 Agent",难度反而比 Phase 9 低。

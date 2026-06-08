@@ -359,12 +359,10 @@ export function shouldSummarize(state: AgentStateType): "summarize" | "agent" {
 // ─── 默认参数导出(给 agentGraph.ts 拼装节点用)───────────────
 
 /**
- * 把 keepLastTurns 默认值从 env 读出来,
- * agentGraph.ts 编节点时不用再 import env 模块。
+ * 从 env 读出来的 keepLastTurns,给 agentGraph.ts 编节点时传入。
  *
- * 单独导出是因为 createSummarizeNode 的 options.keepLastTurns
- * 是可选参数,默认走的是 DEFAULT_KEEP_LAST_TURNS 常量(本文件顶部),
- * 但我们希望生产路径用 env 配的值,所以编节点时显式传入。
+ * `createSummarizeNode` 自己有个 `DEFAULT_KEEP_LAST_TURNS` 常量兜底(=3),
+ * 但生产路径希望走 env 配置,所以编节点时显式传入这个值。
  */
 export const defaultKeepLastTurns = agentSummarizeKeepTurns;
 

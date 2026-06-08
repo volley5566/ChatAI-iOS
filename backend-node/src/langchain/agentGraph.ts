@@ -251,11 +251,11 @@ export async function runLangGraphAgentStream({
   const checkpointer = threadId ? getSqliteCheckpointer() : undefined;
 
   /**
-   * # 图的拓扑(Phase 11 #5 fix 后)
+   * # 图的拓扑(Phase 11 完整版)
    *
    *   START
    *     ↓
-   *   reset ───────────────────────── (重置 modelCallCount/toolCallCount 为 0)
+   *   reset ───────────────────── (Phase 11 hotfix:每次请求把计数器清零)
    *     ↓
    *   shouldSummarize ──┬─→ "summarize" ─→ agent → ... (压缩老消息后进推理)
    *                     └─→ "agent"      ─→ ...        (回合数没够,直接推理)
@@ -264,31 +264,32 @@ export async function runLangGraphAgentStream({
    *                              ├─→ "tools"           ─→ agent (loop)
    *                              └─→ END
    *
-   * # reset 节点修了什么 bug
+   * # 节点职责速查(详细注释见各节点所在文件)
    *
-   *   modelCallCount / toolCallCount 一直被 checkpointer 当普通 state 持久化,
-   *   导致同一 thread 跨请求累加(thread 第 4 轮就撞穿默认 limit=6 → 软退出)。
-   *   reset 在 START 之后第一个跑,把计数器归零,让 limit 真正按"per-request"工作。
-   *   详见 agentGraphNodes.ts:resetCountersNode 的注释。
+   *   reset            agentGraphNodes.ts:resetCountersNode
+   *                    清零 modelCallCount/toolCallCount,让 per-request limit
+   *                    真正按"每次请求"工作。
    *
-   * # 为什么 summarize 只在 START 之后判断,不在循环里
+   *   summarize        langchain/summarizeNode.ts
+   *                    调 LLM 把老 messages 浓缩进 state.summary,
+   *                    用 RemoveMessage 哨兵把原文删掉。
    *
-   *   想象一次请求触发了 4 轮 ReAct 循环:
-   *     agent → tools → agent → tools → agent → END
+   *   agent            agentGraphNodes.ts:createAgentNode
+   *                    调模型决定下一步;把 state.summary 拼成
+   *                    SystemMessage 塞到 input 最前面。
    *
-   *   如果在每次 agent 之前都判断 summarize,就可能在 tools 调用和 agent
-   *   消化结果之间插一刀,把 tool_calls / ToolMessage 的配对切散,
-   *   模型会看到"无主的 ToolMessage"直接报 invalid_request_error。
+   * # 关键设计决定
    *
-   *   把判断放在 START 之后,只对应"一个新用户请求开始"这个时刻,
-   *   100% 安全(此时 state 永远停在"END 后的稳定态")。
+   *   reset / shouldSummarize 只放在 START 之后判断一次,不放在 agent ↔ tools
+   *   的循环里。否则会在 tool_calls / ToolMessage 配对中间切散,引发
+   *   invalid_request_error。详见 summarizeNode.ts:shouldSummarize 注释。
    *
    * # HITL 兼容
    *
-   *   HITL resume 时,LangGraph 从挂起的节点(toolNode/evaluateAnswerNode)
-   *   重跑,**不经过 START**,所以 reset / shouldSummarize 都不会触发。
-   *   这是正确的:resume 是同一个 user request 的延续,计数器要继续算、
-   *   不要在工具序列中间压缩。
+   *   HITL resume 从挂起的工具节点重跑,**不经过 START** →
+   *   reset / shouldSummarize 自然跳过。这正是想要的:
+   *   resume 是同一个 user request 的延续,计数器要继续算,
+   *   也不该在工具序列中间压缩。
    */
   const graph = new StateGraph(AgentState)
     // addNode 把节点函数注册到图里,起一个名字(后面 addEdge 要用)。
@@ -298,9 +299,9 @@ export async function runLangGraphAgentStream({
     .addNode("tools", toolNode)
     .addNode("evaluateAnswer", evaluateAnswerNode)
     .addNode("summarize", summarizeNode)
-    // Phase 11 fix — 重置计数器节点(只是为 per-request limit 兜底)
+    // Phase 11 hotfix — 重置计数器节点(只是为 per-request limit 兜底)
     .addNode("reset", resetCountersNode)
-    // Phase 11 fix:START 先去 reset 把计数器清零,再到 shouldSummarize 条件边
+    // Phase 11 hotfix:START 先去 reset 把计数器清零,再到 shouldSummarize 条件边
     .addEdge(START, "reset")
     // 第三个参数 ["summarize", "agent"] 是"可能的返回值",LangGraph 编译期会校验
     .addConditionalEdges("reset", shouldSummarize, ["summarize", "agent"])

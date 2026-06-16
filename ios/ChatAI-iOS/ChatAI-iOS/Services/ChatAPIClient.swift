@@ -304,6 +304,8 @@ final class ChatAPIClient: ChatAPI {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Phase 12:统一带上用户身份(详见 sendStreamingRequest 处注释)。
+        request.setValue(UserIdentity.current, forHTTPHeaderField: "X-User-Id")
 
         // 3. 把 Swift 结构体编码成 JSON 数据。
         // 后端 server.ts 期望收到：
@@ -507,6 +509,9 @@ final class ChatAPIClient: ChatAPI {
         var request = URLRequest(url: url)//-URLRequest ≈ Retrofit 的 @POST + @Body,或 OkHttp 的 Request.Builder
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Phase 12:带上当前用户身份。后端按这个头给跨对话记忆分租户。
+        // 放在 HTTP 头而不是 body —— 身份是横切信息,所有接口统一带,不污染各自的请求体。
+        request.setValue(UserIdentity.current, forHTTPHeaderField: "X-User-Id")
 
         let requestBody = ChatRequestBody(
             message: message,
@@ -900,6 +905,8 @@ final class ChatAPIClient: ChatAPI {
                     var request = URLRequest(url: url)
                     request.httpMethod = "POST"
                     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    // Phase 12:统一带上用户身份(详见 sendStreamingRequest 处注释)。
+                    request.setValue(UserIdentity.current, forHTTPHeaderField: "X-User-Id")
 
                     // 构造 body:approved 必填,edited_args 可选
                     var bodyDict: [String: Any] = ["approved": approved]
@@ -1016,6 +1023,9 @@ final class ChatAPIClient: ChatAPI {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Phase 12:统一带上用户身份(详见 sendStreamingRequest 处注释)。
+        // 对话 CRUD(建/列/删)也要带,这样新建对话才能挂到正确的用户名下。
+        request.setValue(UserIdentity.current, forHTTPHeaderField: "X-User-Id")
         if let body {
             request.httpBody = body
         }

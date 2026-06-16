@@ -1,5 +1,5 @@
 // ============================================================
-// Prisma Schema —— Phase 5(Checkpointer 持久化)
+// Prisma Schema —— Phase 5(Checkpointer 持久化)+ Phase 12(跨对话记忆)
 // ============================================================
 //
 // 这个文件是"数据库的设计图"。Prisma 通过它生成:
@@ -32,6 +32,39 @@ datasource db {
 }
 
 // ============================================================
+// Phase 12 新增:User(用户)
+// ============================================================
+//
+// # 为什么 Phase 12 才引入 User
+//   Phase 1~11 整个系统是"匿名单设备"的:一台设备 = 所有对话,没有"我是谁"的概念。
+//   到了跨对话长期记忆(Phase 12),记忆必须有归属——"记住张三在学 SwiftUI"
+//   这条记忆是属于张三的,不能被别人看到。所以要先有一个"用户身份"的锚点。
+//
+// # 这个 User 不是"账号系统"
+//   它没有用户名 / 密码 / 邮箱。它只是一个"租户 id":
+//     - iOS 首次启动时本地生成一个 UUID,存进 UserDefaults,之后每个请求带上
+//     - 后端第一次见到这个 id 就 upsert 一行 User
+//   将来真要做登录,再在这张表上加字段即可,记忆的归属模型不用动。
+//
+// # 为什么要单独建表而不是只存一个字符串列
+//   1. 外键约束 → 记忆和对话都挂在 User 下,数据完整性有保障
+//   2. 级联删除 → "清空我的所有数据"只要删一行 User,记忆自动跟着删(见 Memory)
+//   3. 扩展点    → 以后的"用户级偏好"(比如记忆开关、语言偏好)有地方放
+model User {
+  id String @id @default(uuid())
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // 反向关系:一个用户有多段对话、多条记忆。
+  // 这两行不会在数据库里产生真实列,只是 Prisma 客户端用来做关联查询的"导航"。
+  threads  Thread[]
+  memories Memory[]
+
+  @@map("users")
+}
+
+// ============================================================
 // 第一版业务表:Thread(对话)
 // ============================================================
 //
@@ -42,6 +75,7 @@ datasource db {
 //   - id:对话的唯一标识,iOS 端用它来切换对话
 //   - title:对话标题(比如"SwiftUI @State 入门"),可为空
 //   - createdAt / updatedAt:用来排序对话列表
+//   - userId(Phase 12 新增):这段对话属于哪个用户
 //
 // 物理表名用 snake_case `threads`(SQL 惯例),
 // 通过 `@@map("threads")` 映射;Prisma TypeScript 客户端里仍然用 PascalCase Thread。
@@ -57,6 +91,14 @@ model Thread {
   // - 用 String?(末尾问号)表示可空
   title String?
 
+  // Phase 12:这段对话的归属用户。
+  // - 故意做成**可空**:Phase 11 之前建的老对话没有 userId,
+  //   设成 NOT NULL 会让 migration 在老数据上失败。可空 = 向后兼容。
+  // - onDelete: SetNull:万一某个 User 被删,对话不跟着消失(对话还有
+  //   checkpointer 里的历史,贸然删掉会留下孤儿数据),只把归属清空。
+  userId String?
+  user   User?   @relation(fields: [userId], references: [id], onDelete: SetNull)
+
   // 创建时间。
   // @default(now()) 让数据库在插入时自动填当前时间,代码里不用手填。
   createdAt DateTime @default(now())
@@ -66,7 +108,74 @@ model Thread {
   // 我们用它实现"对话列表按最新活跃时间排序"。
   updatedAt DateTime @updatedAt
 
+  // 按 userId 建索引:将来"只列出某用户的对话"时不用全表扫描。
+  @@index([userId])
   // 物理表名:threads(默认会用 PascalCase Thread,这里手动改成 snake_case)。
   // SQL 惯例是 snake_case + 复数,Prisma 客户端那边仍用 Thread。
   @@map("threads")
+}
+
+// ============================================================
+// Phase 12 新增:Memory(跨对话长期记忆)
+// ============================================================
+//
+// # 这张表是干嘛的
+//   Checkpointer 解决的是"同一段对话内"的记忆(thread 内多轮)。
+//   Memory 表解决的是"跨对话"的记忆:在对话 A 里学到的事实,对话 B 也能用到。
+//
+//   类比:checkpointer 是"本次通话的草稿纸",Memory 是"客户档案库(CRM)"。
+//   通话结束草稿纸扔掉,但要点会被提炼进档案库,下次通话自动调出来。
+//
+// # 一条记忆长什么样
+//   userId  = 归属哪个用户(任何查询都强制带它,天然做到用户间隔离)
+//   kind    = 记忆类型(下面三选一,认知科学的经典分类,Mem0 / LangMem 都用):
+//               semantic   关于用户/世界的稳定事实  ("用户在学 SwiftUI")
+//               episodic   过去发生的具体事件        ("上周 @State 答错了,得 1 分")
+//               procedural 偏好/做事规则             ("喜欢先看代码再看解释")
+//   content = 记忆正文(一句自然语言)
+//
+// # embedding 字段:为什么要存向量
+//   读取记忆时不是"全部塞给模型"(可能上千条,既贵又吵),而是按"当前问题"
+//   做语义检索,只挑最相关的几条。检索靠的就是 embedding 向量的余弦相似度——
+//   和 Phase 6 RAG 知识库用的是同一套 Ollama embedding 基础设施。
+//
+//   - 类型用 Bytes(SQLite 里就是 BLOB):把 768 维 Float32Array 序列化成二进制存。
+//   - 可空:刚插入还没来得及算向量、或算向量失败时,记录仍然能先落库,事后补算。
+//   - embeddingModel:记下这条向量是哪个模型算的(如 "ollama:nomic-embed-text")。
+//     将来换 embedding 模型,可以据此找出"旧向量"重新计算,避免新旧向量混在一起
+//     算相似度(维度/语义空间不一致,比出来的分数是错的)。这和 ragCache 的
+//     指纹失效是同一个思路。
+//
+// # sourceThreadId:这条记忆是从哪段对话提炼出来的
+//   可空,纯粹是溯源/调试用——点开一条记忆能跳回它的来源对话。
+//   不做外键(对话可能已被删,但记忆要保留),只存一个裸字符串。
+model Memory {
+  id String @id @default(uuid())
+
+  // 归属用户。NOT NULL —— 记忆必须有主人,没有"匿名记忆"。
+  // onDelete: Cascade:删用户 → 他的记忆全部自动删干净(GDPR 友好,"清空我的数据")。
+  userId String
+  user   User   @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  // 记忆类型:"semantic" | "episodic" | "procedural"。
+  // 用裸字符串而不是 enum:SQLite 对 enum 支持弱,且字符串在调试时更直观。
+  // 取值约束放在应用层(memoryStore)校验。
+  kind String
+
+  // 记忆正文。
+  content String
+
+  // 来源对话 id(可空,溯源用,不设外键)。
+  sourceThreadId String?
+
+  // 语义向量(可空,BLOB)。+ 算它的 embedding 模型标识(指纹,失效重算用)。
+  embedding      Bytes?
+  embeddingModel String?
+
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+
+  // 几乎所有查询都是"某用户 + 某类型"的检索,联合索引能显著加速。
+  @@index([userId, kind])
+  @@map("memories")
 }

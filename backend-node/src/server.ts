@@ -136,6 +136,26 @@ app.get("/health", (_req: Request, res: Response) => {
   });
 });
 
+/**
+ * Phase 12 — 从请求里取"当前用户 id"。
+ *
+ * # 身份为什么走 HTTP 头而不是请求体
+ *   userId 是一个**横切关注点**(每个接口都要,但又不属于业务参数),
+ *   放在 `X-User-Id` 头里,GET / POST / DELETE 全都能统一带上,
+ *   不用给每个 body / query 单独加字段。这是身份类信息的常见做法。
+ *
+ * # 这不是鉴权
+ *   现阶段后端**完全信任**这个头里的值(iOS 本地生成的匿名 UUID),
+ *   不做任何校验/签名。它的作用只是"给数据分租户",好让 Phase 12 的
+ *   跨对话记忆能按用户隔离。将来要做真正的登录鉴权,把这里换成
+ *   "解析 JWT → 取 sub" 即可,上层业务代码不用动。
+ *
+ * 没传头 → 返回 undefined → 退回匿名行为(向后兼容老版本 iOS)。
+ */
+function getUserId(req: Request): string | undefined {
+  return req.header("x-user-id")?.trim() || undefined;
+}
+
 // ═══════════════════════════════════════════════════════════════════
 // /api/chat — 非流式结构化 JSON(最早期接口)
 // ═══════════════════════════════════════════════════════════════════
@@ -327,15 +347,19 @@ app.post(
       const rawThreadId = body.thread_id?.trim();
       const threadId = rawThreadId || undefined;
 
+      // Phase 12:取当前用户 id(来自 X-User-Id 头,可能为空 → 匿名)。
+      const userId = getUserId(req);
+
       /**
        * 有 threadId 就 touch 一下 threads 表(Prisma upsert):
        *   - 不存在 → 自动创建(iOS 直接发消息不必先调 POST /api/threads)
        *   - 已存在 → 刷新 updatedAt(对话列表按最近活跃排序)
+       *   - Phase 12:带上 userId,把对话挂到该用户名下(老对话会被自动回填)
        *
        * 故意不 try/catch: db 都写不了,后续 checkpointer 也大概率出问题,早 fail 早暴露。
        */
       if (threadId) {
-        await touchThread(threadId);
+        await touchThread(threadId, userId);
       }
 
       logAgentInfo(requestId, "request", "received", {
@@ -506,7 +530,11 @@ app.post(
 app.post("/api/threads", async (req: Request, res: Response) => {
   try {
     const body = req.body as { title?: string };
-    const thread = await createThread({ title: body.title });
+    // Phase 12:把新对话挂到当前用户名下(X-User-Id 头,可能为空 → 匿名对话)。
+    const thread = await createThread({
+      title: body.title,
+      userId: getUserId(req),
+    });
     res.status(201).json(thread);
   } catch (error) {
     console.error("[Threads] create failed:", error);
@@ -723,8 +751,8 @@ app.post(
         edited: Boolean(decision.edited_args),
       });
 
-      // 续跑过程中可能再次刷新 thread updatedAt
-      await touchThread(threadId);
+      // 续跑过程中可能再次刷新 thread updatedAt(Phase 12:一并带上用户归属)
+      await touchThread(threadId, getUserId(req));
 
       // ── 建立 SSE ─────────────────────────────────────────────
       res.setHeader("Content-Type", "text/event-stream; charset=utf-8");

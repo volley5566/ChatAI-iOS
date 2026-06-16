@@ -75,6 +75,33 @@ export type ThreadMessagesPayload = {
 };
 
 /**
+ * Phase 12 — 确保某个 userId 在 users 表里存在(不存在就建一行)。
+ *
+ * # 为什么需要这一步
+ *   Thread.userId / Memory.userId 都是指向 users 表的外键。
+ *   外键约束要求"被指向的那行必须先存在",否则插入会报 FK 违约。
+ *   iOS 端的 userId 是本地生成的匿名 UUID,后端第一次见到时表里还没有,
+ *   所以在关联对话/记忆之前,先 upsert 兜底建好这个用户。
+ *
+ * # 为什么用 upsert 而不是 create
+ *   绝大多数请求里这个用户早就存在了,upsert 的语义正是
+ *   "有就什么都不做(update {} 只刷 updatedAt),没有才建",幂等、并发安全。
+ *
+ * 传空 / undefined 直接跳过——匿名(无 userId)请求依旧能跑,向后兼容。
+ */
+export async function ensureUser(userId?: string): Promise<void> {
+  const id = userId?.trim();
+  if (!id) {
+    return;
+  }
+  await prisma.user.upsert({
+    where: { id },
+    create: { id },
+    update: {}, // 已存在:空更新,仅触发 @updatedAt
+  });
+}
+
+/**
  * 创建新对话。
  *
  * 此时只在 Prisma threads 表里插一行——checkpointer 那边还没任何快照,
@@ -84,15 +111,24 @@ export type ThreadMessagesPayload = {
  *   - 不传 → Prisma 自动生成 UUID(老行为)
  *   - 传 → 用调用方指定的 id(Time-travel fork 时需要先在 LangGraph
  *          那边算好新 thread_id,再用同一个 id 在 Prisma 这边建行)
+ *
+ * Phase 12 加了可选的 userId 参数:
+ *   - 传了 → 先 ensureUser 兜底,再把对话挂到这个用户名下
+ *   - 不传 → userId 留空(匿名对话),向后兼容
  */
 export async function createThread(options: {
   id?: string;
   title?: string;
+  userId?: string;
 }): Promise<ThreadSummary> {
+  const userId = options.userId?.trim() || undefined;
+  await ensureUser(userId);
+
   const thread = await prisma.thread.create({
     data: {
       ...(options.id ? { id: options.id } : {}),
       title: options.title?.trim() || null,
+      ...(userId ? { userId } : {}),
       // id / createdAt / updatedAt 默认让 Prisma 自动填(见 schema.prisma)
     },
   });
@@ -248,12 +284,24 @@ export async function deleteThread(threadId: string): Promise<void> {
  * upsert + update {} 是 Prisma 触发 @updatedAt 的标准技巧:
  *   - 找不到这个 id 就按 create 数据创建
  *   - 找到了就执行 update {}(空更新),触发 @updatedAt 刷
+ *
+ * Phase 12:可选 userId。
+ *   - 传了 → 先 ensureUser,再把 userId 写进对话(create 和 update 都写)。
+ *           对 update 也写 userId 的好处:Phase 12 之前建的老对话(userId 为空)
+ *           会在用户下次发消息时被自动"回填"归属,无需单独的数据迁移脚本。
+ *   - 不传 → 退回老行为(空更新只刷 updatedAt),匿名请求照常工作。
  */
-export async function touchThread(threadId: string): Promise<void> {
+export async function touchThread(
+  threadId: string,
+  userId?: string
+): Promise<void> {
+  const ownerId = userId?.trim() || undefined;
+  await ensureUser(ownerId);
+
   await prisma.thread.upsert({
     where: { id: threadId },
-    create: { id: threadId },
-    update: {}, // 空更新仍然触发 updatedAt 刷
+    create: { id: threadId, ...(ownerId ? { userId: ownerId } : {}) },
+    update: ownerId ? { userId: ownerId } : {}, // 空更新仍触发 updatedAt 刷
   });
 }
 

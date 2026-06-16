@@ -399,6 +399,8 @@ export async function runSummarizeStandalone(options: {
     modelCallCount: 0,
     toolCallCount: 0,
     summary: options.existingSummary ?? "",
+    // Phase 12 新增的 state channel —— summarizeNode 用不到,给个空数组占位即可
+    recalledMemories: [],
   });
 
   const removedIds = (update.messages ?? [])

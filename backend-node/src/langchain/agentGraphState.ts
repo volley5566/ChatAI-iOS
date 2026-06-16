@@ -151,6 +151,34 @@ export const AgentState = Annotation.Root({
     reducer: (_current, update) => update ?? "",
     default: () => "",
   }),
+
+  /**
+   * 本次请求召回的跨对话长期记忆(Phase 12 #3)。
+   *
+   * 每个元素是一条已格式化好的记忆行(如 "[事实] 用户在学 SwiftUI"),
+   * 由 recallMemoriesNode 在 agent 推理前写入;agentNode 把它们拼成一段
+   * SystemMessage 注入模型(和 summary 并列)。
+   *
+   * # 为什么 reducer 是"覆盖式"
+   *   recalledMemories 是**请求级**的临时上下文,不是要累积的历史。
+   *   recallMemoriesNode 每次新请求都按"当前这条问题"重新检索一批,
+   *   直接整体替换旧值即可。recall 节点即使没召回到 / 功能关闭,也会显式
+   *   return { recalledMemories: [] } 把它清空,避免上一轮的记忆被 checkpointer
+   *   持久化后,在这一轮被错误地再次注入。
+   *
+   * # 和 summary 的区别
+   *   summary  = 这"同一段对话"里更早的消息压缩(thread 内)
+   *   recalled = "跨对话"从记忆库捞出来的用户长期事实/偏好(thread 间)
+   *   两者来源不同、生命周期不同,所以是两个独立 channel。
+   *
+   * # 向后兼容
+   *   Phase 12 之前的 checkpoint 没有这个 channel,反序列化时用 default() = []
+   *   初始化,老对话完全无感。
+   */
+  recalledMemories: Annotation<string[]>({
+    reducer: (_current, update) => update ?? [],
+    default: () => [],
+  }),
 });
 
 /**

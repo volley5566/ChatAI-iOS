@@ -92,6 +92,12 @@ type RunLangChainAgentStreamOptions = {
    */
   threadId?: string;
   /**
+   * 当前用户 id(接口对齐字段,Phase 12)。
+   * 跨对话记忆只在 LangGraph 路径生效;Phase 3 createAgent 没有那张图,
+   * 这里收下后忽略(和 threadId 同样的"对齐但不用"处理)。
+   */
+  userId?: string;
+  /**
    * HITL 续跑参数(接口对齐字段)。
    * Phase 3 createAgent **不支持 HITL** —— 收到非空值时直接抛错,
    * 提示调用方切到 USE_LANGGRAPH=true。
@@ -111,12 +117,14 @@ export async function runLangChainAgentStream({
   history,
   // _ 前缀表示"声明了但故意不用",消除 lint 警告
   threadId: _threadId,
+  userId: _userId,
   resumePayload,
   onToolEvent,
   onDelta,
   shouldStop,
 }: RunLangChainAgentStreamOptions): Promise<LangChainAgentRunResult> {
   void _threadId;
+  void _userId;
 
   // Phase 3 createAgent 没接 checkpointer,根本无法 resume 一个挂起的图。
   // 收到 resumePayload 直接报错,避免上层误以为续跑成功了。

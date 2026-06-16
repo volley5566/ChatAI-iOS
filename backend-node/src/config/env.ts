@@ -191,6 +191,48 @@ export const agentSummarizeKeepTurns = readIntegerEnv(
   1
 );
 
+// ─── Phase 12 跨对话记忆:读取(recall)────────────────────────
+
+/**
+ * 记忆"读取"功能总开关(Phase 12 #3)。
+ *
+ * true  → 每次新请求在 agent 推理前,先 recallMemoriesNode 按当前问题
+ *         语义检索该用户的长期记忆,拼成 SystemMessage 注入模型。
+ * false → recall 节点直接返回空,模型看不到任何跨对话记忆,行为退回 Phase 11。
+ *
+ * **默认 false** —— 这是第一个让记忆真正影响模型输出的开关,
+ * 故意默认关闭,灰度上线:确认无误后再在 .env 里显式打开。
+ * 跟 USE_LANGGRAPH / AGENT_SUMMARIZE_ENABLED 同模式,出问题秒回滚。
+ *
+ * 只在 LangGraph 路径(USE_LANGGRAPH=true)生效——recall 节点挂在 StateGraph 上,
+ * createAgent 路径没有这张图。
+ */
+const memoryRecallEnabledRaw = (process.env.MEMORY_RECALL_ENABLED || "")
+  .trim()
+  .toLowerCase();
+export const memoryRecallEnabled =
+  memoryRecallEnabledRaw === "true" || memoryRecallEnabledRaw === "1";
+
+/**
+ * 每次 recall 最多注入几条记忆。默认 5,和 RAG_TOP_K 一个量级——
+ * 太多会把 system prompt 撑大、稀释重点,也更费 token。
+ */
+export const memoryRecallTopK = readIntegerEnv("MEMORY_RECALL_TOP_K", 5, 1);
+
+/**
+ * 相似度下限:低于这个分数的记忆判为"跟当前问题无关",不注入。
+ *
+ * 默认 0.5 偏宽松——nomic-embed-text 对同语言文本给的基线相似度本来就偏高
+ * (无关内容也常有 0.6 上下),这一版优先"让人看见 recall 生效",
+ * 宁可多注入一两条也不要漏。生产环境想更干净可以调高到 0.7+。
+ * 是 0..1 的浮点,见 memoryStore.cosineSimilarity。
+ */
+export const memoryRecallMinScore = readNumberEnv(
+  "MEMORY_RECALL_MIN_SCORE",
+  0.5,
+  0
+);
+
 // ─── LangGraph 切换开关 ──────────────────────────────────────
 
 /**

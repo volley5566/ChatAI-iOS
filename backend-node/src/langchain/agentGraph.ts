@@ -66,6 +66,7 @@ import { AgentState } from "./agentGraphState";
 import {
   createAgentNode,
   createEvaluateAnswerNode,
+  createRecallMemoriesNode,
   createToolNode,
   extractFinalAssistantText,
   resetCountersNode,
@@ -142,6 +143,14 @@ type RunLangGraphAgentStreamOptions = {
    * (兼容老版本 iOS,server.ts 不传 thread_id 时走这条)
    */
   threadId?: string;
+  /**
+   * 当前用户 id(Phase 12)。
+   *
+   * 传了 + MEMORY_RECALL_ENABLED=true → recallMemoriesNode 会按这个用户检索
+   *   跨对话长期记忆,注入模型。
+   * 不传 → recall 节点直接返回空(匿名请求没有专属记忆),其余行为不变。
+   */
+  userId?: string;
   onToolEvent?: (event: ChatStreamEvent) => void;
   onDelta?: (delta: string) => void;
   shouldStop?: () => boolean;
@@ -159,6 +168,7 @@ export async function runLangGraphAgentStream({
   systemPrompt,
   history,
   threadId,
+  userId,
   resumePayload,
   onToolEvent,
   onDelta,
@@ -241,6 +251,14 @@ export async function runLangGraphAgentStream({
     keepLastTurns: defaultKeepLastTurns,
   });
 
+  // Phase 12 #3 — 记忆召回节点
+  // 在 agent 推理前按当前问题检索该用户的跨对话长期记忆,注入 SystemMessage。
+  // userId 为空 / MEMORY_RECALL_ENABLED=false 时,节点内部直接返回空,等于不生效。
+  const recallMemoriesNode = createRecallMemoriesNode({
+    requestId,
+    userId,
+  });
+
   /**
    * checkpointer 决定图要不要做"对话持久化":
    *   - 有 threadId → 用 SqliteCheckpointer,每次节点跑完自动存 state
@@ -256,6 +274,8 @@ export async function runLangGraphAgentStream({
    *   START
    *     ↓
    *   reset ───────────────────── (Phase 11 hotfix:每次请求把计数器清零)
+   *     ↓
+   *   recallMemories ──────────── (Phase 12 #3:按当前问题召回跨对话记忆)
    *     ↓
    *   shouldSummarize ──┬─→ "summarize" ─→ agent → ... (压缩老消息后进推理)
    *                     └─→ "agent"      ─→ ...        (回合数没够,直接推理)
@@ -301,10 +321,17 @@ export async function runLangGraphAgentStream({
     .addNode("summarize", summarizeNode)
     // Phase 11 hotfix — 重置计数器节点(只是为 per-request limit 兜底)
     .addNode("reset", resetCountersNode)
-    // Phase 11 hotfix:START 先去 reset 把计数器清零,再到 shouldSummarize 条件边
+    // Phase 12 #3 — 记忆召回节点(reset 之后、压缩判断之前)
+    .addNode("recallMemories", recallMemoriesNode)
+    // Phase 11 hotfix:START 先去 reset 把计数器清零
     .addEdge(START, "reset")
+    // Phase 12 #3:reset 之后先 recallMemories(注入跨对话记忆),再判断要不要压缩
+    .addEdge("reset", "recallMemories")
     // 第三个参数 ["summarize", "agent"] 是"可能的返回值",LangGraph 编译期会校验
-    .addConditionalEdges("reset", shouldSummarize, ["summarize", "agent"])
+    .addConditionalEdges("recallMemories", shouldSummarize, [
+      "summarize",
+      "agent",
+    ])
     // 压缩完后必然进 agent(state.messages 已经短了 + state.summary 已经写好)
     .addEdge("summarize", "agent")
     // addConditionalEdges:shouldContinue 返回节点名,框架按名查找下一个节点。
@@ -663,9 +690,11 @@ function buildDummyStateGraph() {
     .addNode("evaluateAnswer", async () => ({}))
     .addNode("summarize", async () => ({}))
     .addNode("reset", async () => ({}))
+    .addNode("recallMemories", async () => ({}))
     .addEdge(START, "reset")
+    .addEdge("reset", "recallMemories")
     // 假图条件边返回值无所谓,但 third arg 要列全 — LangGraph 编译期会校验
-    .addConditionalEdges("reset", () => END, ["summarize", "agent"])
+    .addConditionalEdges("recallMemories", () => END, ["summarize", "agent"])
     .addEdge("summarize", "agent")
     .addConditionalEdges("agent", () => END, ["tools", "evaluateAnswer", END])
     .addEdge("tools", "agent")

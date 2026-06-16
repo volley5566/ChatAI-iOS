@@ -409,6 +409,8 @@ app.post(
         systemPrompt,
         history,
         threadId,
+        // Phase 12:把用户身份带进去,LangGraph 路径用它召回跨对话记忆
+        userId,
         // 工具进度回调: 工具事件 → 转成 SSE 推给 iOS
         onToolEvent: (event) => {
           if (!clientClosed) {
@@ -772,6 +774,9 @@ app.post(
         systemPrompt: undefined,
         history: [],
         threadId,
+        // Phase 12:对齐传入(resume 不经过 recall 节点,这里其实用不到,
+        // 但保持和主流程一致,避免遗漏)
+        userId: getUserId(req),
         resumePayload: decision,
         onToolEvent: (event) => {
           if (!clientClosed) {

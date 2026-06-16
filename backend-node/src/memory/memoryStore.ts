@@ -87,21 +87,8 @@ export async function putMemory(input: {
   }
   assertValidKind(input.kind);
 
-  // 算向量。失败就降级成"无向量记忆",不让整条写入失败。
-  // 类型收窄到 Uint8Array<ArrayBuffer>:Prisma 6 的 Bytes 输入类型不接受
-  // 宽泛的 ArrayBufferLike(它可能是 SharedArrayBuffer)。
-  let embedding: Uint8Array<ArrayBuffer> | null = null;
-  let embeddingModel: string | null = null;
-  try {
-    const vector = await createLangChainEmbeddings().embedQuery(content);
-    embedding = serializeVector(vector);
-    embeddingModel = getEmbeddingsIdentity();
-  } catch (error) {
-    console.error(
-      "[MemoryStore] embedding failed, storing memory without vector:",
-      error
-    );
-  }
+  // 算向量(失败降级成"无向量记忆",不让整条写入失败)。
+  const { embedding, embeddingModel } = await computeEmbedding(content);
 
   const row = await prisma.memory.create({
     data: {
@@ -115,6 +102,38 @@ export async function putMemory(input: {
   });
 
   return toMemoryRecord(row);
+}
+
+/**
+ * 更新一条已有记忆的正文(Phase 12 #4 去重用)。
+ *
+ * memoryWriter 提炼出新记忆时,如果发现库里已有"几乎一样"的一条(相似度超阈值),
+ * 不再插一条重复的,而是调这个函数把那条**刷新**成最新措辞 + 重算向量。
+ * 这是最朴素的"合并"——用新表述覆盖旧表述,避免同一事实存很多遍。
+ *
+ * 找不到这个 id 返回 null(幂等,调用方自行决定要不要回退成插入)。
+ */
+export async function updateMemory(
+  memoryId: string,
+  content: string
+): Promise<MemoryRecord | null> {
+  const trimmed = content.trim();
+  if (!trimmed) {
+    throw new Error("updateMemory: content is required");
+  }
+
+  const { embedding, embeddingModel } = await computeEmbedding(trimmed);
+
+  try {
+    const row = await prisma.memory.update({
+      where: { id: memoryId },
+      data: { content: trimmed, embedding, embeddingModel },
+    });
+    return toMemoryRecord(row);
+  } catch {
+    // Prisma 在记录不存在时抛 P2025 —— 当成"没更新到"处理
+    return null;
+  }
 }
 
 // ─── 语义检索 ─────────────────────────────────────────────────────
@@ -257,6 +276,32 @@ function toMemoryRecord(row: {
     createdAt: row.createdAt,
     updatedAt: row.updatedAt,
   };
+}
+
+/**
+ * 把一段文本算成 embedding 并序列化好,连同模型指纹一起返回。
+ * 失败降级成 { null, null }:记忆仍能落库,只是这条暂时不能被向量检索到。
+ *
+ * 类型收窄到 Uint8Array<ArrayBuffer>:Prisma 6 的 Bytes 输入类型不接受
+ * 宽泛的 ArrayBufferLike(它可能是 SharedArrayBuffer)。
+ */
+async function computeEmbedding(text: string): Promise<{
+  embedding: Uint8Array<ArrayBuffer> | null;
+  embeddingModel: string | null;
+}> {
+  try {
+    const vector = await createLangChainEmbeddings().embedQuery(text);
+    return {
+      embedding: serializeVector(vector),
+      embeddingModel: getEmbeddingsIdentity(),
+    };
+  } catch (error) {
+    console.error(
+      "[MemoryStore] embedding failed, storing memory without vector:",
+      error
+    );
+    return { embedding: null, embeddingModel: null };
+  }
 }
 
 /**

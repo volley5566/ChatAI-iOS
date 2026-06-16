@@ -233,6 +233,43 @@ export const memoryRecallMinScore = readNumberEnv(
   0
 );
 
+// ─── Phase 12 跨对话记忆:写入(write)────────────────────────
+
+/**
+ * 记忆"写入"功能总开关(Phase 12 #4)。
+ *
+ * true  → 每轮对话正常结束后(无 HITL 挂起),后台异步调一次 LLM,
+ *         从最近对话里提炼"关于用户的稳定事实/偏好/经历",去重后入库。
+ * false → 完全不写,记忆库只能靠 memory:debug 手动灌(回到 #3 之前的状态)。
+ *
+ * **默认 false** —— 和 recall 同样灰度上线。写入会多花一次 LLM 调用(成本),
+ * 且决定"什么被长期记住",更需要谨慎,所以默认关闭。
+ *
+ * 写入是 fire-and-forget 的:它在 SSE 响应发完之后才后台跑,失败只记日志,
+ * **绝不影响用户拿到回答**。只在 LangGraph + 有 threadId + 有 userId 时才触发。
+ */
+const memoryWriteEnabledRaw = (process.env.MEMORY_WRITE_ENABLED || "")
+  .trim()
+  .toLowerCase();
+export const memoryWriteEnabled =
+  memoryWriteEnabledRaw === "true" || memoryWriteEnabledRaw === "1";
+
+/**
+ * 写入去重阈值(0..1)。
+ *
+ * 提炼出一条新记忆后,先在该用户已有记忆里搜最相似的一条:
+ *   相似度 ≥ 这个阈值 → 判为"同一件事",更新那条(刷新措辞)而不是再插一条
+ *   相似度 < 这个阈值 → 当成新事实,插入
+ *
+ * 默认 0.85 偏高:只有"几乎在说同一句话"才合并,保证不同的事实能各自留存。
+ * (比 recall 的 0.5 高很多 —— recall 要"宁可多召回",dedup 要"宁可不误合并"。)
+ */
+export const memoryWriteDedupThreshold = readNumberEnv(
+  "MEMORY_WRITE_DEDUP_THRESHOLD",
+  0.85,
+  0
+);
+
 // ─── LangGraph 切换开关 ──────────────────────────────────────
 
 /**

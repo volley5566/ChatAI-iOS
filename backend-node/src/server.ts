@@ -37,6 +37,7 @@ import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { runLangChainAgentStream } from "./agent/agentRunner";
+import { scheduleMemoryWrite } from "./memory/memoryWriter";
 import {
   forkThreadFromCheckpoint,
   getPendingApprovalForThread,
@@ -52,7 +53,13 @@ import {
 } from "./agent/agentObservability";
 import { logChatContext, prepareChatCompletion } from "./chat/chatCompletion";
 import { sanitizeChatHistory } from "./chat/chatHistory";
-import { logLangSmithStatus, model, port, useLangGraph } from "./config/env";
+import {
+  logLangSmithStatus,
+  memoryWriteEnabled,
+  model,
+  port,
+  useLangGraph,
+} from "./config/env";
 import { writeSseEvent } from "./http/sse";
 import { parseStructuredAnswer } from "./chat/structuredAnswer";
 import {
@@ -483,6 +490,21 @@ app.post(
         pending: agentRun.pending,
       });
 
+      /**
+       * Phase 12 #4 — 一轮对话正常结束 → 后台异步提炼并写入长期记忆。
+       *
+       * 触发条件:
+       *   - memoryWriteEnabled  功能开启(默认 false)
+       *   - threadId + userId    知道"哪段对话、记给谁"
+       *   - !agentRun.pending     没有 HITL 挂起(挂起 = 这轮还没真结束)
+       *
+       * scheduleMemoryWrite 是 fire-and-forget:立刻返回,真正的 LLM 提炼 + 入库
+       * 在响应发完后的下一个 tick 后台跑,失败只记日志,绝不影响用户。
+       */
+      if (memoryWriteEnabled && threadId && userId && !agentRun.pending) {
+        scheduleMemoryWrite({ requestId, userId, threadId });
+      }
+
       responseCompleted = true;
       res.end();
     } catch (error) {
@@ -820,6 +842,12 @@ app.post(
         // 续跑后模型可能再次想调一个需要审批的工具,这里再次 pending
         pending: agentRun.pending,
       });
+
+      // Phase 12 #4 — resume 后这轮也算正常结束(无再次挂起)→ 后台写记忆。
+      const resumeUserId = getUserId(req);
+      if (memoryWriteEnabled && resumeUserId && !agentRun.pending) {
+        scheduleMemoryWrite({ requestId, userId: resumeUserId, threadId });
+      }
 
       responseCompleted = true;
       res.end();

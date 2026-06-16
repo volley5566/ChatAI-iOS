@@ -18,7 +18,8 @@
     "mcp:dev": "node -r ts-node/register/transpile-only src/mcp/mcpServer.ts",
     "mcp:start": "node dist/mcp/mcpServer.js",
     "start": "node dist/server.js",
-    "eval": "node -r ts-node/register/transpile-only evals/runEval.ts"
+    "eval": "node -r ts-node/register/transpile-only evals/runEval.ts",
+    "memory:eval": "MEMORY_RECALL_ENABLED=true node -r ts-node/register/transpile-only evals/memoryEval.ts"
   },
   "keywords": [],
   "author": "",

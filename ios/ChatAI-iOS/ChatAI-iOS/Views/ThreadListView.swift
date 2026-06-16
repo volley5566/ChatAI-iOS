@@ -27,6 +27,9 @@ struct ThreadListView: View {
     /// 页面 body 反复刷新也不会重复 new。和 ChatViewModel 的用法一致。
     @StateObject private var viewModel = ThreadListViewModel()
 
+    /// Phase 12 #5 — 是否正在展示"AI 记忆"管理页(以 sheet 弹出)。
+    @State private var showingMemories = false
+
     var body: some View {
         // 这里的 4 种状态对应的子视图,在下面的 @ViewBuilder 函数里分别返回。
         // body 只负责"选择哪个分支",细节藏在子函数里——保持顶层视觉简洁。
@@ -60,6 +63,17 @@ struct ThreadListView: View {
         //
         // 这就是"基于值的导航"的好处——列表页不知道也不需要知道目标 View 是什么。
         .toolbar {
+            // Phase 12 #5 — 左上角进入"AI 记忆"管理页。
+            // 用 sheet 而不是 NavigationLink:记忆页是自包含的模态,
+            // 不参与对话列表 → 聊天页的导航栈,弹窗形式更合适。
+            ToolbarItem(placement: .topBarLeading) {
+                Button {
+                    showingMemories = true
+                } label: {
+                    Image(systemName: "brain.head.profile")
+                }
+                .accessibilityLabel("AI 记忆")
+            }
             ToolbarItem(placement: .topBarTrailing) {
                 NavigationLink(value: NewConversation()) {
                     Image(systemName: "square.and.pencil")
@@ -68,6 +82,9 @@ struct ThreadListView: View {
                 // iOS 系统消息 App 的同款图标用的也是这个文案。
                 .accessibilityLabel("新建对话")
             }
+        }
+        .sheet(isPresented: $showingMemories) {
+            MemoryListView()
         }
         // .task vs .onAppear:
         //   .task 自带 async 上下文 + 视图消失时自动取消,

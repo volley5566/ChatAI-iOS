@@ -77,10 +77,19 @@ import type {
 import {
   createThread,
   deleteThread,
+  ensureUser,
   getThreadMessages,
   listThreads,
   touchThread,
 } from "./db/threadsRepository";
+import {
+  clearUserMemories,
+  deleteMemoryForUser,
+  listMemories,
+  putMemory,
+  type MemoryKind,
+  type MemoryRecord,
+} from "./memory/memoryStore";
 import {
   LangSmithFeedbackDisabledError,
   submitUserFeedback,
@@ -1104,6 +1113,131 @@ app.post(
     }
   }
 );
+
+// ═══════════════════════════════════════════════════════════════════
+// /api/memories — 跨对话长期记忆管理(Phase 12 #5)
+// ═══════════════════════════════════════════════════════════════════
+//
+// 给 iOS 的"AI 记忆"管理页用:让用户看见 AI 记住了自己哪些事,能手动加、能删。
+//
+// 设计要点:
+//   - 全部按 X-User-Id 头隔离;任何按 id 的操作都带 userId 兜底,防越权。
+//   - **不受 MEMORY_RECALL/WRITE_ENABLED 开关影响** —— 那两个开关管"自动读/写",
+//     这里是"用户手动查看/管理已存数据",任何时候都该能用。
+//   - 透明度 + 可控:让用户知道 AI 记了啥、随时能撤回(GDPR 友好)。
+
+/** MemoryRecord → 给 iOS 的 snake_case 形状(收掉 userId/embedding 等内部字段)。 */
+function toMemoryResponse(record: MemoryRecord) {
+  return {
+    id: record.id,
+    kind: record.kind,
+    content: record.content,
+    source_thread_id: record.sourceThreadId,
+    created_at: record.createdAt.toISOString(),
+    updated_at: record.updatedAt.toISOString(),
+  };
+}
+
+/**
+ * GET /api/memories — 列出当前用户的全部记忆(按更新时间倒序)。
+ * 可选 ?kind=semantic|episodic|procedural 过滤。
+ * 没带 X-User-Id → 返回空列表(匿名用户没有专属记忆)。
+ */
+app.get("/api/memories", async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+  if (!userId) {
+    res.json({ memories: [] });
+    return;
+  }
+
+  const kind = typeof req.query.kind === "string" ? req.query.kind : undefined;
+
+  try {
+    const records = await listMemories({
+      userId,
+      kind: kind as MemoryKind | undefined,
+    });
+    res.json({ memories: records.map(toMemoryResponse) });
+  } catch (error) {
+    console.error("[Memories] list failed:", error);
+    res.status(500).json({ error: "Failed to list memories." });
+  }
+});
+
+/**
+ * POST /api/memories — 用户手动加一条记忆。
+ * body: { content: string, kind?: "semantic"|"episodic"|"procedural" }
+ * 没带 X-User-Id → 400(记忆必须有归属)。
+ */
+app.post("/api/memories", async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+  if (!userId) {
+    res.status(400).json({ error: "X-User-Id header is required." });
+    return;
+  }
+
+  const body = (req.body ?? {}) as { content?: string; kind?: string };
+  const content = typeof body.content === "string" ? body.content.trim() : "";
+  if (!content) {
+    res.status(400).json({ error: "content is required." });
+    return;
+  }
+  const kind = (body.kind as MemoryKind | undefined) ?? "semantic";
+
+  try {
+    // 记忆有外键指向 users,先确保该用户存在(手动添加可能早于任何对话)。
+    await ensureUser(userId);
+    const record = await putMemory({ userId, kind, content });
+    res.status(201).json(toMemoryResponse(record));
+  } catch (error) {
+    // putMemory 对非法 kind 会抛错 → 当成 400 参数错误
+    const message = error instanceof Error ? error.message : "Failed to add memory.";
+    const isValidation = message.startsWith("Invalid memory kind");
+    console.error("[Memories] add failed:", error);
+    res.status(isValidation ? 400 : 500).json({ error: message });
+  }
+});
+
+/**
+ * DELETE /api/memories — 清空当前用户的全部记忆("一键清空")。
+ * 放在 /:id 路由之前注册,避免 "/api/memories" 被当成 id="" 匹配。
+ */
+app.delete("/api/memories", async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+  if (!userId) {
+    res.status(400).json({ error: "X-User-Id header is required." });
+    return;
+  }
+
+  try {
+    const count = await clearUserMemories(userId);
+    res.json({ deleted: count });
+  } catch (error) {
+    console.error("[Memories] clear failed:", error);
+    res.status(500).json({ error: "Failed to clear memories." });
+  }
+});
+
+/**
+ * DELETE /api/memories/:id — 删一条记忆(必须属于当前用户)。
+ * 幂等:id 不存在 / 不属于该用户都返回 204(前端无需区分)。
+ */
+app.delete("/api/memories/:id", async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+  if (!userId) {
+    res.status(400).json({ error: "X-User-Id header is required." });
+    return;
+  }
+  const memoryId = typeof req.params.id === "string" ? req.params.id : "";
+
+  try {
+    await deleteMemoryForUser(memoryId, userId);
+    res.status(204).end();
+  } catch (error) {
+    console.error(`[Memories] delete failed for ${memoryId}:`, error);
+    res.status(500).json({ error: "Failed to delete memory." });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════
 // 启动服务

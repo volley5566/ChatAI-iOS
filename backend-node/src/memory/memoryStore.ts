@@ -240,10 +240,36 @@ export async function listMemories(input: {
 
 /**
  * 删一条记忆。返回是否真的删到了(id 不存在返回 false,幂等)。
+ * 不校验归属——只给调试脚本用。HTTP 接口请用 deleteMemoryForUser。
  */
 export async function deleteMemory(memoryId: string): Promise<boolean> {
   const result = await prisma.memory.deleteMany({ where: { id: memoryId } });
   return result.count > 0;
+}
+
+/**
+ * 删一条记忆,**但必须属于这个用户**(Phase 12 #5,给 HTTP 删除接口用)。
+ *
+ * where 同时带 id 和 userId:即使别人猜到了某条记忆的 id,也删不掉不属于自己的。
+ * 这是多租户隔离的最后一道闸 —— 任何按 id 操作都要带 userId 兜底。
+ * 删到返回 true,没删到(id 不存在 / 不属于该用户)返回 false。
+ */
+export async function deleteMemoryForUser(
+  memoryId: string,
+  userId: string
+): Promise<boolean> {
+  const result = await prisma.memory.deleteMany({
+    where: { id: memoryId, userId },
+  });
+  return result.count > 0;
+}
+
+/**
+ * 清空某个用户的全部记忆(Phase 12 #5,给"一键清空"用)。返回删除条数。
+ */
+export async function clearUserMemories(userId: string): Promise<number> {
+  const result = await prisma.memory.deleteMany({ where: { userId } });
+  return result.count;
 }
 
 // ─── 内部工具 ─────────────────────────────────────────────────────

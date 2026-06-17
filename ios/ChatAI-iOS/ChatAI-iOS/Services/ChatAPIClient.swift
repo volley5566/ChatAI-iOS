@@ -224,6 +224,27 @@ protocol ChatAPI {
         checkpointID: String,
         title: String?
     ) async throws -> ThreadSummary
+
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 12 #5 — 跨对话长期记忆管理
+    //
+    // 都按 X-User-Id 头(所有请求自动带,见 sendStreamingRequest 处注释)隔离。
+    // 这几个接口不受后端 MEMORY_RECALL/WRITE_ENABLED 开关影响 —— 它们是
+    // "查看/管理已存数据",任何时候都该能用。
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 列出当前用户的全部记忆。对应 GET /api/memories。
+    func listMemories() async throws -> [MemoryItem]
+
+    /// 手动加一条记忆。对应 POST /api/memories。
+    /// kind 传 nil 时后端默认 "semantic"。
+    func addMemory(content: String, kind: String?) async throws -> MemoryItem
+
+    /// 删一条记忆。对应 DELETE /api/memories/:id。幂等。
+    func deleteMemory(id: String) async throws
+
+    /// 清空当前用户的全部记忆。对应 DELETE /api/memories。
+    func clearMemories() async throws
 }
 
 /// iOS 调用 Node.js 后端时可能遇到的错误。
@@ -304,6 +325,8 @@ final class ChatAPIClient: ChatAPI {
         var request = URLRequest(url: url)
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Phase 12:统一带上用户身份(详见 sendStreamingRequest 处注释)。
+        request.setValue(UserIdentity.current, forHTTPHeaderField: "X-User-Id")
 
         // 3. 把 Swift 结构体编码成 JSON 数据。
         // 后端 server.ts 期望收到：
@@ -507,6 +530,9 @@ final class ChatAPIClient: ChatAPI {
         var request = URLRequest(url: url)//-URLRequest ≈ Retrofit 的 @POST + @Body,或 OkHttp 的 Request.Builder
         request.httpMethod = "POST"
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Phase 12:带上当前用户身份。后端按这个头给跨对话记忆分租户。
+        // 放在 HTTP 头而不是 body —— 身份是横切信息,所有接口统一带,不污染各自的请求体。
+        request.setValue(UserIdentity.current, forHTTPHeaderField: "X-User-Id")
 
         let requestBody = ChatRequestBody(
             message: message,
@@ -824,6 +850,43 @@ final class ChatAPIClient: ChatAPI {
         return try ChatAPIClient.makeThreadDecoder().decode(ThreadSummary.self, from: data)
     }
 
+    // ─────────────────────────────────────────────────────────────────────
+    // Phase 12 #5 — 记忆管理 API 实现
+    //
+    // 用户身份不在这里显式传——performJSONRequest 已经统一带上 X-User-Id 头。
+    // 时间字段是 ISO 8601 带毫秒,复用 makeThreadDecoder。
+    // ─────────────────────────────────────────────────────────────────────
+
+    /// 列出记忆。GET /api/memories
+    func listMemories() async throws -> [MemoryItem] {
+        let data = try await performJSONRequest(method: "GET", path: "api/memories", body: nil)
+        let wrapper = try Self.makeThreadDecoder().decode(MemoryListResponseBody.self, from: data)
+        return wrapper.memories
+    }
+
+    /// 手动加一条记忆。POST /api/memories
+    func addMemory(content: String, kind: String?) async throws -> MemoryItem {
+        var bodyDict: [String: String] = ["content": content]
+        if let kind, !kind.isEmpty {
+            bodyDict["kind"] = kind
+        }
+        let bodyData = try JSONEncoder().encode(bodyDict)
+
+        let data = try await performJSONRequest(method: "POST", path: "api/memories", body: bodyData)
+        return try Self.makeThreadDecoder().decode(MemoryItem.self, from: data)
+    }
+
+    /// 删一条记忆。DELETE /api/memories/:id(后端 204,无响应体)
+    func deleteMemory(id: String) async throws {
+        let encodedID = id.addingPercentEncoding(withAllowedCharacters: .urlPathAllowed) ?? id
+        _ = try await performJSONRequest(method: "DELETE", path: "api/memories/\(encodedID)", body: nil)
+    }
+
+    /// 清空全部记忆。DELETE /api/memories(后端返回 { deleted: n },这里不关心数量)
+    func clearMemories() async throws {
+        _ = try await performJSONRequest(method: "DELETE", path: "api/memories", body: nil)
+    }
+
     /// Phase 10.1 #4 — 提交用户反馈。POST /api/feedback
     ///
     /// 请求体协议(和后端 FeedbackRequestBody 对齐):
@@ -900,6 +963,8 @@ final class ChatAPIClient: ChatAPI {
                     var request = URLRequest(url: url)
                     request.httpMethod = "POST"
                     request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+                    // Phase 12:统一带上用户身份(详见 sendStreamingRequest 处注释)。
+                    request.setValue(UserIdentity.current, forHTTPHeaderField: "X-User-Id")
 
                     // 构造 body:approved 必填,edited_args 可选
                     var bodyDict: [String: Any] = ["approved": approved]
@@ -1016,6 +1081,9 @@ final class ChatAPIClient: ChatAPI {
         var request = URLRequest(url: url)
         request.httpMethod = method
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        // Phase 12:统一带上用户身份(详见 sendStreamingRequest 处注释)。
+        // 对话 CRUD(建/列/删)也要带,这样新建对话才能挂到正确的用户名下。
+        request.setValue(UserIdentity.current, forHTTPHeaderField: "X-User-Id")
         if let body {
             request.httpBody = body
         }

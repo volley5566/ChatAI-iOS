@@ -198,6 +198,7 @@ sequenceDiagram
 | **Subgraph** (Phase 9) | 把复杂工具的内部流程拆成"图中图",主图把子图当普通节点用 | §12 章节 |
 | **Time-travel** (Phase 9) | 从历史 checkpoint 分叉出新 thread,像 git checkout 一样回到过去 | §13 章节 |
 | **Summarization** (Phase 11) | 长对话时让 LLM 把老消息压成 summary,`RemoveMessage` 把原文删掉,token 成本从线性增长变有上限 | §14 章节 |
+| **Long-term Memory** (Phase 12) | 跨对话记忆:对话结束 LLM 提炼用户事实/偏好存进向量库,新对话按语义召回注入 prompt——checkpointer 解决"thread 内",这解决"thread 间" | §15 章节 |
 
 ### 0.5 三个核心权衡
 
@@ -239,6 +240,7 @@ sequenceDiagram
 | Phase 10 | 生产化：LangSmith trace + Eval + CI/CD + 安全加固 + Docker | `langsmithClient.ts` `evals/` `Dockerfile` |
 | **Phase 9** | **高级 LangGraph:HITL 人工审核 + Subgraph 子图 + Time-travel 时光机** | `agentGraphNodes.ts` `subgraphs/evaluateAnswerGraph.ts` `ToolApprovalCard.swift` |
 | **Phase 11** | **对话压缩 + 顺手修了一个 per-request 计数器老 bug**(为 Phase 8 Multi-Agent 铺路) | `summarizeNode.ts` `agentGraphState.ts`(summary channel) `ChatView.swift`(chip) |
+| **Phase 12** | **跨对话长期记忆:User/Memory 表 + 自动提炼写入 + 语义召回注入 + iOS 记忆管理页** | `memory/memoryStore.ts` `memory/memoryWriter.ts` `agentGraphNodes.ts`(recall 节点) `MemoryListView.swift` |
 
 Phase 3 和 Phase 4 通过 `USE_LANGGRAPH` 环境变量灰度切换,行为完全等价。
 **注意 Phase 9 / Phase 11 都只在 USE_LANGGRAPH=true 路径生效**——
@@ -1843,7 +1845,301 @@ ios/ChatAI-iOS/ChatAI-iOS/
 
 ---
 
-## 15. 后续规划
+## 15. 跨对话长期记忆 — Long-term Memory(Phase 12)
+
+**核心一句话**:checkpointer 让 AI 在"同一段对话里"记得住,但**换一段新对话就失忆**。Phase 12 给 AI 加一层"跨对话记忆"——对话结束时让 LLM 提炼"关于用户的稳定事实/偏好",存进按用户隔离的向量库;下次任何新对话开始时,按当前问题语义召回最相关的几条,注入 prompt。**写自动、读自动,用户还能在 iOS 上查看/管理。**
+
+### 15.0 一段话 + 一个比方看懂(先读这节)
+
+> 下面这节是"通俗导读",用大白话把 Phase 12 讲一遍;15.1 往后是技术细节。
+> 看不懂术语没关系,先看懂这个比方,后面就都顺了。
+
+**这个功能解决的痛点:AI 像个健忘的客服。**
+
+```text
+你打电话给客服 → 接通张三 → 你说"我叫小李,买的是 iPhone"
+张三在通话期间记得住,能帮你查物流。            ← 这是"对话内记忆"(Phase 5 早就做好了)
+
+半小时后你再打 → 这次接通李四 → 你问"我那单怎么样了?"
+李四:"请问您贵姓?买的啥?"                      ← 换个人接,就失忆了!这就是"跨对话失忆"
+```
+
+**Phase 12 干的事 = 给这家客服公司建了个"客户档案库(CRM)":**
+
+```text
+张三挂电话前 → 把"小李 / iPhone / 关心物流"写进客户档案     ← 这叫"写记忆"
+李四接电话前 → 系统自动把小李的档案弹到他屏幕上            ← 这叫"读记忆"
+于是李四开口:"小李您好,您的 iPhone 物流……"
+```
+
+**这套"档案库"是怎么搭起来的——分了 6 小步:**
+
+```text
+#1 先发"会员卡"          每台手机第一次打开,生成一个匿名身份(就像办张会员卡),
+                         以后每次说话都带上,这样系统才知道"这是谁的档案"。
+
+#2 造个"档案柜"          一张数据库表 + 一套存取逻辑。关键是它"按意思查"——
+                         你存"在学 SwiftUI",问"我在学什么技术"也能查到
+                         (不是关键词匹配,是语义匹配,靠把每句话变成"意思坐标")。
+
+#3 让 AI 会"翻档案"       AI 每次答话前,先拿你这句话去档案柜里捞最相关的几条,
+                         悄悄塞进它的"系统提示",它答话时就"顺便"知道了。
+
+#4 让 AI 会"记档案"       一轮对话聊完,后台一个"记笔记助理"回看刚才的话,
+                         提炼出"关于你的、以后用得上的事",去重后存进档案柜。
+                         全程在后台,不耽误你;同一件事说三遍也只记一条。
+
+#5 给你一个"档案管理页"   App 里点 🧠 图标,能看到 AI 记了你哪些事,
+                         能手动加、能删、能一键清空。给你知情权和掌控权。
+
+#6 上锁 + 写说明书        一个一键回归测试(防以后改坏)+ 这份文档。
+```
+
+**三个最值得记住的点:**
+
+1. **"按意思找"是灵魂**。普通搜索要一字不差;这里是语义搜索——你问"我在学啥",它能翻出"在学 SwiftUI"那条,哪怕没有一个字重复。这靠的是 embedding 向量(和 §4 RAG 知识库同一套技术)。
+
+2. **每个人的档案严格隔离**。所有操作都强制带"这是谁",别人就算猜到你某条记忆的编号也删不掉、看不到。
+
+3. **默认关闭,零影响**。"自动读""自动写"两个开关默认都是关的。不打开,App 行为和以前一模一样;想用了再打开,灰度上线、出问题秒回滚。
+
+---
+
+### 15.1 先厘清:记忆的三层
+
+业界(LangGraph / Mem0 / Letta)把 Agent 记忆按生命周期分三层:
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│ Working Memory   单次模型调用的 context window               │
+│                  生命周期 = 一次 invoke,模型一返回就没了      │
+├─────────────────────────────────────────────────────────────┤
+│ Short-term       一个 thread 内的对话历史                    │
+│ (Conversational) 生命周期 = 单个 thread                      │
+│                  ★ Phase 5 SqliteCheckpointer 解决到这里 ★  │
+│                  ★ Phase 11 Summarization 压缩的也是这一层 ★ │
+├─────────────────────────────────────────────────────────────┤
+│ Long-term        跨 thread / 跨 session 的持久知识            │
+│ (Cross-thread)   生命周期 = 用户级,永久                      │
+│                  ☆ Phase 12 补上的就是这一层 ☆              │
+└─────────────────────────────────────────────────────────────┘
+```
+
+长期记忆内部又分三类(认知科学经典分类,本项目用 `kind` 字段区分):
+
+| kind | 存什么 | 例子 |
+|---|---|---|
+| `semantic`(事实) | 关于用户/世界的稳定事实 | "用户叫王小明""用户在学 SwiftUI" |
+| `episodic`(经历) | 过去发生的具体事件 | "用户上次 @State 答错了,得 1 分" |
+| `procedural`(偏好) | 偏好 / 做事规则 | "用户喜欢先看代码再看解释" |
+
+### 15.2 解决什么问题
+
+```text
+没有长期记忆:
+  对话 A:  用户:"我叫王小明,在准备 iOS 面试"  → AI 记住(仅在 thread A 的 checkpointer 里)
+  对话 B:  用户:"你还记得我叫啥吗?"            → AI:"我们没见过呀"  ← 跨对话失忆!
+
+有长期记忆:
+  对话 A 结束 → 后台提炼"用户叫王小明,正在准备 iOS 面试" → 存进 Memory 表(挂在 userId 下)
+  对话 B 开始 → 按"你还记得我叫啥"语义召回那条 → 拼进 system prompt → AI:"你是王小明,在准备 iOS 面试"
+```
+
+类比:checkpointer 是"本次通话的草稿纸",Memory 表是"客服公司的客户档案库(CRM)"。通话结束草稿纸扔掉,但要点提炼进档案库,下次来电自动调出。
+
+### 15.3 数据模型
+
+Phase 12 引入"用户身份"作为记忆的归属锚点(详见 `prisma/schema.prisma`):
+
+```text
+User      匿名身份锚点。iOS 首次启动生成一个 UUID 存进 UserDefaults,之后每个请求
+          带 X-User-Id 头。不是账号系统(无密码/邮箱),只是"租户 id",给记忆分隔离。
+Thread    加了 userId 外键(可空,向后兼容老对话)。
+Memory    id / userId / kind / content / sourceThreadId
+          + embedding(BLOB,768 维 Float32)+ embeddingModel(指纹,换模型时失效重算)
+```
+
+身份走 **HTTP 头 `X-User-Id`** 而不是请求体:它是横切信息,GET/POST/DELETE 统一带,不污染各接口的 body。将来要做真登录,把后端 `getUserId(req)` 换成"解析 JWT 取 sub"即可,上层不动。
+
+### 15.4 写入流程(Memory Writer)
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant iOS
+    participant Exp as Express
+    participant Agent as Agent(图)
+    participant W as memoryWriter
+    participant LLM as DeepSeek
+    participant DB as Memory 表
+
+    iOS->>Exp: POST /api/agent/stream
+    Exp->>Agent: 跑图,流式回答
+    Agent-->>Exp: SSE delta...
+    Exp-->>iOS: SSE done(用户已拿到回答)
+    note over Exp,W: 回答发完之后才触发(fire-and-forget)
+    Exp->>W: scheduleMemoryWrite(setImmediate)
+    W->>W: 取最近 ~8 条对话
+    W->>LLM: 提炼"关于用户的稳定信息"→ JSON
+    LLM-->>W: {semantic,episodic,procedural}
+    loop 每条提炼出的记忆
+        W->>DB: 搜同类最相似一条
+        alt 相似度 ≥ 0.85(重复)
+            W->>DB: updateMemory(刷新旧那条)
+        else 新事实
+            W->>DB: putMemory(插入 + 算 embedding)
+        end
+    end
+```
+
+三个关键点:**① 不阻塞用户**——写在 SSE 响应之后 `setImmediate` 后台跑,失败只记日志。**② 只看最近窗口**——新事实几乎都在最新一两轮,喂全历史又贵又重复。**③ 朴素去重**——相似度超阈值就更新旧那条,不堆重复。
+
+### 15.5 读取流程(Memory Recall)
+
+召回是主图的一个**入口节点**,在 agent 推理前跑:
+
+```text
+START
+  ↓
+reset ───────────── (Phase 11 hotfix:清零计数器)
+  ↓
+recallMemories ──── (Phase 12:按当前问题语义召回该用户的记忆,写进 state.recalledMemories)
+  ↓
+shouldSummarize ──┬─→ summarize → agent
+                  └─→ agent
+```
+
+`agentNode` 调模型前,把召回的记忆拼成一段 SystemMessage(和 Phase 11 的 summary 并列):
+
+```text
+[system 原 prompt]              ← 角色/规则/工具说明
+[system 用户长期记忆]            ← Phase 12:recalledMemories(如有)
+[system 早期对话摘要]            ← Phase 11:summary(如有)
+[state.messages 最近原文]
+```
+
+**安全设计**:recall 节点**每次都返回** `recalledMemories`(关闭/无召回时返回 `[]`),覆盖式 reducer 保证不会有"上一轮的记忆残留在持久化 state 里被这一轮误注入"。HITL resume 从挂起的工具节点重入、不经过 START,所以沿用首跑时算好的召回结果,不重复检索。
+
+### 15.6 关键设计决定
+
+```text
+1. 暴力余弦在应用层算,不用数据库向量检索
+   SQLite 没有 pgvector。沿用 Phase 6 RAG 的做法:把候选向量读进内存逐条算 cosine。
+   学习项目每人几十~几百条记忆,够快。上规模换 Postgres+pgvector 只改 memoryStore.ts。
+
+2. 只比 embeddingModel 一致的记忆
+   不同 embedding 模型的向量在不同语义空间,跨模型算相似度是错的。每条记忆记下
+   "是哪个模型算的"(指纹),换模型后旧向量自动被跳过。同 ragCache 指纹失效思路。
+
+3. 召回阈值低(0.5)、去重阈值高(0.85)
+   召回"宁可多召回一两条"(nomic-embed-text 基线相似度本来就偏高);
+   去重"宁可不误合并"(只有几乎一模一样才合并,保证不同事实各自留存)。
+
+4. 写入 fire-and-forget,绝不阻塞用户
+   多一次 LLM 调用的成本/延迟,全部挪到响应之后的后台,失败静默记日志。
+
+5. 两个开关都默认关闭,灰度上线
+   MEMORY_RECALL_ENABLED / MEMORY_WRITE_ENABLED 默认 false。
+   这是首批"让记忆影响模型输出 / 自动写库"的能力,默认关,确认无误再打开。
+   和 USE_LANGGRAPH / AGENT_SUMMARIZE_ENABLED 同模式,出问题秒回滚。
+```
+
+### 15.7 配置
+
+```text
+MEMORY_RECALL_ENABLED        默认 false   读取总开关(每次新请求按问题召回记忆注入)
+MEMORY_RECALL_TOP_K          默认 5       每次最多注入几条
+MEMORY_RECALL_MIN_SCORE      默认 0.5     相似度下限,低于不注入
+MEMORY_WRITE_ENABLED         默认 false   写入总开关(对话结束后台提炼入库)
+MEMORY_WRITE_DEDUP_THRESHOLD 默认 0.85    去重阈值,相似度 ≥ 此值更新旧的而非新增
+```
+
+只在 `USE_LANGGRAPH=true` 路径生效(recall 节点挂在 StateGraph 上)。
+
+### 15.8 iOS 记忆管理页
+
+后端开放一组 `/api/memories` CRUD(全部按 `X-User-Id` 隔离,**不受上面两个开关影响**——查看/管理已存数据任何时候都该能用):
+
+```text
+GET    /api/memories         列出当前用户记忆(可 ?kind= 过滤)
+POST   /api/memories         手动加一条 { content, kind? }
+DELETE /api/memories/:id     删一条(必须属于本人,防越权)
+DELETE /api/memories         一键清空本人全部记忆
+```
+
+iOS 在对话列表页左上角加了个 🧠 入口(`brain.head.profile`),弹出 `MemoryListView`:按类型分段展示、左滑删除、`+` 手动添加、🗑 一键清空(带二次确认)。给用户对"AI 记了我什么"的知情权和掌控权(隐私友好)。
+
+### 15.9 与其它 Phase 的协同
+
+| 跟谁 | 关系 |
+|---|---|
+| **Phase 5** (checkpointer) | 互补:checkpointer 管 thread 内,Memory 表管 thread 间。两者都落在同一个 SQLite。 |
+| **Phase 6** (Ollama embedding) | 直接复用:记忆的向量化和 RAG 知识库用的是同一套 embedding 工厂 + 指纹机制。 |
+| **Phase 11** (Summarization) | 并列注入:recall 注入的 memory 和 summarize 产出的 summary 在 agentNode 里是两段独立的 SystemMessage。 |
+| **Phase 9** (HITL) | recall 不在 resume 路径上(resume 不经过 START),挂起态不会重复召回。 |
+| **Phase 8** (Multi-Agent,未来) | 记忆是用户级的,未来 Supervisor/Worker 都能按同一 userId 共享这层长期记忆。 |
+
+### 15.10 为什么自建,而不用 Mem0 / LangGraph Store
+
+```text
+方案 A  LangGraph 官方 BaseStore   —— 和 checkpointer 对称的二级存储,带向量索引
+方案 B  Mem0 / Zep 等第三方记忆服务 —— 写入/去重/时效都托管,几十行接进来
+方案 C  自建 Prisma + Ollama(本项目选的)
+
+选 C 的理由:
+  - 和项目"渐进自建、把原理摊开"的教学目标一致——记忆的存/取/去重逻辑全看得见
+  - 零新增外部依赖:复用已有的 SQLite(Phase 5)+ Ollama embedding(Phase 6)
+  - 数据模型简单可控,换 Postgres+pgvector 只改一个文件
+  代价:写入触发时机、去重、时效这些策略要自己设计(已在 memoryWriter 里实现基础版)
+```
+
+### 15.11 调试 / 验证
+
+```bash
+# 存取层(不启动后端):put / search / list / delete
+npm run memory:debug -- put "用户在学 SwiftUI"
+npm run memory:debug -- search "我在学什么"
+
+# 写入层:对内置样例对话跑提炼(只看提炼质量,不写库)
+npm run memory:write:debug
+
+# 端到端回归:播种一条记忆 → 新 thread 提问 → 断言被召回答出 → 自动清理
+npm run memory:eval
+```
+
+### 15.12 关键文件
+
+```text
+backend-node/
+  prisma/schema.prisma              ★ User 表 + Memory 表 + Thread.userId
+  prisma/migrations/..._add_user_and_memory/
+  src/
+    memory/
+      memoryStore.ts                ★ put/search/list/update/delete + cosine + 向量序列化
+      memoryStoreDebug.ts           ★ npm run memory:debug
+      memoryWriter.ts               ★ extractMemories + 去重入库 + scheduleMemoryWrite
+      memoryWriterDebug.ts          ★ npm run memory:write:debug
+    langchain/
+      agentGraphState.ts            recalledMemories channel(覆盖式)
+      agentGraphNodes.ts            ★ createRecallMemoriesNode + agentNode 拼 memory
+      agentGraph.ts                 主图 + dummy 图加 recallMemories 节点 + 透传 userId
+    db/threadsRepository.ts         ensureUser + createThread/touchThread 支持 userId
+    config/env.ts                   MEMORY_RECALL_*/MEMORY_WRITE_* 开关
+    server.ts                       getUserId(X-User-Id) + /api/memories CRUD + 写入触发
+  evals/memoryEval.ts               ★ npm run memory:eval 跨对话召回回归测试
+
+ios/ChatAI-iOS/ChatAI-iOS/
+  Core/UserIdentity.swift           ★ 匿名 UUID(UserDefaults)
+  Services/ChatAPIClient.swift      X-User-Id 头 + 4 个 /api/memories 方法
+  Models/MemoryItem.swift           记忆展示模型
+  ViewModels/MemoryViewModel.swift  加载/添加/删除/清空(乐观更新)
+  Views/MemoryListView.swift        ★ 记忆管理页(分段列表 + 添加面板 + 清空确认)
+  Views/ThreadListView.swift        🧠 入口 + sheet
+```
+
+---
+
+## 16. 后续规划
 
 ```text
 ✅ Phase 9   高级 LangGraph(全部完成 — 8/8 任务)
@@ -1859,12 +2155,21 @@ ios/ChatAI-iOS/ChatAI-iOS/
    ✅ #5     /messages 端点返回 summary + iOS chip
    ✅ hotfix reset 节点 + reducer 重置协议(修 Phase 5 老 bug)
 
+✅ Phase 12  跨对话长期记忆(全部完成 — 6 个 substep,详见 §15)
+   ✅ #1     数据模型 + 用户身份(User/Memory 表 + Thread.userId + iOS X-User-Id)
+   ✅ #2     memoryStore 存取层(put/search/list/delete + cosine)
+   ✅ #3     Memory Reader(recall 节点按问题召回,注入 SystemMessage)
+   ✅ #4     Memory Writer(对话结束 LLM 提炼 + 去重入库,fire-and-forget)
+   ✅ #5     /api/memories CRUD + iOS 记忆管理页
+   ✅ #6     回归测试(npm run memory:eval)+ 本章文档
+
 ⏳ Phase 8   Multi-Agent 协作(Supervisor + 子 Agent)
    - 概念:一个"总控 Agent"按用户意图把请求路由给不同的"专家 Agent"
      (代码 Agent / 学习 Agent / 总结 Agent...)
    - 复用 Phase 9 的子图 pattern:每个专家就是一个独立子图
    - 复用 Phase 5 的 checkpointer:子图自己的 state 也能持久化
    - 复用 Phase 11 的 summary:Supervisor 调 Worker 时只传摘要,不传全 history
+   - 复用 Phase 12 的记忆:每个专家 Agent 都能按同一 userId 共享长期记忆
 ```
 
-Phase 9 + Phase 11 已经把 LangGraph 的核心能力(挂起恢复 / 子图组合 / 时光回溯 / 上下文压缩)都接上了。Phase 8 的多 Agent 协作只是在这套基础上多加一层"路由 Agent",难度反而比 Phase 9 低。
+Phase 9 + Phase 11 + Phase 12 已经把 LangGraph 的核心能力(挂起恢复 / 子图组合 / 时光回溯 / 上下文压缩 / 跨对话记忆)都接上了。Phase 8 的多 Agent 协作只是在这套基础上多加一层"路由 Agent",难度反而比 Phase 9 低。

@@ -2,6 +2,7 @@ import {
   AIMessage,
   AIMessageChunk,
   isAIMessage,
+  isHumanMessage,
   ToolMessage,
 } from "@langchain/core/messages";
 import type { ClientTool } from "@langchain/core/tools";
@@ -10,8 +11,12 @@ import { END, interrupt } from "@langchain/langgraph";
 import {
   agentModelCallLimit,
   agentModelRetryMaxAttempts,
+  memoryRecallEnabled,
+  memoryRecallMinScore,
+  memoryRecallTopK,
 } from "../config/env";
 import { logAgentInfo } from "../agent/agentObservability";
+import { searchMemories, type MemoryKind } from "../memory/memoryStore";
 import type { ChatStreamEvent } from "../shared/types";
 import type { AgentStateType, AgentStateUpdate } from "./agentGraphState";
 import { createLangChainChatModel } from "./chatModel";
@@ -372,8 +377,34 @@ export function createAgentNode(options: {
      * 注意这里的拼装**只影响本次模型调用**,不写回 state。
      * state.summary 和 state.messages 仍由 summarizeNode / messagesStateReducer 维护。
      */
+    /**
+     * # Phase 12 #3 — 把 state.recalledMemories 拼成一段 SystemMessage
+     *
+     * recalledMemories 是 recallMemoriesNode 在本次请求开始时,按当前问题语义
+     * 检索出来的"跨对话长期记忆"(每行已格式化成 "[事实] ..." 这种)。
+     *
+     * 和 summary 的关系:summary 是"这段对话更早的内容",memory 是"跨对话的
+     * 用户长期事实/偏好"。两段都用 SystemMessage,放在原 prompt 之后、
+     * messages 之前。memory 放在 summary 之前,因为它是"关于用户的稳定背景",
+     * 比"本段对话摘要"更靠近通用设定。
+     *
+     * 措辞上明确告诉模型"如相关可自然参考,不要生硬复述/罗列"——
+     * 防止模型把记忆当成必须背诵的清单,答非所问。
+     */
     const inputMessages = [
       { role: "system" as const, content: options.systemPrompt },
+      ...(state.recalledMemories && state.recalledMemories.length > 0
+        ? [
+            {
+              role: "system" as const,
+              content:
+                "以下是关于这位用户的长期记忆(来自历史对话,跨会话保留)。" +
+                "如与当前问题相关,可自然地参考它们来个性化你的回答;" +
+                "如不相关,请忽略,不要生硬复述或罗列这些条目:\n" +
+                state.recalledMemories.map((line) => `- ${line}`).join("\n"),
+            },
+          ]
+        : []),
       ...(state.summary
         ? [
             {
@@ -778,6 +809,109 @@ export function createEvaluateAnswerNode(options: {
       messages: toolMessages,
       toolCallCount: 1,
     };
+  };
+}
+
+// ─── 入口节点 recallMemoriesNode (Phase 12 #3) ───────────────────
+
+/**
+ * 把记忆类型映射成给模型看的中文标签。
+ * 标签让模型(和调试时的人)一眼看出这条记忆的性质。
+ */
+function memoryKindLabel(kind: MemoryKind): string {
+  switch (kind) {
+    case "semantic":
+      return "事实";
+    case "episodic":
+      return "经历";
+    case "procedural":
+      return "偏好";
+    default:
+      return "记忆";
+  }
+}
+
+/**
+ * 创建 recallMemoriesNode 工厂函数(Phase 12 #3)。
+ *
+ * # 这个节点干什么
+ *   在 agent 推理**之前**,按"用户这次问的问题"去记忆库做语义检索,
+ *   把最相关的几条长期记忆写进 state.recalledMemories。
+ *   agentNode 随后会把它们拼成 SystemMessage 注入模型(见 createAgentNode)。
+ *
+ * # 为什么 userId 用闭包传,不从 config 读
+ *   和 createAgentNode / createToolNode 一样,这个图是**每次请求新建**的,
+ *   userId 在建图时就已知。用闭包烤进去,和项目里其它节点工厂的写法一致,
+ *   比在节点里读 config.configurable.userId 更直观。
+ *
+ * # 安全设计:总是返回 recalledMemories(可能为空)
+ *   不管功能是否开启、是否召回到东西,这个节点**永远**返回
+ *   { recalledMemories: [...] }(覆盖式 reducer)。这样:
+ *     - 功能关闭 → 返回 [],顺便把上一轮可能残留在持久化 state 里的记忆清空
+ *     - 召回失败 → 返回 [],优雅降级,绝不让整个请求挂掉
+ *   绝不"什么都不返回",否则旧值会留在 state 里被 agentNode 误注入。
+ *
+ * # 只在"新请求"跑,不在 HITL resume 跑
+ *   这个节点挂在 START → reset → recall 这条入口链上。HITL resume 从挂起的
+ *   工具节点重入,不经过 START,自然跳过 recall —— 这是对的:resume 是同一个
+ *   请求的延续,沿用首跑时已写好的 recalledMemories 即可。
+ */
+export function createRecallMemoriesNode(options: {
+  requestId: string;
+  userId?: string;
+}) {
+  return async function recallMemoriesNode(
+    state: AgentStateType
+  ): Promise<AgentStateUpdate> {
+    // 功能未开 / 没有用户身份 → 直接清空,不做任何检索工作
+    if (!memoryRecallEnabled || !options.userId) {
+      return { recalledMemories: [] };
+    }
+
+    // 取本次请求里最新的一条用户消息当检索 query
+    let question = "";
+    for (let i = state.messages.length - 1; i >= 0; i -= 1) {
+      const message = state.messages[i];
+      if (isHumanMessage(message)) {
+        question = messageContentToString(message.content).trim();
+        break;
+      }
+    }
+
+    if (!question) {
+      return { recalledMemories: [] };
+    }
+
+    try {
+      // 不限定 kind:semantic(事实)/ episodic(经历)/ procedural(偏好)
+      // 都可能对个性化回答有用,统一按语义相关度排序取 topK。
+      const hits = await searchMemories({
+        userId: options.userId,
+        query: question,
+        topK: memoryRecallTopK,
+        minScore: memoryRecallMinScore,
+      });
+
+      const lines = hits.map(
+        (hit) => `[${memoryKindLabel(hit.kind)}] ${hit.content}`
+      );
+
+      logAgentInfo(options.requestId, "memory_recall", "completed", {
+        userId: options.userId,
+        queryLength: question.length,
+        recalledCount: lines.length,
+        topScore: hits[0]?.score ?? null,
+      });
+
+      return { recalledMemories: lines };
+    } catch (error) {
+      // 检索失败(Ollama 挂 / DB 出错)不致命:这一轮就当没有记忆,正常作答。
+      logAgentInfo(options.requestId, "memory_recall", "failed", {
+        userId: options.userId,
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return { recalledMemories: [] };
+    }
   };
 }
 

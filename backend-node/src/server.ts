@@ -37,6 +37,7 @@ import cors from "cors";
 import helmet from "helmet";
 import rateLimit from "express-rate-limit";
 import { runLangChainAgentStream } from "./agent/agentRunner";
+import { scheduleMemoryWrite } from "./memory/memoryWriter";
 import {
   forkThreadFromCheckpoint,
   getPendingApprovalForThread,
@@ -52,7 +53,13 @@ import {
 } from "./agent/agentObservability";
 import { logChatContext, prepareChatCompletion } from "./chat/chatCompletion";
 import { sanitizeChatHistory } from "./chat/chatHistory";
-import { logLangSmithStatus, model, port, useLangGraph } from "./config/env";
+import {
+  logLangSmithStatus,
+  memoryWriteEnabled,
+  model,
+  port,
+  useLangGraph,
+} from "./config/env";
 import { writeSseEvent } from "./http/sse";
 import { parseStructuredAnswer } from "./chat/structuredAnswer";
 import {
@@ -70,10 +77,19 @@ import type {
 import {
   createThread,
   deleteThread,
+  ensureUser,
   getThreadMessages,
   listThreads,
   touchThread,
 } from "./db/threadsRepository";
+import {
+  clearUserMemories,
+  deleteMemoryForUser,
+  listMemories,
+  putMemory,
+  type MemoryKind,
+  type MemoryRecord,
+} from "./memory/memoryStore";
 import {
   LangSmithFeedbackDisabledError,
   submitUserFeedback,
@@ -135,6 +151,26 @@ app.get("/health", (_req: Request, res: Response) => {
     service: "ai-ios-chat-backend",
   });
 });
+
+/**
+ * Phase 12 — 从请求里取"当前用户 id"。
+ *
+ * # 身份为什么走 HTTP 头而不是请求体
+ *   userId 是一个**横切关注点**(每个接口都要,但又不属于业务参数),
+ *   放在 `X-User-Id` 头里,GET / POST / DELETE 全都能统一带上,
+ *   不用给每个 body / query 单独加字段。这是身份类信息的常见做法。
+ *
+ * # 这不是鉴权
+ *   现阶段后端**完全信任**这个头里的值(iOS 本地生成的匿名 UUID),
+ *   不做任何校验/签名。它的作用只是"给数据分租户",好让 Phase 12 的
+ *   跨对话记忆能按用户隔离。将来要做真正的登录鉴权,把这里换成
+ *   "解析 JWT → 取 sub" 即可,上层业务代码不用动。
+ *
+ * 没传头 → 返回 undefined → 退回匿名行为(向后兼容老版本 iOS)。
+ */
+function getUserId(req: Request): string | undefined {
+  return req.header("x-user-id")?.trim() || undefined;
+}
 
 // ═══════════════════════════════════════════════════════════════════
 // /api/chat — 非流式结构化 JSON(最早期接口)
@@ -327,15 +363,19 @@ app.post(
       const rawThreadId = body.thread_id?.trim();
       const threadId = rawThreadId || undefined;
 
+      // Phase 12:取当前用户 id(来自 X-User-Id 头,可能为空 → 匿名)。
+      const userId = getUserId(req);
+
       /**
        * 有 threadId 就 touch 一下 threads 表(Prisma upsert):
        *   - 不存在 → 自动创建(iOS 直接发消息不必先调 POST /api/threads)
        *   - 已存在 → 刷新 updatedAt(对话列表按最近活跃排序)
+       *   - Phase 12:带上 userId,把对话挂到该用户名下(老对话会被自动回填)
        *
        * 故意不 try/catch: db 都写不了,后续 checkpointer 也大概率出问题,早 fail 早暴露。
        */
       if (threadId) {
-        await touchThread(threadId);
+        await touchThread(threadId, userId);
       }
 
       logAgentInfo(requestId, "request", "received", {
@@ -385,6 +425,8 @@ app.post(
         systemPrompt,
         history,
         threadId,
+        // Phase 12:把用户身份带进去,LangGraph 路径用它召回跨对话记忆
+        userId,
         // 工具进度回调: 工具事件 → 转成 SSE 推给 iOS
         onToolEvent: (event) => {
           if (!clientClosed) {
@@ -457,6 +499,21 @@ app.post(
         pending: agentRun.pending,
       });
 
+      /**
+       * Phase 12 #4 — 一轮对话正常结束 → 后台异步提炼并写入长期记忆。
+       *
+       * 触发条件:
+       *   - memoryWriteEnabled  功能开启(默认 false)
+       *   - threadId + userId    知道"哪段对话、记给谁"
+       *   - !agentRun.pending     没有 HITL 挂起(挂起 = 这轮还没真结束)
+       *
+       * scheduleMemoryWrite 是 fire-and-forget:立刻返回,真正的 LLM 提炼 + 入库
+       * 在响应发完后的下一个 tick 后台跑,失败只记日志,绝不影响用户。
+       */
+      if (memoryWriteEnabled && threadId && userId && !agentRun.pending) {
+        scheduleMemoryWrite({ requestId, userId, threadId });
+      }
+
       responseCompleted = true;
       res.end();
     } catch (error) {
@@ -506,7 +563,11 @@ app.post(
 app.post("/api/threads", async (req: Request, res: Response) => {
   try {
     const body = req.body as { title?: string };
-    const thread = await createThread({ title: body.title });
+    // Phase 12:把新对话挂到当前用户名下(X-User-Id 头,可能为空 → 匿名对话)。
+    const thread = await createThread({
+      title: body.title,
+      userId: getUserId(req),
+    });
     res.status(201).json(thread);
   } catch (error) {
     console.error("[Threads] create failed:", error);
@@ -723,8 +784,8 @@ app.post(
         edited: Boolean(decision.edited_args),
       });
 
-      // 续跑过程中可能再次刷新 thread updatedAt
-      await touchThread(threadId);
+      // 续跑过程中可能再次刷新 thread updatedAt(Phase 12:一并带上用户归属)
+      await touchThread(threadId, getUserId(req));
 
       // ── 建立 SSE ─────────────────────────────────────────────
       res.setHeader("Content-Type", "text/event-stream; charset=utf-8");
@@ -744,6 +805,9 @@ app.post(
         systemPrompt: undefined,
         history: [],
         threadId,
+        // Phase 12:对齐传入(resume 不经过 recall 节点,这里其实用不到,
+        // 但保持和主流程一致,避免遗漏)
+        userId: getUserId(req),
         resumePayload: decision,
         onToolEvent: (event) => {
           if (!clientClosed) {
@@ -787,6 +851,12 @@ app.post(
         // 续跑后模型可能再次想调一个需要审批的工具,这里再次 pending
         pending: agentRun.pending,
       });
+
+      // Phase 12 #4 — resume 后这轮也算正常结束(无再次挂起)→ 后台写记忆。
+      const resumeUserId = getUserId(req);
+      if (memoryWriteEnabled && resumeUserId && !agentRun.pending) {
+        scheduleMemoryWrite({ requestId, userId: resumeUserId, threadId });
+      }
 
       responseCompleted = true;
       res.end();
@@ -1043,6 +1113,131 @@ app.post(
     }
   }
 );
+
+// ═══════════════════════════════════════════════════════════════════
+// /api/memories — 跨对话长期记忆管理(Phase 12 #5)
+// ═══════════════════════════════════════════════════════════════════
+//
+// 给 iOS 的"AI 记忆"管理页用:让用户看见 AI 记住了自己哪些事,能手动加、能删。
+//
+// 设计要点:
+//   - 全部按 X-User-Id 头隔离;任何按 id 的操作都带 userId 兜底,防越权。
+//   - **不受 MEMORY_RECALL/WRITE_ENABLED 开关影响** —— 那两个开关管"自动读/写",
+//     这里是"用户手动查看/管理已存数据",任何时候都该能用。
+//   - 透明度 + 可控:让用户知道 AI 记了啥、随时能撤回(GDPR 友好)。
+
+/** MemoryRecord → 给 iOS 的 snake_case 形状(收掉 userId/embedding 等内部字段)。 */
+function toMemoryResponse(record: MemoryRecord) {
+  return {
+    id: record.id,
+    kind: record.kind,
+    content: record.content,
+    source_thread_id: record.sourceThreadId,
+    created_at: record.createdAt.toISOString(),
+    updated_at: record.updatedAt.toISOString(),
+  };
+}
+
+/**
+ * GET /api/memories — 列出当前用户的全部记忆(按更新时间倒序)。
+ * 可选 ?kind=semantic|episodic|procedural 过滤。
+ * 没带 X-User-Id → 返回空列表(匿名用户没有专属记忆)。
+ */
+app.get("/api/memories", async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+  if (!userId) {
+    res.json({ memories: [] });
+    return;
+  }
+
+  const kind = typeof req.query.kind === "string" ? req.query.kind : undefined;
+
+  try {
+    const records = await listMemories({
+      userId,
+      kind: kind as MemoryKind | undefined,
+    });
+    res.json({ memories: records.map(toMemoryResponse) });
+  } catch (error) {
+    console.error("[Memories] list failed:", error);
+    res.status(500).json({ error: "Failed to list memories." });
+  }
+});
+
+/**
+ * POST /api/memories — 用户手动加一条记忆。
+ * body: { content: string, kind?: "semantic"|"episodic"|"procedural" }
+ * 没带 X-User-Id → 400(记忆必须有归属)。
+ */
+app.post("/api/memories", async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+  if (!userId) {
+    res.status(400).json({ error: "X-User-Id header is required." });
+    return;
+  }
+
+  const body = (req.body ?? {}) as { content?: string; kind?: string };
+  const content = typeof body.content === "string" ? body.content.trim() : "";
+  if (!content) {
+    res.status(400).json({ error: "content is required." });
+    return;
+  }
+  const kind = (body.kind as MemoryKind | undefined) ?? "semantic";
+
+  try {
+    // 记忆有外键指向 users,先确保该用户存在(手动添加可能早于任何对话)。
+    await ensureUser(userId);
+    const record = await putMemory({ userId, kind, content });
+    res.status(201).json(toMemoryResponse(record));
+  } catch (error) {
+    // putMemory 对非法 kind 会抛错 → 当成 400 参数错误
+    const message = error instanceof Error ? error.message : "Failed to add memory.";
+    const isValidation = message.startsWith("Invalid memory kind");
+    console.error("[Memories] add failed:", error);
+    res.status(isValidation ? 400 : 500).json({ error: message });
+  }
+});
+
+/**
+ * DELETE /api/memories — 清空当前用户的全部记忆("一键清空")。
+ * 放在 /:id 路由之前注册,避免 "/api/memories" 被当成 id="" 匹配。
+ */
+app.delete("/api/memories", async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+  if (!userId) {
+    res.status(400).json({ error: "X-User-Id header is required." });
+    return;
+  }
+
+  try {
+    const count = await clearUserMemories(userId);
+    res.json({ deleted: count });
+  } catch (error) {
+    console.error("[Memories] clear failed:", error);
+    res.status(500).json({ error: "Failed to clear memories." });
+  }
+});
+
+/**
+ * DELETE /api/memories/:id — 删一条记忆(必须属于当前用户)。
+ * 幂等:id 不存在 / 不属于该用户都返回 204(前端无需区分)。
+ */
+app.delete("/api/memories/:id", async (req: Request, res: Response) => {
+  const userId = getUserId(req);
+  if (!userId) {
+    res.status(400).json({ error: "X-User-Id header is required." });
+    return;
+  }
+  const memoryId = typeof req.params.id === "string" ? req.params.id : "";
+
+  try {
+    await deleteMemoryForUser(memoryId, userId);
+    res.status(204).end();
+  } catch (error) {
+    console.error(`[Memories] delete failed for ${memoryId}:`, error);
+    res.status(500).json({ error: "Failed to delete memory." });
+  }
+});
 
 // ═══════════════════════════════════════════════════════════════════
 // 启动服务

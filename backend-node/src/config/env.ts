@@ -191,6 +191,85 @@ export const agentSummarizeKeepTurns = readIntegerEnv(
   1
 );
 
+// ─── Phase 12 跨对话记忆:读取(recall)────────────────────────
+
+/**
+ * 记忆"读取"功能总开关(Phase 12 #3)。
+ *
+ * true  → 每次新请求在 agent 推理前,先 recallMemoriesNode 按当前问题
+ *         语义检索该用户的长期记忆,拼成 SystemMessage 注入模型。
+ * false → recall 节点直接返回空,模型看不到任何跨对话记忆,行为退回 Phase 11。
+ *
+ * **默认 false** —— 这是第一个让记忆真正影响模型输出的开关,
+ * 故意默认关闭,灰度上线:确认无误后再在 .env 里显式打开。
+ * 跟 USE_LANGGRAPH / AGENT_SUMMARIZE_ENABLED 同模式,出问题秒回滚。
+ *
+ * 只在 LangGraph 路径(USE_LANGGRAPH=true)生效——recall 节点挂在 StateGraph 上,
+ * createAgent 路径没有这张图。
+ */
+const memoryRecallEnabledRaw = (process.env.MEMORY_RECALL_ENABLED || "")
+  .trim()
+  .toLowerCase();
+export const memoryRecallEnabled =
+  memoryRecallEnabledRaw === "true" || memoryRecallEnabledRaw === "1";
+
+/**
+ * 每次 recall 最多注入几条记忆。默认 5,和 RAG_TOP_K 一个量级——
+ * 太多会把 system prompt 撑大、稀释重点,也更费 token。
+ */
+export const memoryRecallTopK = readIntegerEnv("MEMORY_RECALL_TOP_K", 5, 1);
+
+/**
+ * 相似度下限:低于这个分数的记忆判为"跟当前问题无关",不注入。
+ *
+ * 默认 0.5 偏宽松——nomic-embed-text 对同语言文本给的基线相似度本来就偏高
+ * (无关内容也常有 0.6 上下),这一版优先"让人看见 recall 生效",
+ * 宁可多注入一两条也不要漏。生产环境想更干净可以调高到 0.7+。
+ * 是 0..1 的浮点,见 memoryStore.cosineSimilarity。
+ */
+export const memoryRecallMinScore = readNumberEnv(
+  "MEMORY_RECALL_MIN_SCORE",
+  0.5,
+  0
+);
+
+// ─── Phase 12 跨对话记忆:写入(write)────────────────────────
+
+/**
+ * 记忆"写入"功能总开关(Phase 12 #4)。
+ *
+ * true  → 每轮对话正常结束后(无 HITL 挂起),后台异步调一次 LLM,
+ *         从最近对话里提炼"关于用户的稳定事实/偏好/经历",去重后入库。
+ * false → 完全不写,记忆库只能靠 memory:debug 手动灌(回到 #3 之前的状态)。
+ *
+ * **默认 false** —— 和 recall 同样灰度上线。写入会多花一次 LLM 调用(成本),
+ * 且决定"什么被长期记住",更需要谨慎,所以默认关闭。
+ *
+ * 写入是 fire-and-forget 的:它在 SSE 响应发完之后才后台跑,失败只记日志,
+ * **绝不影响用户拿到回答**。只在 LangGraph + 有 threadId + 有 userId 时才触发。
+ */
+const memoryWriteEnabledRaw = (process.env.MEMORY_WRITE_ENABLED || "")
+  .trim()
+  .toLowerCase();
+export const memoryWriteEnabled =
+  memoryWriteEnabledRaw === "true" || memoryWriteEnabledRaw === "1";
+
+/**
+ * 写入去重阈值(0..1)。
+ *
+ * 提炼出一条新记忆后,先在该用户已有记忆里搜最相似的一条:
+ *   相似度 ≥ 这个阈值 → 判为"同一件事",更新那条(刷新措辞)而不是再插一条
+ *   相似度 < 这个阈值 → 当成新事实,插入
+ *
+ * 默认 0.85 偏高:只有"几乎在说同一句话"才合并,保证不同的事实能各自留存。
+ * (比 recall 的 0.5 高很多 —— recall 要"宁可多召回",dedup 要"宁可不误合并"。)
+ */
+export const memoryWriteDedupThreshold = readNumberEnv(
+  "MEMORY_WRITE_DEDUP_THRESHOLD",
+  0.85,
+  0
+);
+
 // ─── LangGraph 切换开关 ──────────────────────────────────────
 
 /**
